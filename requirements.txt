@@ -1,0 +1,34 @@
+# azure-proxy runtime dependencies
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# Six packages, and every one of them is imported by the code — `openai` used to
+# be on this list and was never imported by anything; it is gone.
+#
+# Floors rather than pins. This is a service you deploy and keep running, not a
+# library, so it wants security updates without an edit here; the floors are the
+# versions the test suite has actually been run against, listed below. If a
+# future release breaks something, pin it here with `==` and say why.
+#
+# Last verified: 2026-08-23 on CPython 3.9.12 and 3.11.15, 106/106 tests passing
+#   azure-identity 1.25.3   fastapi 0.141.1   httpx 0.28.1
+#   PyYAML 6.0.3            rich 15.0.0       uvicorn 0.52.4
+
+# Azure AD credentials. Shells out to `az account get-access-token`, so the
+# Azure CLI has to be installed separately — it is not a pip dependency.
+azure-identity>=1.19
+
+# The two faces, /v1/chat/completions and /v1/responses.
+fastapi>=0.115
+uvicorn>=0.30
+
+# Upstream HTTP, including the streaming path. Async client throughout.
+httpx>=0.27
+
+# settings/*.yaml
+PyYAML>=6.0
+
+# The dashboard only (tui/). The proxy itself never imports it, so a missing
+# rich costs you the dashboard and nothing else.
+rich>=13.7

@@ -1,0 +1,526 @@
+# azure-proxy / settings / policy.yaml
+#
+# TEMPLATE. Copy to policy.yaml before starting the proxy:
+#
+#     cp settings/policy.yaml.template settings/policy.yaml
+#
+# The copy is gitignored, so local tuning never shows up as a repository diff.
+# Everything below is commented for a reason — read the comment before turning
+# the knob above it.
+#
+# Operating policy — the knobs you are meant to turn. Facts about Azure live in
+# runtime/, are written by the probe, and should not be hand-edited.
+
+server:
+  # Loopback only. Callers send no credentials, so anything that can reach this
+  # port can spend the team's Azure quota. Do not bind 0.0.0.0 without auth.
+  host: 127.0.0.1
+  # Check with `ss -lnt` before changing this — on a shared box the interesting
+  # ports are usually already taken by somebody's other proxy.
+  port: 8811
+
+  # debug adds a line per upstream attempt. info is the useful default: one line
+  # in, one line out, plus every failover and token transition. Request and
+  # response bodies are never logged at any level — prompts are user data.
+  log_level: info
+
+  # Diagnostics: dump raw upstream streams to a directory. OFF, and it should be
+  # left off — these files contain prompts, which is exactly what log_level is
+  # forbidden from recording at any level.
+  #
+  # It exists because the in-band throttle below was mis-diagnosed twice from
+  # log lines alone. Five minutes with the actual bytes on disk settled what
+  # weeks of inference would not have. Turn it on, reproduce the problem, read
+  # the files, turn it off, delete them.
+  #
+  #   capture_dir    a path enables it; null (the default) disables it
+  #   capture_mode   `suspicious` keeps only streams that never reached
+  #                  response.completed — the interesting set, and the small
+  #                  one. `all` keeps everything, for when the question is what
+  #                  a HEALTHY response looks like.
+  #   capture_limit  stop after this many files, so a forgotten switch fills a
+  #                  directory rather than a disk.
+  capture_dir: null
+  capture_mode: suspicious
+  capture_limit: 40
+
+routing:
+  # Failover fires on these, and only these.
+  retry_on_status: [429, 500, 502, 503, 504]
+  retry_on_transport_error: true      # connection reset / DNS / TLS
+
+  # A slow reasoning request and a hung one look identical from here. Retrying
+  # on timeout would pay twice for the same prompt while the first call may
+  # still be running, so timeouts are returned to the caller instead.
+  retry_on_timeout: false
+  request_timeout_seconds: 900
+
+  max_attempts_per_request: 4         # distinct endpoints; never the same one twice
+  backoff_initial_seconds: 1.0
+  backoff_multiplier: 2.0
+  backoff_jitter_seconds: 1.0
+
+  # Which route gets tried FIRST. Failover is unaffected by all three — they
+  # walk the same chain on 429/5xx/transport error, none of them can try one
+  # endpoint twice, and each produces a full permutation of the model's routes.
+  #
+  #   strict_priority      the probe's order, every time. The top route takes
+  #                        100% of the traffic until it starts failing. This is
+  #                        the kill switch: if a run is behaving strangely, this
+  #                        setting makes "which endpoint served this?" answerable
+  #                        from the config alone.
+  #   priority_threshold   priority order, except that a route
+  #                        already carrying more than `spill_threshold` of its
+  #                        own quota is stepped over in favour of the next one.
+  #                        Traffic concentrates on the best endpoint while there
+  #                        is room, and starts spreading BEFORE anything is full
+  #                        rather than after the first 429.
+  #   capacity             priority is ignored entirely; every request samples
+  #                        the routes in proportion to their measured quota. The
+  #                        widest spread, and the right answer when the routes
+  #                        are interchangeable and the load is high enough that
+  #                        all of them are needed all of the time.
+  #
+  # `priority` and `weighted` are the previous names for strict_priority and
+  # capacity and still work.
+  #
+  # Set to `capacity` here, deliberately, and only because session affinity
+  # below now makes it safe. The argument against it used to be that the three
+  # endpoints are not interchangeable — different regions, and
+  # endpoint-c is on api_version 2024-12-01-preview against
+  # 2025-04-01-preview for the other two. That is still true, but it turned out
+  # to understate the problem: moving a codex conversation between endpoints
+  # does not just change its latency, it destroys its encrypted reasoning. With
+  # affinity holding each conversation in place, spreading them is free, and
+  # spreading is what this workload needs — a single codex request is ~15% of
+  # endpoint-a's TPM ceiling, so concentrating sessions there throttles it.
+  #
+  # `priority_threshold` remains the better general-purpose default and is what
+  # a mixed workload should use. Note that with affinity on, balancing happens
+  # per CONVERSATION rather than per request, so n concurrent codex sessions can
+  # occupy at most n endpoints however this is set.
+  balance: capacity
+
+  balancing:
+    # ---- priority_threshold ------------------------------------------------
+    #
+    # Spill to the next route once this fraction of a route's quota is in use.
+    #
+    # The fraction is of THAT ROUTE'S OWN quota, never an absolute rate: for
+    # gpt-5.6-sol the measured ceilings are 333k TPM on endpoint-a, 1M on
+    # endpoint-b and 499k on endpoint-c, so any shared absolute
+    # number would mean "70% of the smallest" for two of the three.
+    #
+    # Both dimensions are computed — requests against limit-requests, tokens
+    # against limit-tokens — and the larger one decides. Whichever ceiling is
+    # reached first is the one that will produce the 429. That is normally
+    # tokens: the live run on 2026-08-20 sat at ~27% of TPM while using ~8% of
+    # RPM, so TPM binds about 3x sooner.
+    #
+    # 0.70 leaves 30% of headroom for the two things this cannot see. Azure
+    # admits on a much shorter window than a minute, so a burst can exceed the
+    # per-minute average without the average showing it; and the ledger below
+    # only counts this proxy's own traffic, so anyone else on the same
+    # deployment is invisible. Raising it towards 1.0 turns this back into
+    # "wait until it is full", which is the behaviour it exists to replace;
+    # lowering it spreads earlier at the cost of using the preferred endpoint
+    # less.
+    spill_threshold: 0.70
+
+    # The window "current load" is measured over, and where that measurement
+    # comes from. This is the proxy's OWN ledger — every request it dispatches,
+    # timestamped, with a token cost — and not x-ratelimit-remaining-*.
+    #
+    # That choice was made from measurement, not preference. Sampled against an
+    # idle endpoint-b/gpt-4.1-mini on 2026-08-20: 16 concurrent requests, an
+    # instantaneous ~960 RPM against a stated ceiling of 2000, moved
+    # remaining-requests from 2000 to 1989 — and three seconds later it was back
+    # at 1999 and stayed there. remaining-tokens behaved identically. So despite
+    # renewalperiod-requests reading 60, `remaining` is a sub-second bucket
+    # quoted against a per-minute ceiling: it reported 0.55% consumed at a moment
+    # when the true minute-equivalent load was around 48%, and responses within
+    # one burst disagreed with each other. Nothing that undercounts by ~90x can
+    # carry a 70% threshold. (x-ratelimit-reset-* reads 0 on every sample and is
+    # no help either.)
+    #
+    # The proxy's own ledger has the opposite trade: exact for our traffic,
+    # available at dispatch instead of on completion — which matters when a
+    # reasoning turn takes most of the window — and blind to any other consumer
+    # of the same deployment. The 429 demotion path covers that blind spot
+    # reactively; the 30% of headroom above is what covers it in advance.
+    #
+    # 60 seconds because that is what Azure reports as renewalperiod for both
+    # dimensions on every deployment measured here, so the ledger and the
+    # ceiling it is divided by are quoted over the same period.
+    load_window_seconds: 60
+
+    # A request's token cost is charged when it is dispatched, because that is
+    # when Azure charges it, and at that moment the only thing known about it is
+    # how big the body was. So the initial estimate is bytes / this. Every
+    # response that states a `usage.total_tokens` corrects a per-route ratio
+    # from then on, which is what accounts for reasoning tokens that were never
+    # in the request at all — so this value only has to be within an order of
+    # magnitude, and only matters for a route's first few requests.
+    assumed_chars_per_token: 4
+
+    # ---- other tenants on the same deployment ------------------------------
+    #
+    # The load window above counts only what THIS proxy sent. Quota is granted
+    # per deployment and shared with anyone else holding credentials for it —
+    # on this box there are eight other proxies under a different account
+    # pointed at the same endpoints, and two of them could not be read to find
+    # out which deployments they use. Assuming we are alone means walking into a
+    # wall that is invisible from here.
+    #
+    # There is exactly one moment when the other tenants become observable: when
+    # Azure refuses. A throttle says total consumption hit the ceiling, and our
+    # own share of that total is already known, so
+    #
+    #     foreign = clamp(1 - our_load_at_throttle, 0, 1)
+    #
+    # A throttle while we are at 0.9 says it was mostly us. A throttle while we
+    # are at 0.05 says someone else has 95% of the deployment and we were just
+    # the request that arrived last. That second case is the whole point, and
+    # watching foreign_load in GET /routes over a long run is also how to settle
+    # whether anyone else is really on gpt-5.6-sol.
+    #
+    # Both routing modes act on our_load + foreign_load rather than on our_load:
+    # `priority_threshold` spills at the combined figure, and `capacity` samples
+    # by limit x (1 - total_load) — what is actually left — instead of by the
+    # deployment's nominal size.
+    foreign_load:
+      # false reverts to counting only our own traffic.
+      enabled: true
+
+      # How fast the estimate is given back, in units of "fraction of the
+      # ceiling per minute". 0.1 forgets a 100% estimate over ten minutes.
+      #
+      # This is the additive-increase half of AIMD, and the shape is chosen, not
+      # incidental. An exponential halflife returns capacity FASTEST in the
+      # minute right after a throttle — exactly when the deployment is known to
+      # be contended and caution is worth the most — and then trails off for a
+      # long time afterwards when the estimate is stale and worth the least. It
+      # is backwards in both halves. Linear reclaim is constant and gentle.
+      #
+      # AIMD is also the only increase/decrease pairing that converges to a fair
+      # split between controllers that cannot see each other; AIAD and MIMD do
+      # not. Several of the other proxies here are plausibly adaptive too, so
+      # this is load-bearing rather than tidy.
+      #
+      # OSCILLATION, at this rate. The loop is: throttle -> estimate jumps up ->
+      # we send less -> no more throttles -> estimate reclaims -> we send more
+      # -> throttle. Its period is (how far the estimate must fall before our
+      # traffic pushes the total back to 1.0) / rate. Against a steady foreign
+      # load of 0.8 the proxy overshoots by roughly the share it can add before
+      # hitting the ceiling — about 0.2 — so the cycle is ~2 minutes and costs
+      # ONE throttled request, which now fails over transparently. Worst case,
+      # a full 1.0 estimate, is 10 minutes. Both are an order of magnitude above
+      # demote_seconds (30s) and Retry-After (measured 1-8s), which is what
+      # keeps the fast controller and the slow one from fighting. Raising this
+      # much past 0.2 collapses that separation and produces the repeated
+      # wall-hitting it is meant to avoid.
+      reclaim_per_minute: 0.1
+
+      # Reclaim does not begin until the throttle's Retry-After has elapsed —
+      # Azure states how long this congestion is expected to last, so there is
+      # no reason to guess at that timescale. Set by the response, not here.
+      #
+      # IDLE ROUTES STILL RECLAIM. The alternative — freezing the estimate while
+      # a route receives no traffic — was considered and rejected: the estimate
+      # describes the world, and the world changes whether or not we are looking
+      # at it. Freezing also has a trap, in that a route we stopped using would
+      # stay suppressed forever precisely because we stopped using it. The cost
+      # of reclaiming while idle is that the first requests back may hit the
+      # wall once; that is a single transparent failover, and it is also
+      # information, since it immediately restores the estimate.
+      #
+      # The probe channel that closes this loop is `weight_floor` above: a route
+      # believed to be completely full still draws that fraction of its capacity
+      # in ordinary traffic. Those requests are the probe — real work, no extra
+      # cost, and if the other tenant has left they simply succeed. Note the
+      # floor is applied to the PRODUCT of all the reductions, not to each in
+      # turn, or a route that is loaded and parked and short of headroom would
+      # be floored three times over and starve at 0.05^3.
+
+    #
+    # ---- capacity, and the failover-order weights --------------------------
+    #
+    # The LAST RESORT for a cold-start prior, per endpoint, in RPM.
+    #
+    # It is rarely reached now. A route's prior comes from ARM by way of the
+    # probe: runtime/models.json carries capacity_requests / capacity_tokens for
+    # every deployment, quoted in the same units as x-ratelimit-limit-*, so a
+    # fresh process starts out knowing each route's real ceiling and the first
+    # response only confirms it. This table is what is left when that is
+    # missing — an endpoint with no subscription/resource_group in
+    # endpoints.yaml, a principal without ARM read on the account, or a
+    # runtime/ written before any of this existed.
+    #
+    # It is a worse answer by construction, and not because the numbers are old:
+    # quota is granted per DEPLOYMENT, and one endpoint's deployments do not
+    # share a ceiling. endpoint-b is 1000 RPM for gpt-5.6-sol and 2000 for
+    # gpt-4.1-mini; a single number per endpoint cannot be right for both.
+    #
+    # Whatever the prior, it governs only until the route has returned one
+    # response carrying x-ratelimit-limit-*, at which point the measured value
+    # replaces it permanently. Wrong numbers here cost a few seconds of skew,
+    # not a wrong steady state.
+    #
+    # Both are readable at any time from GET /routes, side by side:
+    # capacity_* is what ARM declared, limit_* is what the traffic measured.
+    #
+    # The unit does not have to match what Azure reports. These are converted
+    # into measured units using the routes where both numbers are known, so
+    # only the ratios between them matter.
+    static_weights:
+      endpoint-a: 333
+      endpoint-b: 1000
+      endpoint-c: 499
+
+    # x-ratelimit-remaining-* only gets to *reduce* a weight, and only once it
+    # is below this fraction of the limit; above it the route is treated as
+    # fully available.
+    #
+    # Given the measurement recorded under load_window_seconds above, this will
+    # essentially never fire — `remaining` did not drop below 99% even at half
+    # the stated ceiling. It is kept because it costs nothing and because on the
+    # one occasion it does fire it is reporting a real instantaneous burst. Do
+    # not mistake it for the load signal; that is the ledger.
+    headroom_high_water: 0.5
+
+    # An observation older than this is treated as "unknown", not "empty". A
+    # route that has gone quiet must not be starved for it.
+    observation_ttl_seconds: 120
+
+    # A route is never weighted below this fraction of its capacity: it stays
+    # reachable, so it can report fresh quota headers and climb back out.
+    weight_floor: 0.05
+
+    # 429 (and 5xx, and transport errors) multiply the route's weight by this
+    # and park it for `demote_seconds` — or for Retry-After, when Azure sends
+    # one, which is always the better number. Recovery starts when the parking
+    # window ends and doubles the weight every halflife until it is whole again.
+    #
+    # A parked route is also skipped as the head of the priority_threshold
+    # chain, however idle the ledger says it is: Retry-After is the deployment
+    # telling us about everyone's traffic, and the ledger only knows about ours.
+    demote_multiplier: 0.25
+    demote_seconds: 30
+    demote_recovery_halflife_seconds: 30
+
+  # Some state does not travel between endpoints, and this proxy shipped three
+  # revisions believing otherwise.
+  #
+  # codex sends `include: ["reasoning.encrypted_content"]`. Azure returns the
+  # model's reasoning as an ENCRYPTED blob and codex hands it back next turn.
+  # The key belongs to the resource that produced it, so a blob sent to a
+  # different endpoint comes back as
+  #
+  #   The encrypted content for item rs_… could not be verified.
+  #   Reason: Encrypted content could not be decrypted.
+  #
+  # which kills the trial. Measured: switching `balance` to capacity took the
+  # first three codex trials to NonZeroAgentExitCode, 0 passed.
+  #
+  # `store: false` therefore means "do not keep this server-side", NOT "this
+  # request is self-contained". The blob is cross-turn state carried by the
+  # client. Every mechanism here that moves a request between endpoints breaks
+  # it — capacity sampling, threshold spillover, and the in-band throttle
+  # failover that exists to fix rate limiting.
+  #
+  # So: a conversation carrying that state is pinned to the endpoint that
+  # produced it and is never moved.
+  session_affinity:
+    enabled: true
+
+    # A request is sticky if its `include` array holds one of these. codex sends
+    # this from its FIRST turn, which is what makes the pin correct: it has to
+    # happen on the turn that CREATES the blob, not the one that returns it, or
+    # the blob is already on the wrong endpoint by the time anyone could notice.
+    #
+    # This is also what keeps affinity from taxing everyone. The chat face and
+    # mini-swe-agent never ask for encrypted reasoning, so they are never
+    # pinned and keep the full run of the balancer.
+    sticky_include:
+      - reasoning.encrypted_content
+
+    # Where the conversation id comes from, first match wins. Measured off real
+    # codex 0.149 traffic through harbor (2026-08-20) — all four of these carry
+    # the same value and hold it constant for every turn of a trial:
+    #
+    #   session-id: 01a0216b-cf47-7542-95ad-7d524fbb1582   (header)
+    #   thread-id:  01a0216b-…                             (header)
+    #   prompt_cache_key: 01a0216b-…                       (body)
+    #   client_metadata.session_id: 01a0216b-…             (body)
+    #
+    # The header comes first because it costs nothing to read; the body fields
+    # are behind it so a client that sends one but not the other still works.
+    # Note codex sends `session-id`, NOT `x-session-id` — that one is kept last
+    # for Harbor, which is where the name in `forward_headers` came from.
+    keys:
+      - header:session-id
+      - body:prompt_cache_key
+      - body:client_metadata.session_id
+      - header:x-session-id
+
+    # What to do when the pinned endpoint is throttled.
+    #
+    #   wait     re-attempt the SAME endpoint after its Retry-After. Slower, and
+    #            correct.
+    #   switch   fail over like anything else. Faster, and it guarantees a
+    #            decryption error on the next turn — which is a lost trial, not
+    #            a slow one. Here only as an escape hatch.
+    #
+    # `wait` is right because the alternative is not "fast instead of slow", it
+    # is "fast and broken". A throttle is a few seconds (measured Retry-After:
+    # 1-8s); a decryption failure ends the run.
+    on_conflict: wait
+
+    # How many extra times to re-attempt a pinned endpoint before giving the
+    # upstream's error back to the caller. codex then does its own
+    # "Reconnecting… 1/5" and the next request pins to the same place, so this
+    # budget compounds with the client's rather than replacing it.
+    wait_attempts: 4
+
+    # Cap on any single wait, so a pinned endpoint that never recovers returns
+    # an error instead of hanging. Retry-After has been seen at 1-8s.
+    max_wait_seconds: 30
+
+    # A pin outlives a whole trial and no longer. Bounded so a long-lived proxy
+    # does not accumulate them.
+    ttl_seconds: 3600
+    max_sessions: 4096
+
+  # off the live service on 2026-08-20 by pushing endpoint-a past its TPM
+  # ceiling — 5 of 8 concurrent requests came back like this:
+  #
+  #   HTTP/1.1 200 OK
+  #   retry-after: 4
+  #   x-ratelimit-remaining-tokens: -27689
+  #
+  #   event: response.created   {"status":"in_progress"}
+  #   event: error              {"code":"rate_limit_exceeded","message":"Your
+  #                              requests to gpt-5.6-sol for gpt-5.6-sol in
+  #                              swedencentral have exceeded rate limit."}
+  #   event: response.failed    {"status":"failed"}
+  #
+  # THE REFUSAL IS IN THE HEADERS. `retry-after` was on all five refusals and on
+  # none of the three that succeeded, so the proxy decides off that — at the
+  # same moment it would read a 429's status line, before any body, at zero
+  # latency, and independent of how big the stream is.
+  #
+  # That last part is the whole lesson. The first version of this scanned the
+  # first 16KB of the body instead. It passed every test and caught nothing in
+  # production: a codex-shaped response.created echoes the request back and is
+  # itself bigger than the window, so the error event landed past the end of it.
+  # 184 refusals in one run were logged as 63464-byte successes and codex saw
+  # `stream disconnected before completion` on every one.
+  #
+  # Negative x-ratelimit-remaining-tokens is deliberately NOT used as a signal:
+  # one of the three SUCCESSFUL responses reported -27978 and streamed fine. The
+  # counter goes negative whenever the window is oversubscribed; retry-after is
+  # Azure actually declining.
+  #
+  # The body scan below is kept as a backstop for a refusal sent without the
+  # header. It now runs over the whole stream rather than a window, because
+  # bounding it is what broke it.
+  stream_probe:
+    # How long the head of a stream may be held before the first byte is
+    # released, while the backstop looks for an in-band error. The probe usually
+    # ends much sooner: it stops the instant a complete non-preamble event
+    # arrives, which is what a healthy stream produces first.
+    #
+    # Now that the headers carry the answer this matters much less than it did.
+    # It is the safety net for a refusal shape nobody has seen yet, so it is set
+    # where it costs nothing measurable: an A/B against the live service put
+    # median first-byte at 0.89s with it and 1.18s without, i.e. inside Azure's
+    # own variance. Set to 0 to disable the backstop entirely.
+    hold_seconds: 0.5
+
+    # And how much may be held. This bounds memory per in-flight request, not
+    # detection: detection is the header. Note that it must NOT be treated as
+    # "the error is always within this many bytes" — that assumption is exactly
+    # what failed above.
+    hold_bytes: 16384
+
+    # In-band error codes the backstop treats as retryable — as if the status
+    # line had said 429. Deliberately short: an error that is not about capacity
+    # (a content filter, a bad parameter) would produce the same answer from
+    # every endpoint, so retrying it just spends quota to reproduce it.
+    retry_on_codes:
+      - rate_limit_exceeded
+
+request:
+  # Parameters are forwarded untouched. Only `model` is rewritten, to the
+  # native deployment name of whichever route is chosen. If a deployment
+  # rejects a parameter, its 400 reaches the caller unmodified.
+  mode: passthrough
+
+  # The one exception to `mode: passthrough`, and it applies to /v1/responses
+  # only. Azure's Responses validator is stricter than the real OpenAI one on
+  # two fields that codex sends on every turn, so a passthrough proxy makes
+  # codex fail 100% of the time with NonZeroAgentExitCodeError. Two rewrites:
+  #
+  #   1. `input[*].tools[*].description: ""` -> a placeholder. codex wraps its
+  #      real tools in a `type: namespace` tool whose own description is blank;
+  #      Azure rejects that with `empty_string`, OpenAI accepts it.
+  #   2. `input[*].internal_chat_message_metadata_passthrough` is dropped.
+  #      Azure rejects the `create_time` inside it with `unknown_parameter`.
+  #      It is codex's own bookkeeping for a stateful conversation store, and
+  #      this proxy does not implement session state, so there is nothing here
+  #      for it to pass through to.
+  #
+  # Neither touches prompts, sampling parameters or tool *behaviour*, so
+  # benchmark numbers stay comparable. Set false to see the raw Azure errors.
+  responses_compat: true
+
+  # Harbor sends X-Session-ID, which some routers use for session affinity.
+  forward_headers: true
+
+auth:
+  # AzureCliCredential, i.e. whatever `az account get-access-token` hands back.
+  # That is the CLI's *cached* token, so its remaining lifetime is not
+  # predictable — six and ten minute tokens have both been observed, as well as
+  # near-hour ones. The proxy refreshes in the background and clamps this margin
+  # to half the token's actual life, so a short-lived token cannot put an `az`
+  # subprocess on the request path.
+  scope: https://cognitiveservices.azure.com/.default
+  refresh_margin_seconds: 300
+
+  # Where the Azure CLI keeps the identity this proxy runs as: its logged-in
+  # account and, crucially, its refresh tokens. The proxy does not run on the
+  # operator's own Azure account — it runs as whatever principal the endpoints
+  # in settings/endpoints.yaml are granted to. So it needs a directory of its
+  # own: a personal `az login` writes to ~/.azure and must not be able to swap
+  # the proxy's identity out from under it, nor the other way round.
+  #
+  # `az-identity/`, in the repository, and deliberately NOT a dotfile. It is
+  # something a human has to put files into before the proxy will start, and a
+  # hidden directory is a poor place to keep a required setup step — it was
+  # `.azure-proxy/` and the name did a good job of hiding a prerequisite.
+  #
+  # Relative paths are resolved against the repo root, never against the
+  # caller's working directory, so the whole tree can be moved or handed to
+  # another account without editing this line.
+  #
+  # Two files are needed, and only two — see az-identity/README.md:
+  #   azureProfile.json      which account/tenant/subscription is active
+  #   msal_token_cache.json  the refresh token itself
+  #
+  # IT HOLDS A REFRESH TOKEN. .gitignore keeps everything in there out of the
+  # repository except its README. Anyone who can read it can mint tokens for
+  # this identity anywhere, not merely through this proxy — so sharing
+  # operation of the proxy means sharing this directory. There is no
+  # arrangement where it does not.
+  #
+  # Populate it with ./az.sh, which points `az` at it for you. Never bare `az`.
+  az_config_dir: .az-identity
+
+  # Compared against whoever is actually logged in above; a mismatch is logged
+  # loudly at startup. Not fatal — the token may still work, and failing to boot
+  # is the less useful of the two failures.
+  #
+  # This is not the account you log into this box with. If it ever reads
+  # your-own@example.com, something logged your personal identity into the proxy's
+  # credential directory and the deployments will start returning 401/403.
+  expected_account: null      # e.g. svc-account@example.com

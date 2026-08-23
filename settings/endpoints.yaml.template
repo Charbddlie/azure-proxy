@@ -1,0 +1,83 @@
+# azure-proxy / settings / endpoints.yaml
+#
+# TEMPLATE. Copy to endpoints.yaml and fill in your own resources:
+#
+#     cp settings/endpoints.yaml.template settings/endpoints.yaml
+#
+# The copy is gitignored — it names your subscriptions, so it is yours and not
+# the repository's.
+#
+# Candidate endpoints. This is the probe's input — it decides what is actually
+# reachable and writes the answer to runtime/sources.json.
+#
+# All entries authenticate with the AD token from `az account get-access-token`.
+# The probe takes two of them: one for the data plane (cognitiveservices) and
+# one for ARM (management.azure.com), both from the same credential directory.
+
+# 越靠上越优先使用
+#
+# `subscription` and `resource_group` are where the account lives in ARM. They
+# are what lets the probe ASK which deployments exist instead of guessing, and
+# they carry the per-deployment quota with them. Neither is a secret. To find
+# them for a new endpoint:
+#
+#   ./az.sh graph query -q "resources
+#     | where type =~ 'microsoft.cognitiveservices/accounts' and name == '<name>'
+#     | project resourceGroup, subscriptionId"
+#
+# Leaving them out is allowed and falls back to the `deployments` list below.
+candidates:
+  # One block per Azure OpenAI / AI Foundry resource you can reach. Order is
+  # failover priority: the first that serves a model is tried first.
+  #
+  #   name             a label of your choosing. It is what appears in the logs,
+  #                    the dashboard and the x-azure-proxy-route header.
+  #   url              the resource endpoint, trailing slash included.
+  #   api_version      older versions do not serve /v1/responses at all.
+  #   auth             `cli` — the AD token from the identity in .az-identity/.
+  #   subscription     where the resource lives in ARM. Optional; without it the
+  #   resource_group   probe cannot ask which deployments exist and falls back
+  #                    to guessing from the `deployments` list below.
+  #
+  # To find the ARM coordinates of a resource you can already reach:
+  #
+  #   ./az.sh graph query -q "resources
+  #     | where type =~ 'microsoft.cognitiveservices/accounts' and name == '<name>'
+  #     | project resourceGroup, subscriptionId"
+
+  - name: my-openai-westus
+    url: https://my-openai-westus.openai.azure.com/
+    api_version: "2025-04-01-preview"
+    auth: cli
+    subscription: 00000000-0000-0000-0000-000000000000
+    resource_group: my-resource-group
+
+  - name: my-foundry-eastus2
+    url: https://my-foundry-eastus2.cognitiveservices.azure.com/
+    api_version: "2024-12-01-preview"
+    auth: cli
+    subscription: 00000000-0000-0000-0000-000000000000
+    resource_group: my-other-resource-group
+
+# The fallback, for an endpoint whose deployments ARM will not list: no
+# subscription/resource_group above, or the proxy's principal cannot read the
+# account. Then there is nothing to do but try names and see which answer, and
+# these are the names it tries.
+#
+# A guessed name is assumed to serve the model it is named after, which is not
+# something the data plane will confirm or deny — endpoint-b has a deployment
+# called `gpt-4o-mini` that serves gpt-4.1-mini. Prefer ARM.
+deployments:
+  - gpt-5.6-sol
+  - gpt-5.6
+  - gpt-5.5
+  - gpt-5.4
+  - gpt-5.4-mini
+  - gpt-5.4-nano
+  - gpt-5.2
+  - gpt-5.1
+  - gpt-4.1
+  - gpt-4.1-mini
+  - gpt-4.1-nano
+  - o3
+  - o4-mini

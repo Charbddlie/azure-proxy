@@ -1,0 +1,117 @@
+"""The palette and the glyphs, in one place because they are one decision.
+
+Low saturation throughout. A dashboard that is looked at for hours has to be
+readable rather than loud, and — more to the point here — saturation is the
+only channel left to mean *urgency*. If the normal state is already vivid, a
+throttled endpoint has nothing louder to be.
+
+Two rules the rest of the package follows:
+
+**One hue per quantity, not per category.** The four faces (chat, chat-stream,
+responses, responses-stream) are four slices of ONE number — what this proxy is
+taking from a deployment — so they share a colour and differ only in glyph.
+Giving them four colours would read as four independent bars that happen to
+touch, which is the wrong mental model: they compete for a single ceiling.
+
+**Colour states, not values.** The severity colours are applied to the
+percentage and the panel border, never to the bar body. The bar's job is to
+show proportion; recolouring it at a threshold makes the same length mean two
+different things depending on where the boundary happens to fall.
+"""
+
+# -- palette ---------------------------------------------------------------
+#
+# Truecolor hex. Every terminal this is meant for reports COLORTERM=truecolor;
+# rich degrades to the nearest 256-colour cell on the ones that do not, and the
+# palette is chosen so that degradation still separates the four roles.
+
+BORDER = "#3a3f46"          # panel edges at rest
+BORDER_ACTIVE = "#55606b"   # the panel under the cursor
+TITLE = "#9aa7b4"           # panel titles
+LABEL = "#7c8894"           # field names, units
+DIM = "#4e565f"             # things present but not currently interesting
+TEXT = "#c3cad2"            # ordinary values
+
+OURS = "#7fa08a"            # sage: what THIS proxy is using
+FOREIGN = "#b39a72"         # tan: what everyone else is estimated to hold
+FREE = "#3b4149"            # the rest of the ceiling
+
+OK = "#86a98e"
+WARN = "#c2a06a"            # muted amber
+CRIT = "#b57f83"            # muted rose
+ACCENT = "#8d9bc4"          # periwinkle: selection, the active board
+
+# -- severity --------------------------------------------------------------
+#
+# Thresholds on TOTAL load — ours plus theirs — because that is what decides
+# whether the next request gets a 429, and 30% of a deployment someone else has
+# 60% of is a busier place to send traffic than 50% of an empty one.
+#
+# 0.7 is the shipping spill_threshold (settings/policy.yaml). Sitting exactly on
+# it is the priority_threshold mode working correctly, not a problem, so the
+# warning band opens below it and red is kept for genuinely over.
+
+WARN_AT = 0.55
+CRIT_AT = 0.80
+
+
+def severity(total_load):
+    """The colour for a load figure. `None` means unknown, which is not zero."""
+    if total_load is None:
+        return DIM
+    if total_load >= CRIT_AT:
+        return CRIT
+    if total_load >= WARN_AT:
+        return WARN
+    return OK
+
+
+# -- glyphs ----------------------------------------------------------------
+#
+# Ordered heaviest to lightest within `ours` so that a stacked bar reads as a
+# gradient rather than as noise, and so the four are still distinguishable at
+# one cell each. All four are drawn in OURS.
+#
+# The keys are the FACES names from proxy/server.py. They must stay in step;
+# the bar falls back to the last glyph for a name it does not know rather than
+# dropping the segment, because a segment silently missing from a bar is worse
+# than one drawn with the wrong texture.
+
+FACE_GLYPH = {
+    "chat": "█",
+    "chat_stream": "▓",
+    "responses": "▒",
+    "responses_stream": "▚",
+}
+FACE_LABEL = {
+    "chat": "chat",
+    "chat_stream": "chat~",
+    "responses": "resp",
+    "responses_stream": "resp~",
+}
+FOREIGN_GLYPH = "░"
+FREE_GLYPH = "·"
+UNKNOWN_GLYPH = "─"          # the ceiling is not known, so nothing can be shown
+
+# -- event stream ----------------------------------------------------------
+#
+# One mark per kind, coloured by what the kind MEANS rather than by its log
+# level. A `foreign` event is logged at info because it is not an error, but it
+# is the most interesting line in the stream — it is the only moment the proxy
+# can see the other tenants at all — so it gets its own colour rather than
+# sinking into the ordinary traffic.
+
+EVENT_STYLE = {
+    "boot":      ("•", ACCENT),
+    "request":   ("→", DIM),
+    "response":  ("←", DIM),
+    "throttle":  ("▲", CRIT),
+    "demote":    ("▼", WARN),
+    "foreign":   ("◆", FOREIGN),
+    "failover":  ("⇄", WARN),
+    "held":      ("⏸", ACCENT),
+    "pin":       ("⚲", ACCENT),
+    "timeout":   ("◷", WARN),
+    "exhausted": ("✖", CRIT),
+    "token":     ("⚿", LABEL),
+}

@@ -1,0 +1,44 @@
+# 运行时产物
+.proxy.pid
+proxy.log
+__pycache__/
+*.pyc
+
+# 你自己的配置。仓库里只有 settings/*.yaml.template，真文件由你从模板复制出来:
+#
+#   cp settings/endpoints.yaml.template settings/endpoints.yaml
+#   cp settings/policy.yaml.template    settings/policy.yaml
+#
+# endpoints.yaml 里是你的订阅 ID 和资源组，那是你的东西不是仓库的；policy.yaml 里
+# 是你这台机器的调参，也不该表现成仓库的 diff。模板带 `.template` 后缀，不被下面
+# 这条匹配。
+settings/*.yaml
+
+# 凭据。
+#
+# keys.json: probe/probe.py 会读它拿 Azure api-key（走 auth: key 的 endpoint 用）。
+keys.json
+
+# .az-identity/ 里是运行身份的 refresh token。整个目录排除，只放行那份说明——
+# 这样目录在版本库里是**可见**的（新用户 clone 下来就看到它和该往里放什么），
+# 而里面的东西一个也进不去。这条是此刻唯一挡在 refresh token 和 git 历史之间的
+# 东西，别放宽，也别对里面任何文件 `git add -f`。
+.az-identity/*
+!.az-identity/README.md
+
+# 这个目录是 .az-identity 改名前的旧名字，现在不该存在了。留着这条是安全网：
+# 一次 `git add -A` 就能把里面的 refresh token 整个暂存起来（真发生过），
+# 而它和上面那条差一个点，所以上面那条挡不住它。
+az-identity/
+
+# 项目自带的虚拟环境。跟着仓库走，但不进版本库——它是一堆平台相关的二进制，
+# 重建两条命令就够（见 README「环境」）。
+.venv/
+env/
+
+# 探测产物。代理启动时要读 runtime/models.json，所以一个新 clone 在跑过
+# probe/probe.py 之前是起不来的——这是有意的：这两个文件描述的是「某个订阅在
+# 某一刻有哪些部署」，是环境状态不是代码，签进版本库只会让它慢慢和现实脱节，
+# 而一份过期的部署表比没有更难查。
+runtime/
+runtime.bak*

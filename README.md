@@ -1,0 +1,978 @@
+# azure-proxy
+
+本地 OpenAI 协议代理。持有 Azure 凭据，对外暴露**无需鉴权**的
+`/v1/chat/completions` 和 `/v1/responses`。调用端只给模型名和参数，代理负责挑
+endpoint、附加凭据、把模型名换成该 endpoint 上的部署名，按每个部署各自的配额
+分摊流量，并在 429/5xx/流内限流时切到另一个部署重试。
+
+两个面**分开路由**。Azure 把 Responses API 挡在**独立的数据操作**
+（`Microsoft.CognitiveServices/accounts/OpenAI/responses/write`）后面，老的
+api-version 也根本不提供这个接口——所以一个 chat 能用的模型完全可能没有 responses
+路由。谁支持哪个面由探测决定。
+
+调用端有三类，行为都是实测的：
+
+| | |
+|---|---|
+| [Harbor](https://github.com/harbor-framework/harbor)（Terminal-Bench 2.0 harness） | `litellm.acompletion`，chat 面，非流式 |
+| codex 0.149.0 | responses 面，**只走流式**；`store: false`，每轮重发完整 `input`；`include: ["reasoning.encrypted_content"]` |
+| mini-swe-agent | `litellm.responses()`，responses 面，**默认非流式** |
+
+所以流式和非流式都要支持。**服务端会话状态一概不做**——没有调用方用
+`previous_response_id`。
+
+但 `store: false` 的意思是「服务端别存」，**不等于「这个请求是自包含的」**。codex 拿回
+去又发回来的加密 reasoning 就是跨轮状态，只不过由客户端背着走——而且**绑定在产出它的
+那个 endpoint 上**。所以有一件事必须做：**会话亲和**。见下面「加密 reasoning 与会话亲和」。
+
+
+---
+
+## 部署
+
+**一台机器只部署一份。** 负载均衡是靠一本账本实现的——代理记下自己往每个部署发了
+多少，据此决定下一个请求去哪。两份代理各记各的账、花同一份配额，还都以为自己是唯一的，
+那个账本就成了废纸。所以这不是「建议」，是它能工作的前提；`start.sh` 撞上已在运行的
+实例会直接报错退出，就是为了守住这一条。
+
+推论是:**装在一个所有人都能访问的路径下**，别装在某个人的家目录里。
+`/srv/azure-proxy`、`/opt/azure-proxy` 或者一块共享盘上的目录都行——重点是所有需要
+起停它的人都能进得去、写得动。整棵树是自足的（代码 + 虚拟环境 + 凭据），`mv` 走整个
+目录就是一次完整的搬迁，没有任何指回原处的绝对路径。
+
+```bash
+git clone <repo> /srv/azure-proxy && cd /srv/azure-proxy
+
+python3 -m venv .venv                          # 1. 环境
+.venv/bin/pip install -r requirements.txt
+
+./import-identity.sh sc-1234567@microsoft.com   # 2. 身份，见下
+.venv/bin/python probe/probe.py                 # 3. 探测有哪些部署可用
+./start.sh                                      # 4. 起
+```
+
+### 1. 环境
+
+| | |
+|---|---|
+| Python | ≥ 3.9（3.9 和 3.11 上都跑过全量测试） |
+| 位置 | `./.venv`，`.gitignore` 挡掉 |
+| 依赖 | 见 `requirements.txt`，六个包，全都被代码 import |
+
+还需要**系统装了 Azure CLI**（`az`）。它不是 pip 依赖：`azure-identity` 的
+`AzureCliCredential` 是 shell 出去调 `az account get-access-token`。
+
+不需要 `conda activate` 之类的东西——脚本都先 `cd` 到仓库根再用 `./.venv/bin/python`。
+想用别的解释器就设 `AZURE_PROXY_PYTHON`。
+
+### 2. 身份
+
+代理不是用你的 Azure 账号跑的，而是用**部署被授权给的那个 principal**。它需要那个身份
+的凭据放在自己的目录里（`.az-identity/`），不能用 `~/.azure`——你自己的 `az login`
+不能把代理的身份换掉，反过来也一样。
+
+如果这台机器上已经登录过那个账号：
+
+```bash
+./import-identity.sh sc-1234567@microsoft.com
+```
+
+它从 `~/.azure`（或 `$AZURE_CONFIG_DIR`）里**只把这一个账号的凭据**挑出来写进
+`.az-identity/`，然后实测一次能不能签出 token。
+
+**别用 `cp ~/.azure/*.json`。** 一份 `~/.azure` 装着你登录过的每一个账号的
+refresh token——这台机器上的那份就同时有两个——整份拷过去等于把代理用不到的那个身份
+也交了出去，而这个目录是所有运维者都能读的。`import-identity.sh` 存在的理由就是这个。
+
+没登录过就先登录，注意走 `./az.sh` 而不是裸 `az`：
+
+```bash
+./az.sh login --use-device-code
+```
+
+细节和「到底最少需要哪两个文件」见 `.az-identity/README.md`。
+
+### 3. 探测
+
+`runtime/` 是探测的产物，不进版本库，所以新 clone 在跑过探测之前是起不来的——这是有意的:
+那两个文件描述的是「某个订阅在某一刻有哪些部署」，是环境状态不是代码。
+
+---
+
+## 目录
+
+```
+azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目录可以直接搬走
+├── start.sh / start_tui.sh / stop.sh / restart.sh
+├── preflight.sh         # 两个启动脚本共用的检查，别单独跑
+├── az.sh                # 代理专属的 az —— 运维一律走它，别用裸 az
+├── import-identity.sh   # 从已有登录里挑出一个账号的凭据装进来
+├── requirements.txt
+├── .venv/               # 虚拟环境，gitignore
+├── .az-identity/        # 运行身份的 az 配置目录，含 refresh token。gitignore
+│   └── README.md            要放哪两个文件、为什么只需要两个
+├── tools/
+│   └── import_identity.py
+├── settings/            # 人写
+│   ├── endpoints.yaml       候选 endpoint（含订阅坐标）+ 探不到时的后备名单
+│   └── policy.yaml          端口、超时、重试策略、凭据目录
+├── runtime/             # 探测生成，勿手改
+│   ├── sources.json         每个 endpoint 的状态与存活部署
+│   └── models.json          模型名 → 路由（按故障切换顺序），带每个部署的配额
+├── probe/
+│   └── probe.py
+├── proxy/
+│   ├── __main__.py          前台跑 uvicorn；后台化是 start.sh 的 nohup
+│   ├── server.py
+│   └── events.py            结构化事件环，/events 的后面
+├── tui/                 # 看板。独立进程，只读，不管服务死活
+│   ├── app.py               Live 循环、raw-tty 按键、看板切换
+│   ├── boards.py            源 / 模型 / 事件流 三个看板
+│   ├── bars.py              分段容量条
+│   ├── layout.py            宽度感知的列分配与格子分配
+│   ├── snapshot.py          把 JSON 归一成「按源」「按模型」两个视图
+│   ├── client.py            轮询
+│   └── theme.py             低饱和调色板 + 字符表
+└── test/
+    ├── fake_azure.py        可编程的假上游
+    └── run_tests.py
+```
+
+`settings/` 是 YAML，因为注释有用。`runtime/` 是 JSON，因为它不该被手改——
+JSON 不支持注释这件事本身就在说明这一点。
+
+---
+
+## 运行
+
+服务只有一种起法，后台。看板是另一个进程，只读，起停跟服务无关。
+
+| 命令 | 做什么 |
+|---|---|
+| `./start.sh` | 后台起，日志进 `proxy.log` |
+| `./stop.sh` | 停 |
+| `./restart.sh` | stop + start。改过 `settings/` 或重跑过探测之后用 —— 配置只在启动时读一次 |
+| `./start_tui.sh` | 打开看板，看**已经在跑**的那个服务；服务没跑就报错退出 |
+
+**`start.sh` 撞上已在运行时 exit 1**，要先 `./stop.sh`，或者用 `./restart.sh`。
+以前这里是 exit 0 —— 那对任何看返回码的脚本来说都读作「你的新配置生效了」，而它没有：
+配置只在启动时读一次。在线的判据有两条，pidfile 里的进程活着**或者** `/healthz` 有应答；
+后者是为了抓住不是脚本起的那个进程，因为两个代理各记各的账本、花同一份配额，还都以为
+自己是唯一的。`start_tui.sh` 问的是同一个问题、要的是相反的答案：没在跑就没什么可看的。
+
+`.proxy.pid` 由代理进程自己写、退出时自己删。以前是 `start.sh` 用 `$!` 写的，少的就是
+后半截 —— 干净退出时不再留下一个需要 `stop.sh` 认出来是垃圾的 pid。
+
+监听 `127.0.0.1:8811`（在 `settings/policy.yaml` 改）。共享机器上这个端口段常有别人的
+服务，换端口前先 `ss -lnt` 看一眼。
+
+五个接口：
+
+| | |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI 协议，无需鉴权 |
+| `POST /v1/responses` | Responses API，流式与非流式都支持 |
+| `GET /v1/models` | 可用模型 + 每个模型的路由链和支持的面 |
+| `GET /healthz` | 存活、两个面各有几个模型、凭据目录、上次探测时间、当前 `balance` 模式和溢出阈值、监听地址、已运行时长 |
+| `GET /routes` | 每条路由的声明配额与实测配额、自己账本的窗口用量（并按四个「面」拆开）、`our_load` / `foreign_load` / `total_load`、当前权重、429 次数、降权状态、钉住的会话 |
+| `GET /events` | 最近的结构化事件环，看板的数据源。`?since=<游标>&limit=&kind=`，`kind=problems` 只要出问题的那几类 |
+
+**不实现** `GET/DELETE /v1/responses/{id}`、`/cancel`、`/input_items`。没有调用方
+需要有状态会话，而且这些请求 body 里没有 `model`，无法按模型路由。
+
+响应头带 `x-azure-proxy-route`，写明这次实际走的是哪个 endpoint 的哪个部署。
+排查时先看它。
+
+日志在 `proxy.log`：启动摘要（当前 az 账号、token 寿命、每个 endpoint 两个面的状态、
+两个面各有几个模型）、每个请求进出各一行（模型、是否流式、走的哪条路由、耗时）、
+每次故障切换、每次 token 刷新。**请求体和响应体在任何级别都不记**——prompt 是用户
+数据，`/events` 守同一条规矩。`settings/policy.yaml` 的 `server.log_level` 调级别，
+`debug` 会多打每次上游尝试。
+
+调用方式见 `../USING-AZURE-PROXY.md`。
+
+
+---
+
+## 看板（TUI）
+
+```bash
+./start_tui.sh                          # 看本机这个代理
+./start_tui.sh --url http://host:8811   # 看别的机器上的
+python -m tui --url ...                 # 同上，少了下面那几项检查
+```
+
+需要 `rich`，`requirements.txt` 里已经有了。
+
+**看板只读，不管服务的死活。** 它是独立进程，通过代理自己的 HTTP 面
+（`/healthz` `/routes` `/events`）取数，所以随开随关都不碰服务；关掉它所在的终端
+带走的只有看板。反过来 `./restart.sh` 的时候开着的看板会显示一两秒「不可达」然后
+自己接上新的。服务没在跑时 `start_tui.sh` 直接报错退出 —— 一块开着却只会说
+「unreachable」的屏幕读起来像故障，而实际情况是根本没人让它跑。
+
+三个看板，`←` `→` 切换，`↑` `↓` 滚动：
+
+**源** —— 一个 endpoint 一张卡。这个资源上哪些部署在被用、各自吃掉了多少配额。
+一个 endpoint 是一份钱、一个爆炸半径，所以按它分组。
+
+**模型** —— 一个模型一张卡。这个名字能从几个源拿到、每个源有多大、当前权重分到多少。
+调用方要的是 `gpt-5.4`，这张卡回答的是「它现在实际能从哪来」。
+
+### 卡片的顺序，以及什么被藏起来了
+
+默认顺序是**先活跃度，再推出时间，再强弱**：有流量的置顶（这是个看板，在动的才是要看的），
+其余按 `model_version` 从新到旧 —— 那是探测从 ARM 拿到的真实发布日期，不是从名字猜的。
+同一天发布的（`gpt-5.6-luna` / `sol` / `terra` 都是 2026-07-09）再比强弱：
+pro > codex-max > codex > 裸模型 > mini > nano。
+
+「测到过上限」和「从没测过」**不参与排序**。两者的区别是真的、条形也画得出来，但那是
+「代理被告知过什么」而非「有没有流量」，让它参与排序的结果是一个闲着的 `gpt-5.4` 
+莫名其妙压在三个更新的模型上面。真有负载的仍然排在两者之前。
+
+**旧模型闲着时默认不显示。** 保留最新的 3 个版本号（当前是 5.6 / 5.5 / 5.4），
+`gpt-5.3` 及以前、`gpt-4` 系列、`o` 系列都收起来。**有流量就一定显示**，不管多老。
+
+按**版本数量**而不是固定下限，是因为固定下限会烂：钉死在 5.4 就意味着 5.4 永远在屏幕上，
+每出一个新模型都得回来改一次。数数是自己滑动的 —— 5.7 一上来，5.4 就从底下掉出去。
+
+按**版本号**而不是发布日期，尽管日期又准又现成：日期挨得太近，切不开。
+`gpt-5.3-codex` 是 2026-02-24，`gpt-5.4` 是 2026-03-05，隔九天 —— 要这么精确的一个窗口，
+下一次发布就会让它失效。**日期负责排序，版本号负责判断新旧**，两个问题两个信号。
+
+没有 `gpt-<数字>` 版本号的家族（`o3`、`o4-mini`）一律算旧。这是唯一诚实的答案 ——
+名字里没有任何东西能说明 `o3` 相对 `gpt-5.4` 站在哪。代价是将来一个陌生家族闲着时也会被
+收起来，所以**隐藏了几个永远写在页脚**，`a` 随时展开，标签页也显示 `9/20` 而不是 `20`。
+看板可以少显示东西，但不能不吭声。
+
+**事件流** —— 最新在上，不自动跟随（会滚的东西没法读）。`f` 循环过滤：全部 →
+只看问题 → 只看「别人容量估计变了」。最右边一列固定是**这件事改变了什么** ——
+`others 0%→62% (we 38%)`、`park 18s ×0.25`、`→ endpoint-b/gpt-5.4`。它单独占一列而不是
+跟在消息后面，因为跟在后面时它是第一个被截掉的，而它恰恰是整行最重要的东西：
+消息说发生了什么，这一列说代理现在的判断变了。
+
+### 进度条怎么读
+
+```
+gpt-5.4        ███▓▓▒▒▚░░░░····················   42%
+               └──── ours 31% ────┘└frn 11%┘└─ free ─┘
+```
+
+一条配额被三方瓜分，条形存在的理由就是这三者老被搞混：
+
+- **ours**（鼠尾草绿）—— 实测的，代理自己账本里这个窗口发出去的量。
+  四个字符是同一个数的四个切片，**同色不同字符**：`█` chat、`▓` chat 流式、
+  `▒` responses、`▚` responses 流式。它们抢的是同一个上限，所以是一个颜色；
+  给四种颜色会读成四条互不相干的条恰好挨在一起，那是错的心智模型。
+- **░ others**（灰褐）—— **推断的**，别的租户占了多少。只在被限流那一瞬间可观测，
+  之后按 `foreign_reclaim_per_minute` 线性回收（见下面「别人也在用同一份配额」）。
+- **· free**（暗）—— 剩下的，因此只和旁边那个估计一样可信。
+
+**空条 `────` 加 `—` 不是 0%，是「还没测到上限」。** `load()` 返回 `None` 的语义是
+*未知*：没被试过的路由报不出 limit 头，均衡器故意把它当「不忙」好让它有机会被试。
+画成 0% 等于断言这个部署是空的，那是另一个说法，而且没有证据。
+
+细到看不见的量会强行占一格。四次请求对 300k token 的上限是 1e-5，50 格的条上四个面
+全部舍成 0、空白吃满整条 —— 那条条会说「这里什么都没发生」，而它恰恰是正在扛流量的
+那条。这一格是从最大的那段（一般是 free）借的。
+
+### 按键
+
+| | |
+|---|---|
+| `←` `→` / `h` `l` / `Tab` | 切看板 |
+| `↑` `↓` / `k` `j` | 滚动 |
+| `PgUp` `PgDn` / 空格 | 翻页 |
+| `g` `G` | 顶 / 底 |
+| `s` | 排序：activity（默认，见上）/ name（纯字母序，找已知名字用）/ capacity |
+| `a` | 展开/收起闲置的旧模型 |
+| `f` | 事件流过滤 |
+| `r` | 立刻重取 |
+| `q` | 关掉看板。服务不受影响 |
+
+宽度感知：按最小卡宽算列数，余数逐列摊掉，所以无论几列右边缘都是齐的。终端窄到
+放不下一张卡时降级成单列，先砍掉数字副行 —— 条和百分比是卡本身，副行是对它的注解。
+
+数据 1 秒拉一次，画面 4 Hz 重绘。代理不可达时不清屏，继续画最后一份好数据并在页脚
+标出它多旧了 —— 冻住的屏幕对「它还活着吗」是个比过期屏幕更糟的回答。
+
+---
+
+## 测试
+
+```bash
+.venv/bin/python test/run_tests.py         # 全部
+.venv/bin/python test/run_tests.py failover  # 名字匹配的
+```
+
+测的是**代理自己的行为**，不是 Azure 的行为——故障切换、优先级、三种均衡模式、
+按阈值溢出、参数透传、凭据注入、SSE 增量转发、流开始之后不再切换。全部跑在
+`test/fake_azure.py` 提供的假上游上，所以不需要 Azure 登录、不花配额，而且能精确制造
+真实服务不会按需产生的失败：429 风暴、5xx、挂死、主机不存在、流吐到一半断掉，
+以及**「HTTP 200 + 流内限流事件」**——真 Azure 只在自己过载时才产生它。
+
+每个用例起一个真实的代理进程，配一份临时的 `settings/` + `runtime/`，然后同时断言
+**调用端看到了什么**和**上游收到了什么**。代理认两个环境变量来支持这件事：
+`AZURE_PROXY_HOME` 换配置根目录，`AZURE_PROXY_STATIC_TOKEN` 绕过 `az`。
+
+responses 那组用例发的是**实测抓到的 codex 0.148.0 请求体**，逐字段比对上游收到的
+内容，所以任何一个"看起来无害"的字段过滤都会让测试红掉。
+
+
+---
+
+## 探测
+
+**新 clone 的第一步。** `runtime/` 不进版本库（那是环境状态不是代码，签进去只会
+慢慢和现实脱节），而代理启动时要读 `runtime/models.json`——所以没跑过探测之前
+`./start.sh` 起不来。
+
+```bash
+P=.venv/bin/python
+$P probe/probe.py                    # 全部
+$P probe/probe.py --only endpoint-a   # 单个 endpoint
+$P probe/probe.py --no-responses     # 跳过 responses 那一轮
+$P probe/probe.py --no-arm           # 不查 ARM，退回猜名单
+```
+
+前置：用**代理自己的凭据**登录过（见下一节的 `./az.sh`）。取 token 直接调
+`az account get-access-token`，不依赖 SDK；要两份，一份给数据面
+（`cognitiveservices`），一份给 ARM（`management.azure.com`）。
+
+**部署清单从 ARM 来，不是猜的。** 数据面确实没有发现接口，但管理面有，而且它回答了
+数据面回答不了的三件事：
+
+| | |
+|---|---|
+| 有哪些部署 | 不用再拿名字去撞 |
+| 每个部署**实际服务哪个模型** | 这不等于部署名——`endpoint-b` 上叫 `gpt-4o-mini` 的部署跑的是 gpt-4.1-mini |
+| 每个部署的配额 | `properties.rateLimits`，**和 `x-ratelimit-limit-*` 同单位**，所以能直接当冷启动先验 |
+
+要查一个 endpoint 的订阅坐标（填进 `endpoints.yaml` 的 `subscription` /
+`resource_group`）：
+
+```bash
+./az.sh graph query -q "resources
+  | where type =~ 'microsoft.cognitiveservices/accounts' and name == 'endpoint-a'
+  | project resourceGroup, subscriptionId"
+```
+
+**ARM 说存在，数据面说能不能用。** 两件事分开：principal 完全可能有 ARM 读权限而没有
+任何 data action。ARM 列出的每个部署照样一个个探。ARM 查不到时（没填坐标、没权限、
+网络不通）退回 `endpoints.yaml` 的 `deployments` 名单去猜，`sources.json` 里每个
+endpoint 的 `discovery` 字段记录了这次走的是哪条路（`arm` / `list`）。
+
+ARM 那一步就地排掉三类不可能是 chat 路由的部署，省下请求：**Batch SKU**
+（`gpt-4.1-batch`、`gpt-4o-data` 这类只走 batch API）、**图像部署**
+（`dall-e-3`、`gpt-image-*`，代理不提供那个面）、以及**还没建好的**
+（`provisioningState != Succeeded`）。
+
+`models.json` 按**真实模型名**归并。一个 endpoint 上同一模型有多个部署是常态——
+换个 SKU 再买一份就是**第二份独立配额**——它们是同一个名字下的多条路由，不是冲突。
+`endpoint-a` 的 gpt-5.5 就有两条：DataZoneStandard 5000 和 GlobalStandard 15000。
+
+顺带确定每个部署要 `max_completion_tokens` 还是 `max_tokens`（GPT-5.x 与 o 系列要
+前者，GPT-4.x 要后者）。判活时本来就要试，所以不额外花请求。探测请求的 token 上限给
+到 256 而不是一两个：推理模型要先花掉预算做推理才吐第一个可见 token，上限太低会
+报一个看起来像「部署不存在」的错。
+
+然后是 **responses 面的第二轮**：每个 endpoint 先试 URL 形状
+（先 `openai/v1/responses`，再 `openai/responses?api-version=…`），命中的那个记进
+`sources.json` 的 `responses_path`；再对**每一个**部署各发一次。
+
+这一轮**不以 chat 判活为前提**，因为有些模型只有 responses 面：`gpt-5-pro`、
+`gpt-5.4-pro`、`gpt-5.1-codex`、`gpt-5.1-codex-max`、`gpt-5.3-codex` 对
+`chat/completions` 一律回 `400 The requested operation is unsupported.`，同一个部署
+在 `/responses` 上回 200（实测 2026-08-21）。一个部署**任意一个面能用就算能用**，
+`faces` 记录它到底有哪些面。
+
+endpoint 级失败会被归类，而不是笼统的"不可用"：`dns_nxdomain`（资源已删除）、
+`public_access_disabled`（需私有终结点）、`auth_denied`（principal 缺 data action）、
+`no_known_deployments`（endpoint 正常但没有部署应答）。responses 面单独报
+`responses_status`：`auth_denied`（缺 `responses/write` 这个**单独的**权限）、
+`unsupported`（api-version 太老或该资源不提供）。
+
+Azure 增删部署后重跑。`runtime/*.json` 头部有 `_generated_at`。
+
+
+---
+
+## 参数处理
+
+**全部原样透传。** 代理只改写 `model` 字段，其余不动。
+
+如果某个部署拒绝某个参数，它的 400 原样回给调用端。代理不代为丢弃参数——那会让
+`--temperature 0.7` 表面成功、实际按默认值运行，benchmark 数字失去可比性，而且
+下游无从察觉。上游的 400 更难受但更诚实。
+
+responses 面同理，而且更要紧：codex 发的 `include: ["reasoning.encrypted_content"]`
+`reasoning.context` `prompt_cache_key` `client_metadata` `text.verbosity` 都是较新的
+字段，白名单式过滤会看起来无害地把它们吃掉。它的工具还**不在顶层 `tools` 数组**里，
+而是塞在 `input` 里一条 `type: "additional_tools"` 的 developer 消息中——按
+chat/completions 那套结构去理解请求会踩空。回程也一样：SSE 是**字节级转发**，
+代理不解析事件，所以加密的 reasoning 原样回吐，codex 靠它在无状态前提下跨轮保留
+推理链。
+
+已知会撞的一条：Harbor 同时发 `reasoning_effort` 和 `temperature`，而 GPT-5 系列
+拒绝这个组合。用 GPT-5 系列时二选一。
+
+另一条不是代理造成的，但会像 bug 一样表现：**推理模型的思考 token 计入
+`max_completion_tokens`**。给 `gpt-5.5` 设 16，16 个全被推理吃掉，`content` 是空串、
+`finish_reason` 是 `length`。给几百以上才有可见输出。
+
+### 唯一的例外：responses 面的两处改写
+
+`request.responses_compat`（`settings/policy.yaml`，默认 `true`）。只作用于
+`/v1/responses`，chat 面不受影响：
+
+| # | 改写 | 起因 |
+| --- | --- | --- |
+| 1 | `input[*].tools[*].description` 和顶层 `tools[*].description` 的**空串**填成 `(no description)`，递归到嵌套的 `tools` | codex 把真工具包在一个 `type: "namespace"`、`name: "functions"` 的壳里，壳自己的 description 是空串。Azure 报 `empty_string`，真 OpenAI 接受 |
+| 2 | 删掉 `input[*].internal_chat_message_metadata_passthrough` | codex 给每条 input 消息挂 `{turn_id, create_time}`。Azure 报 `unknown_parameter: ...create_time`。这是 codex 给有状态会话存储用的簿记，本代理**没有会话状态**，它没有可以 passthrough 的去处 |
+
+两处都只动结构，不碰 prompt、采样参数和工具行为，所以跑分仍可比。启动时日志里会写
+`responses compat rewrites: on`，`/healthz` 里也有 `responses_compat` 字段——真出了
+解释不了的结果，这行是提醒你「代理确实碰过 body」的唯一线索。关掉就能看到 Azure 的
+原话，当初这两条就是这么定位出来的。
+
+**2026-08-20 复测：这两个 400 在 `endpoint-a` / `2025-04-01-preview` 上已经复现不出来了。**
+用空 description（顶层 `tools`、嵌套子工具、`input[*].tools` 三种位置）和带
+`create_time` 的 `internal_chat_message_metadata_passthrough` 各发一遍，
+`responses_compat` 关着也全部 200。原始那次是 2026-08-19 用抓包录下的 codex 真实请求
+逐字段定位的，那份 capture 没有留存，所以无法逐字重放。可能是 Azure 改了校验，也
+可能触发条件还依赖请求里别的部分。
+
+结论：**改写留着，但别把它当成 codex 已经跑得通的证据。** 它已通过单元测试、且对常规
+流量零影响（全量回归全过）；codex 到底还卡不卡，只有真跑一次 codex 才知道。真跑之后
+如果发现根本不需要，把 `responses_compat` 设 `false` 就退回纯透传。
+
+---
+
+## 路由与故障切换
+
+`settings/endpoints.yaml` 里 **candidates 的先后顺序就是优先级**——排在最前的
+endpoint 最先被尝试。探测把这个顺序固化成每条路由的 `priority` 字段，服务端按它
+排序，不依赖 JSON 数组顺序在读写间不变。要改优先级，调整 `endpoints.yaml` 的条目
+顺序再重跑探测。
+
+其余规则见 `settings/policy.yaml`：
+
+- 切换只在 **429 / 5xx / 连接错误 / 流内限流** 时触发，退避后换下一个 endpoint，同一个不重试
+- **超时不触发切换**。推理模型的慢请求和挂死在客户端看起来一样，超时重试会为同一个
+  prompt 付两次钱，而且第一个请求可能还在跑。超时返回 504，由调用端决定
+- **4xx 直接透传**。参数原样转发，所以一个关于不支持参数的 400 就是真实且有用的结果
+- **流式请求一旦给调用方发出过字节就不再切换**。中途断流只能让它断，`proxy.log` 里记
+  一行说明为什么没重试
+
+### 200 里面藏着的 429
+
+Azure 限流一个**流式** Responses 请求时，不给 429，给 200。实测抓包（2026-08-20，
+把 endpoint-a 压过 TPM 上限，8 个并发里 5 个被拒）：
+
+```
+HTTP/1.1 200 OK
+retry-after: 4
+x-ratelimit-remaining-tokens: -27689        <- 负数
+
+event: response.created   {"status":"in_progress", ...}
+event: error              {"code":"rate_limit_exceeded","message":"Your requests to
+                           gpt-5.6-sol for gpt-5.6-sol in swedencentral have exceeded
+                           rate limit."}
+event: response.failed    {"status":"failed", ...}
+```
+
+**判据在 header 里。** `retry-after` 在 5 个被拒的响应上全都有、在 3 个成功的响应上
+一个都没有。所以代理就按它判——和读 429 状态行是同一个时刻，**在任何 body 字节之前，
+零延迟，而且和流有多大完全无关。**
+
+最后半句是这件事的全部教训。第一版是去**扫 body 的前 16KB**，单元测试全绿，上线一个
+都没抓到：codex 形状的 `response.created` 会把整个请求（`instructions` + 工具定义）
+原样回显，它自己就比扫描窗口大——实测限流响应恒定 61566 字节，`rate_limit_exceeded`
+这个字符串**落在第 30667 字节**，是 16KB 窗口的 1.9 倍开外。于是一次跑分里
+**184 个限流被记成了 63464 字节的「成功」**，codex 那边每一个都是
+`stream disconnected before completion`。字符串从来没错，错的是「限流一定出现在开头」
+这个假设。
+
+**负的 `x-ratelimit-remaining-tokens` 故意不作为判据**：同一次抓包里有一个成功跑完的
+响应报的是 -27978。这个计数器只要窗口超订就会变负，`retry-after` 才是 Azure 真的在
+拒绝这一个请求。
+
+body 扫描作为**兜底**保留（万一哪天 Azure 不带 header 就发限流），但现在扫**整条流**
+而不是一个窗口——限制它正是当初失效的原因。每个 chunk 一次 `bytes.find`，相对它本来
+就在做的 HTTP 而言不值一提。
+
+`routing.stream_probe` 仍然在：上游回 200 之后先把流的开头读进内存，一个字节都不往下
+发，读到可重试的错误就换 endpoint 重来，读到第一个非前奏事件就原样放行。现在它是兜底
+而不是主判据。首字节延迟实测无代价：对着真 Azure A/B 各 8 次，开着是中位数 0.89s、
+关掉是 1.18s，差异在 Azure 自己的抖动里。
+
+**窗口之后到达的流内限流仍然只计数、不重试。** 这时调用方已经在解析这条流了，拼第二
+条流进去是这个代理绝对不能做的事。它照原样转发，但那条路由会被降权。
+
+字节级转发没有被破坏：检测只 `bytes.find`，转发的是**原封不动的同一批 chunk**。
+codex 的 `include: ["reasoning.encrypted_content"]` 照常工作。
+
+### 诊断开关：`server.capture_dir`
+
+**默认关闭，也应该一直关着**——它把上游原始流写到磁盘，里面有 prompt。
+
+它存在是因为上面那个 bug 从日志里被误判了两次，而把真实字节落到磁盘上五分钟就定了案。
+用法：打开 → 复现 → 读 → 关掉 → 删文件。`capture_mode: suspicious` 只留没跑到
+`response.completed` 的流（既是有意思的那批、也是小的那批），`all` 用于「healthy 的
+响应到底长什么样」这类问题，`capture_limit` 防止忘了关。
+
+---
+
+## 主动负载均衡（`routing.balance`）
+
+三种模式，**默认 `priority_threshold`**。三种都走同一套故障切换规则，都不会重复试同一个
+endpoint，区别只在**先试谁**。
+
+| 模式 | 行为 |
+| --- | --- |
+| `strict_priority` | 严格优先级。优先级 1 吃下 100% 流量，只有它出错才往下走。这是 kill switch |
+| `priority_threshold` | **默认。** 按优先级走，但一条路由用掉自己配额的 `spill_threshold`（默认 70%）之后就跳过它，发给下一条 |
+| `capacity` | 完全无视优先级，每个请求按实测配额抽样 |
+
+`priority` / `weighted` 是前两个和最后一个的旧名字，仍然有效。
+
+**为什么默认是 `priority_threshold` 而不是 `capacity`：** 三个 endpoint 不是等价的。
+`endpoint-c` 的 api_version 是 `2024-12-01-preview`，另外两个是
+`2025-04-01-preview`；三个还在不同 region。优先级顺序是一个「谁更好」的判断，在不花钱
+的时候值得保留。它唯一不该做的事是**攥着自己送不出去的流量**——这正是阈值修掉的。
+
+### 「70% 负载」是怎么算的
+
+- **相对该路由自己的配额**，不是绝对值。gpt-5.6-sol 三条路由的实测上限是
+  333k / 1M / 499k TPM，共用一个绝对数就等于「按最小的那个来」
+- **RPM 和 TPM 都算，取大的那个**——先撞到的那个才是会产生 429 的那个。实测通常是 TPM：
+  跑分时 TPM 用到 ~27% 而 RPM 只有 ~8%，TPM 早约 3 倍撞墙
+- 30% 的余量留给两件看不见的事：Azure 实际是按远短于一分钟的窗口准入的，突发可以
+  超过分钟均值而均值看不出来；账本只数代理自己的流量，别人也在用同一份配额时它是瞎的
+
+### 「当前负载」用的是代理自己的账本，不是 `x-ratelimit-remaining-*`
+
+这是实测之后的选择，不是偏好。**先验证过 `remaining` 的语义，结论是它不能用**
+（2026-08-20，对着闲置的 endpoint-b/gpt-4.1-mini，2000 RPM / 2M TPM）：
+
+- 16 个并发请求 = 瞬时约 960 RPM，是上限的 **48%**，而
+  `x-ratelimit-remaining-requests` 只从 2000 掉到 **1989**——按 60 秒窗口算应该掉到
+  1984 并且待在那儿
+- **3 秒后它就回到 1999** 并保持了后续 35 秒的全部采样。没有任何东西按分钟衰减
+- `remaining-tokens` 一样，而且扣的是**实际用量而不是 `max_completion_tokens` 预留**：
+  16 个请求每个预留 4000 token，总共只让它动了 27
+- 同一个突发内部各个响应互相矛盾（1999、1996、1995、1990、1989…），连快照都算不上
+- `x-ratelimit-reset-*` 每一次采样都是 `0`，没有信息
+
+也就是说，尽管 `renewalperiod` 写着 60，**`remaining` 是一个亚秒级的桶，除以的却是每分钟
+的上限**：真实分钟负载 ~48% 的时刻它报告消耗了 0.55%，差了将近两个数量级。任何 70%
+的阈值挂在它上面都永远不会触发。
+
+所以负载来自**代理自己的账本**：每发出一个请求就按 (endpoint, deployment) 记一条
+`[时间戳, token 数]`，负载 = 窗口内还没过期的部分 ÷ 实测上限。取舍是明确的：
+
+- 对自己的流量**精确**，不需要等响应回来就能更新——这很重要，并发 30、推理一轮一分钟
+  的时候，一个只在完成时更新的信号会滞后整整一个请求
+- **没有流量 = 0 负载**，不是「未知」。安静的路由会被优先选中而不是被饿死
+- **看不见别人**。这一点没法从这里修；兜底的是反应式的那一半——429（含流内 429）降权
+
+token 数在**发出时**按估计计入（Azure 也是在准入时计费的），估计值 = 请求体字节数 ÷
+`assumed_chars_per_token`；任何一个报了 `usage.total_tokens` 的响应都会回头修正这条
+账目、并更新该路由的「每字节多少 token」比率。这是推理模型那些**根本没出现在请求里**
+的思考 token 唯一能被算进来的途径。流式响应也一样——`usage` 是从流过去的字节里
+`bytes.find` 出来的，不解析、不重新序列化。
+
+窗口 60 秒，因为这里每个 deployment 报的 `renewalperiod` 都是 60，账本和被除的上限
+必须是同一个周期。
+
+### 怎么看
+
+```bash
+curl -s http://127.0.0.1:8811/routes | python -m json.tool
+```
+
+`sent_requests_in_window` / `sent_tokens_in_window`（代理的账本）就摆在
+`remaining_requests` / `remaining_tokens`（Azure 的账本）旁边——**两者对不上的时候，
+就是有别人在花同一个 deployment 的配额。**
+
+配额上限不用单独去测：`limit_tokens` / `limit_requests` 就是代理从正在跑的流量里读到的
+实测值。
+
+### 为什么 n=4 就能把 swc 打限流
+
+不是并发数的问题，是**每个请求太大**。codex 每一轮都把整份 transcript 重发一遍，所以
+TPM ≈ 单请求 token 数 × 轮次频率 × 并发，和 n 只是线性关系里的一项。
+
+实测（2026-08-20，`/routes` 账本，codex 形状的请求）：
+
+| | |
+| --- | --- |
+| endpoint-a 的 gpt-5.6-sol TPM 上限 | 333,000 |
+| 单个 codex 请求的实测 token 数 | ~50,000（账本学到 0.2275 token/字节） |
+| **一个请求就占上限的** | **~15%** |
+| 5 个请求之后账本读数 | 263,316 = **79%**，已越过 70% 阈值并开始溢出 |
+
+也就是说 **swc 的整个配额只装得下 6~7 个 codex 请求**。阈值判断发生在发出之前，而 4~8
+个请求会在任何一个返回之前全部发出去，所以账本可能从 56% 一跳到 79%——**颗粒度就是
+15%，想卡准 70% 是不可能的。**
+
+账本本身是准的：限流那一刻 Azure 报 `remaining-tokens: -27689`（即它数到约 360k），
+账本数到 263k / 5 个请求，量级和单价都对得上，误差大约 15%。所以 70% 这个阈值有意义，
+**但对 gpt-5.6-sol + codex 这种「单请求占 15% 上限」的负载，它只能减少限流、不能消灭
+限流**——限流照样会发生，只是现在会被透明地切走，调用方看不到。
+
+**建议：gpt-5.6-sol 跑 codex 且 n≥4 时用 `balance: capacity`。** 三条路由的容量是
+333k / 1M / 499k，`capacity` 从第一个请求就按 18% / 55% / 27% 分，谁都不会贴着自己的
+天花板跑；`priority_threshold` 则会让最小的那条（swc，只占总量 18%）长期停在 79% 并
+反复触发限流——虽然每次都被透明处理掉，但每次都要多付一个往返加一次退避。
+
+`gpt-5.5` 有 5 条路由（swc 和 scus 各有两个部署）；`gpt-5.4` `gpt-5.4-mini`
+`gpt-5.4-nano` `gpt-5.6-sol` `gpt-5.6-luna` `gpt-5.6-terra` `o3` 有 3 条；
+`gpt-4.1-mini` `gpt-4o` 有 3 条、`gpt-4.1` `gpt-5.1` `o4-mini` `gpt-5.4-pro` 有 2 条；
+`gpt-5.2` `gpt-5-mini` `gpt-5-pro` `gpt-5.1-codex` `gpt-5.1-codex-max`
+`gpt-5.3-codex` 只有 1 条，**没有切换余地**，429 时只能把错误回给调用端。
+长时间 benchmark 优先选前两组。
+
+**`gpt-5-pro` `gpt-5.4-pro` `gpt-5.1-codex` `gpt-5.1-codex-max` `gpt-5.3-codex`
+只有 responses 面**——它们对 `chat/completions` 一律回
+`400 The requested operation is unsupported.`，走 `/v1/chat/completions` 会拿到
+404 `no_chat_route`（错误信息里会说清它在哪个面上）。
+
+以 `GET /v1/models` 为准，上面这份是 2026-08-21 探测的快照。
+
+一个模型在两个面上的路由数**可能不同，也可能只有一个面**。`GET /v1/models` 的
+`faces` 字段是准的，`runtime/models.json` 里每条路由的 `faces` 是它的来源。
+
+### 权重是怎么来的（`capacity` 模式，以及后备链的排序）
+
+权重来自 Azure 每个响应都带的 `x-ratelimit-limit-tokens`（没有就退回
+`-limit-requests`）。没被观测过的路由用先验，而**先验现在几乎不是猜的**：探测已经从
+ARM 拿到了每个部署的 `rateLimits`，和响应头同单位，写在 `runtime/models.json` 的
+`capacity_requests` / `capacity_tokens` 里——进程刚起来就知道每条路由的真实上限，
+第一个响应只是确认它。`GET /routes` 把两者并排列出：`capacity_*` 是 ARM 声明的，
+`limit_*` 是流量实测的，对不上就说明配额在上次探测之后动过。
+
+`policy.yaml` 的 `static_weights` 退成**最后的兜底**，只在 ARM 给不出容量时才用到
+（endpoint 没填订阅坐标、没有 ARM 读权限、或者 `runtime/` 是旧的）。它天生更差，
+不是因为数字旧：**配额是按部署给的**，同一个 endpoint 的不同部署根本不共享一个
+天花板——`endpoint-b` 对 gpt-5.6-sol 是 1000 RPM，对 gpt-4.1-mini 是 2000。
+一个 endpoint 一个数字，不可能对两者都成立。
+
+走到兜底那条路时，**先验会先被换算成实测的单位**再参与比较：Azure 报的是几十万的
+TPM，配置里写的是几百的 RPM，直接放在一起比，第一个应答的路由会拿到 100000 的权重、
+其余的还停在 1，从此再也抽不到——那就是「优先级路由多绕一圈」而已。换算的汇率取自
+那些两个数都已知的路由。ARM 来的先验本来就同单位，这个汇率对它们退化成 1。
+
+后备链的排序也用同一份容量：**endpoint 优先级在前，容量只在同一个 endpoint 内部
+打破平手**。`endpoint-a` 上 gpt-5.5 有 5000 和 15000 两个部署，没有理由先去够小的
+那个。
+
+另外两个信号：
+
+- `x-ratelimit-remaining-*` 只在**掉到上限的一半以下**时才降权，线性降到地板。按上面
+  实测的语义，这一条基本永远不会触发；留着是因为它不花钱，而且真触发的那一次它报的
+  是一个真实的瞬时突发。**别把它当成负载信号**，负载信号是账本
+- **429 会临时降权**（乘 0.25 并按 `Retry-After` 停发），不只是这一次请求绕开它。
+  停发窗口结束后按半衰期指数恢复。5xx、连接错误和流内限流走同一条路径。停发中的路由
+  在 `priority_threshold` 里也不会被选作链头——账本只知道自己的流量，`Retry-After`
+  说的是所有人的
+
+抽样而不是「谁剩得多发给谁」：后者在并发下所有在飞的请求会算出同一个答案、一起压向
+同一个 endpoint，而修正要等响应回来才发生。抽样没有这个反馈延迟，也不需要记在途请求。
+
+---
+
+## 别人也在用同一份配额（`balancing.foreign_load`）
+
+上面那本账只数**自己**发出去的量。但配额是按 deployment 给的，跟所有拿得到凭据的人共享
+——光这台机器上，另一个账号底下就有 8 个代理指着同一批 endpoint，其中 2 个的部署列表
+读不到（不是同一个账号，没权限），无法确认是不是在抢同一个部署。
+
+**只看自己的账本，就会一直撞一堵从这里看不见的墙。**
+
+### 唯一能看见别人的时刻
+
+就是 Azure 拒绝我们的那一刻。限流意味着**总量**顶到了天花板，而我们自己那一份是已知的：
+
+```
+foreign = clamp(1 - our_load_at_throttle, 0, 1)
+```
+
+我们负载 0.9 时被限流 → 基本是自己撑满的。我们负载 0.05 时被限流 → **别人占了 95%**，
+我们只是最后到的那个请求。后者正是重点。
+
+两个模式都改成看 `our_load + foreign_load`：`priority_threshold` 按合计值溢出，
+`capacity` 按 `limit × (1 - total_load)`（**实际剩下的**）抽样，而不是按名义上限。
+
+实测验证（2026-08-21，直连 Azure 打满 swc 扮演「别人」，同时让代理只发几个请求）：
+
+```
+endpoint-a/gpt-5.6-sol                  our=0.003  foreign=0.997  total=1.0   n=1
+endpoint-b/gpt-5.6-sol                 our=0.002  foreign=0.0    total=0.002
+endpoint-c/gpt-5.6-sol  our=0.008  foreign=0.0    total=0.008
+```
+
+代理自己只用了 0.3%，却正确判定这个 deployment 是满的，而且没有污染另外两条路由。
+`/routes` 里长期观测 `foreign_load` 也就是**验证「到底有没有人在抢 gpt-5.6-sol」的手段**。
+
+### 合成探测没有用
+
+「主动发个测试请求看看」是个自然的想法，但它不成立：限流是按**聚合量**触发的，别人占
+90% 还是 0%，你单发一个小请求都会成功。要能分辨就得发到足以撞墙的量——那既花配额又
+干扰被测对象。**唯一有信息量的探针就是真实流量。** 这跟 TCP 是同一个问题：可用容量只能
+靠用它来发现。
+
+### 控制律是 AIMD
+
+- **乘性减**（我们的份额）：被限流时估计值**直接跳到观测值**，而且只升不降
+  （跟当前值取 `max`）。因为我们自己的负载会波动——某次限流恰好发生在我们负载很高的
+  时候，不该抹掉之前那次「别人占了 0.8」的发现，否则接下来几分钟都在重新学同一件事
+- **加性增**（我们的份额）：两次限流之间，`foreign` 按 `reclaim_per_minute: 0.1`
+  **线性**回收，10 分钟忘干净一个 100% 的估计
+
+**为什么线性而不是指数半衰期**：指数在刚被限流后的那一分钟里还得最快——正是最该谨慎的
+时候；之后又拖尾很久——那时估计已经陈旧、最不值钱。两头都是反的。线性是恒定的温和收回。
+
+而且 AIMD 是唯一能让**互相看不见的多个控制器**收敛到公平分配的组合（AIAD、MIMD 都不
+行）。这台机器上另外几个代理很可能也在做自适应，所以这条不是理论洁癖。
+
+**回收要等 `Retry-After` 过去再开始**——Azure 直接说了这次拥塞还要多久，没必要自己猜。
+
+实测回收曲线（`/routes` 每分钟采样一次）：
+
+```
+foreign=0.989 → 0.889 → 0.789 → 0.689 → 0.589      每分钟正好 -0.100
+```
+
+### 闭环靠 `weight_floor` 收敛
+
+一条被判定为满载的路由**仍然保底拿到 `weight_floor`（5%）的流量**。那些请求就是探针
+——是真实流量，零额外成本，别人真走了它们就会成功，估计值随之回收、容量拿回来。
+
+**注意 floor 是对所有削减因子的乘积生效，不是对每一项分别生效。** 之前是后者：一条
+又满载、又停发中、又低 headroom 的路由会被 floor 三次，落到 `0.05³` ≈ 万分之一，
+那不叫探针那叫饿死。
+
+### 两个取舍
+
+**闲置也照样回收**（不冻结）。估计描述的是**外面的世界**，而世界不会因为我们没在看就
+停住。冻结还有个陷阱：一条我们不再使用的路由会**正因为我们不再使用它**而永远被压着。
+代价是恢复流量的第一批请求可能撞一次墙——那是一次透明的故障切换，而且它本身就是信息，
+撞完估计值立刻回到正确值。
+
+**震荡周期**：环路是「撞墙 → 估计跳高 → 少发 → 不再撞 → 线性回收 → 多发 → 撞墙」，
+周期 =（估计值要降多少我们才会重新顶到 1.0）/ 回收速率。稳定外部负载 0.8 时，我们大约
+多要回 0.2 就会重新撞上，**周期约 2 分钟，代价是一个被透明切走的请求**；最坏情况
+（估计 1.0 全部回收完）是 10 分钟。两者都比 `demote_seconds`（30s）和 `Retry-After`
+（实测 1–8s）高一个数量级——快控制器吸收突发、慢控制器定基线，这个分离是它们不打架的
+前提。`reclaim_per_minute` 调到 0.2 以上就会开始破坏这个分离。
+
+### 和 demote 的关系：叠加，不是替代
+
+两者时间尺度差一个数量级，管的也不是同一件事：
+
+| | 管什么 | 尺度 | 对 5xx/连接错误 |
+| --- | --- | --- | --- |
+| `demote` + parking | 「现在别打这里」的躲避动作 | 秒 | **也生效** |
+| `foreign_load` | 「这条路本来就没那么大」的稳态估计 | 分钟 | 不生效 |
+
+一条被限流的路由**既该马上躲开（parking）、又该从此被当成更小（foreign）**，所以是相乘
+叠加。只有 429 会更新 `foreign_load`——500 或连接重置说明 endpoint 病了，跟配额被谁占
+没有关系，拿它去推断外部负载会让一条只是短暂故障的路由被永久缩小。
+
+---
+
+## 加密 reasoning 与会话亲和（`routing.session_affinity`）
+
+**上面所有「把请求换到别的 endpoint」的机制，对 codex 都是有毒的。** 这个仓库连着三个
+版本都以为不是。
+
+codex 发 `include: ["reasoning.encrypted_content"]`，Azure 把模型的推理链**加密**之后
+返回，codex 下一轮再原样发回去。密钥属于产出它的那个资源，所以把密文交给另一个 endpoint
+会得到：
+
+```
+The encrypted content for item rs_… could not be verified.
+Reason: Encrypted content could not be decrypted.
+```
+
+trial 直接死。实测：把 `balance` 改成 `capacity` 之后，前 3 个 codex trial 全是
+`NonZeroAgentExitCode`，0 通过。
+
+所以之前 README 里那句「codex 自己就发 `store: false` 并且每轮重发完整 `input`，所以三个
+endpoint 可以自由轮询」**是错的**。`store: false` 只是说「服务端别存」；加密 reasoning
+仍然是跨轮状态，只是由客户端背着。三个会移动请求的机制——`capacity` 抽样、
+`priority_threshold` 溢出、以及为了修限流而加的**流内限流故障切换**——每一个都会踩到它。
+
+**做法：带跨轮状态的会话钉在产出它的部署上，之后不再移动。**
+
+钉的是**路由**（endpoint + 部署），不是 endpoint。一个 endpoint 可以用两个部署提供
+同一个模型（换个 SKU 就是第二份配额），而 Azure 的加密内容到底是按资源还是按部署
+加密，我们没有证据。钉到具体部署不可能错；钉到 endpoint 是在赌，而赌输的代价是一个
+trial 直接死掉。`GET /healthz` 的 `sessions_per_route` 是按路由的计数，
+`sessions_per_endpoint` 是把它们按 endpoint 合起来看。
+
+### 什么算一个会话
+
+实测 codex 0.149 经 harbor 的真实流量（2026-08-20），下面四个字段**值完全一样，而且一个
+trial 的每一轮都不变**：
+
+```
+session-id:                 01a0216b-cf47-7542-95ad-7d524fbb1582   (header)
+thread-id:                  01a0216b-…                             (header)
+prompt_cache_key:           01a0216b-…                             (body)
+client_metadata.session_id: 01a0216b-…                             (body)
+```
+
+按这个顺序取，第一个命中的就用。header 在前是因为读它不要钱；body 兜底是为了只发其中
+一种的客户端。注意 codex 发的是 **`session-id`**，不是 `x-session-id`——后者是 Harbor 的，
+排在最后。
+
+### 什么算「带状态」
+
+`include` 里出现 `reasoning.encrypted_content`。codex **从第一轮就发**，这一点很关键：
+钉必须发生在**产出密文的那一轮**，而不是把密文交回来的那一轮，否则等发现的时候密文已经
+在错误的 endpoint 上了。
+
+这条同时也保证了**不带加密 reasoning 的调用方完全不受影响**——chat 面、mini-swe-agent
+都不发这个字段，永远不会被钉，照旧享受完整的负载均衡。
+
+### 亲和撞上限流怎么办
+
+`on_conflict: wait`（默认）：**等 `Retry-After` 之后重试同一条路由，绝不换。**
+
+不是「快 vs 慢」的取舍，是「快且错 vs 慢且对」：限流是几秒（实测 `Retry-After` 1–8 秒），
+解密失败是整个 trial 报废。而且换过去大概率也解不开，等于白换。重试 `wait_attempts` 次
+之后仍不行，就把上游的错误交回给 codex，codex 自己会 `Reconnecting… 1/5` 再来一次——那次
+请求还是同一个会话、还是钉在同一条路由，所以两边的重试预算是叠加的，不是互相取代。
+
+`on_conflict: switch` 是退回旧行为的开关。
+
+### 第一轮仍然可以切
+
+还没产出任何东西的时候没有状态要保护，所以**开局那一轮照常参与均衡、照常故障切换**，
+钉是跟着**响应**走的，不是跟着请求走的。这也是亲和没有退化成「所有会话都堆在 endpoint 1」
+的原因：**会话在开始的时候被分散，之后才被固定。**
+
+实测（3 个 trial，`balance: capacity`）：`sessions_per_endpoint` 为
+`{endpoint-b: 2, endpoint-a: 1}`，3/3 通过，0 个解密错误，0 个 `ApiRateLimit`。
+
+```bash
+curl -s http://127.0.0.1:8811/healthz | python -m json.tool   # session_affinity
+curl -s http://127.0.0.1:8811/routes  | python -m json.tool   # 权重 + 钉住的会话
+```
+
+**并发上限因此变了：** 负载均衡的粒度从「每个请求」变成了「每个会话」。n 个 codex 并发
+最多只能用到 n 个 endpoint，所以 n=1 必然全压在一条路由上，跟 `balance` 设成什么无关。
+
+---
+
+## 凭据与 token 过期
+
+代理用 `AzureCliCredential`，也就是 `az account get-access-token` 返回的东西。
+
+**关键事实一：代理跑的不是你的 Azure 账号。** 它借用 `svc-account@example.com`
+——`settings/endpoints.yaml` 里那几个 endpoint 的 data action 是授给这个 principal 的。
+你自己的账号（`your-own@example.com`）登进去，token 签得出来，但每个 deployment 都会
+401/403。实测撞过一次：`az` 被换成另一个 principal，代理的下一次 token 刷新就全线 401。
+
+所以代理有**自己的凭据目录**（`settings/policy.yaml` 的 `auth.az_config_dir`，
+默认是仓库内的 `.az-identity/`）。`AzureCliCredential` 是拿 `os.environ` 的副本去
+spawn `az` 的，所以进程里设一个 `AZURE_CONFIG_DIR` 就够了。**双向隔离**：你 `az login`
+不影响代理，代理的登录也不影响你。
+
+路径写成**相对**的，按仓库根解析，不按调用者的 cwd。以前写的是
+`~/<某人>/.azure-proxy`——那是代理还跑在一个共享账号下时写的。
+后来换成独立账号，同一个 `~` 指向了一个不存在的地方，代理照常启动，
+然后每个请求都是 503 `credentials_unavailable`。后来改成绝对路径填了这个坑，但绝对路径
+换来的是另一个坑：整棵树一搬家就得回来改这一行。相对路径两个都躲开了。
+
+代理相关的 az 操作一律走 `./az.sh`，它替你设好那个目录：
+
+```bash
+./az.sh login --use-device-code
+./az.sh account set --subscription "Advanced Machine Learning"
+./az.sh account show --query user.name -o tsv
+```
+
+裸 `az` 操作的是你自己的 `~/.azure`，对代理没有任何作用。
+
+**关键事实二：一份 `~/.azure` 里通常不止一个身份。** 如果你没法用 device code 登进
+那个 principal，但别处有一份它还登录着的配置目录，用：
+
+```bash
+./import-identity.sh sc-1234567@microsoft.com --from <那份目录>
+```
+
+**不要 `cp -a <那份目录>/. .az-identity/`**，尽管这份代理最初就是那么来的。
+`msal_token_cache.json` 的每个分区都按 `home_account_id` 索引，一份 `~/.azure` 里有几个
+登录过的账号，里面就有几个 refresh token——这台机器上那份就同时装着 `other-account` 和
+`svc-account`，而代理只用得到后者。整份拷过去，等于把一个用不到的活凭据也放进了一个
+所有运维者都能读的目录，而且两个文件看起来跟单个登录毫无区别，没有任何东西会提示你。
+
+`import-identity.sh` 做的是**过滤**而不是拷贝：按 `home_account_id` 精确挑出一个账号的
+`Account` / `RefreshToken` / `IdToken`，裁掉 `azureProfile.json` 里不属于它的订阅并保证
+留一个 default，然后实测签一次 token 证明确实可用。它还会告诉你把谁留在了原处。
+
+顺手两个手工容易做错的地方：`azureProfile.json` 是带 UTF-8 BOM 写出来的（当 utf-8 读会
+直接抛异常）；access token 故意不带过来——它有效期约一小时，带过去的话第一次
+`az account get-access-token` 会直接命中缓存、根本没验证 refresh token，于是一个坏掉的
+refresh token 要等一小时后才暴露。
+
+**同一份 refresh token 别留两份在用。** AAD 对 public client 的 refresh token 是轮换的，
+两个进程各拿一份去刷，早晚互相把对方作废。所以拷完就该把原来那份停掉。
+
+启动时 `start.sh` 会把当前账号和 `policy.yaml` 的 `expected_account` 比一下，不一致就
+警告并告诉你怎么修；代理进程自己也会在 `proxy.log` 里再喊一次——都不 fatal，手上的
+token 可能还能用，启动失败反而更难查。
+
+**关键事实二：`az account get-access-token` 给的是 `az` 自己缓存里的 token，剩余寿命
+不可预测。** 实测拿到过 6 分钟和 9.7 分钟的，也可能拿到接近一小时的——取决于你取的
+时候它已经活了多久。所以不能假设"token 有一小时"。
+
+处理规则三条：
+
+- **token 一直用到真正过期前 30 秒**。`refresh_margin_seconds` 只决定什么时候**开始尝试**
+  续，不决定什么时候**停止信任**手上这个
+- **margin 会被 clamp 到 token 实际寿命的一半**。不然一个寿命短于 margin 的 token 一到手
+  就算"该刷新了"，于是每个请求都去 shell 一次 `az`（实测 0.7 秒），并发下全堵在锁上
+- **刷新尝试有频率下限**（10 秒）。`az` 彻底坏掉时不会退化成每请求一次子进程
+
+后台有个刷新协程，所以正常情况下**没有请求需要为取 token 付时间**。
+
+刷新失败但手上的 token 还能用时，**继续用**，错误记在 `/healthz` 的 `token.last_error`
+里，`proxy.log` 里记一行（只在状态变化时记，不会每 30 秒刷屏）；只有真的没有可用
+token 时才返回 503：
+
+```json
+{"error": {"message": "Azure credentials unavailable (...). on the proxy host run: ./az.sh login --use-device-code",
+           "code": "credentials_unavailable"}}
+```
+
+看 token 还剩多久：
+
+```bash
+curl -s http://127.0.0.1:8811/healthz | python -m json.tool
+```
+
+`az` 登录彻底失效时（refresh token 到期、条件访问策略要求重新认证），在**代理所在的机器**上：
+
+```bash
+./az.sh login --use-device-code
+./az.sh account set --subscription "Advanced Machine Learning"
+```
+
+不需要重启代理——后台协程下一轮就会取到新 token。
+
+
+---
+
+## 安全
+
+- 只绑 `127.0.0.1`。调用端无需凭据，意味着能连上这个端口的任何东西都能消耗团队
+  的 Azure 配额。改绑 `0.0.0.0` 之前必须先加鉴权
+- 所有 endpoint 都走 AD token，仓库里不存任何密钥
+- `auth.az_config_dir` 指向仓库**外面**，因为那个目录里有 refresh token。别把它挪
+  进仓库，`.gitignore` 也不该被指望来兜这个底
+- 日志不记录请求体和响应体。prompt 是用户数据，一个悄悄归档它们的代理会比它帮忙
+  排查的任何问题都严重
+
