@@ -15,12 +15,14 @@ LOGFILE=proxy.log
 
 # Where the proxy will listen, read from the same file it reads.
 #
-# require_settings first, and this is the earliest anything touches settings/:
-# every caller reads the endpoint before it does anything else, so a fresh clone
-# would otherwise meet a yaml traceback here rather than the sentence naming the
-# file to copy.
+# The two prerequisites come first, and this is the earliest anything needs
+# either: every caller reads the endpoint before it does anything else, so a
+# fresh clone would otherwise meet `./.venv/bin/python: No such file or
+# directory` here — exit 127 from the shell, with none of the messages below
+# ever getting a chance to say which command to run.
 read_endpoint() {
     require_settings
+    check_python
     HOST=$($PYTHON -c "import yaml;print(yaml.safe_load(open('settings/policy.yaml'))['server']['host'])")
     PORT=$($PYTHON -c "import yaml;print(yaml.safe_load(open('settings/policy.yaml'))['server']['port'])")
 }
