@@ -111,6 +111,7 @@ EVENT_STYLE = {
     "failover":  ("⇄", WARN),
     "held":      ("⏸", ACCENT),
     "pin":       ("⚲", ACCENT),
+    "stripped":  ("✂", CRIT),
     "timeout":   ("◷", WARN),
     "exhausted": ("✖", CRIT),
     "token":     ("⚿", LABEL),

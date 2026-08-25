@@ -827,6 +827,17 @@ client_metadata.session_id: 01a0216b-…                             (body)
 一种的客户端。注意 codex 发的是 **`session-id`**，不是 `x-session-id`——后者是 Harbor 的，
 排在最后。
 
+取到之后还要**再拼上请求的模型名**，钉子是按「会话 + 模型」存的。钉住的是某个**部署**
+产出的密文，而一个会话 id 不保证只覆盖一个模型：2026-08-25 实测，一个 `gpt-5.6-sol` 的
+会话和一个 `gpt-5.6-terra` 的会话共用了同一格，两边轮流覆盖对方的钉子，于是每一轮都查到
+对方的路由、判定不可用、然后被均衡到一个解不开自己密文的部署上。那一整批 run 全部死于
+`invalid_encrypted_content`。加上模型名之后是两格，互不干扰。
+
+同一个原因，**查钉子的时候不删钉子**。钉住的路由不服务当前模型时，这一轮不用它，但那一格
+留着：这条记录属于钉它的那个会话，下一次成功响应本来就会覆盖它，而在读的路径上删掉，等于
+把「这一轮用不上」变成「那个会话从此没有钉子」——后者会被均衡走，然后整个 run 结束。留一格
+陈旧记录的代价是 TTL 到期前占一个槽位。
+
 ### 什么算「带状态」
 
 `include` 里出现 `reasoning.encrypted_content`。codex **从第一轮就发**，这一点很关键：
@@ -846,6 +857,41 @@ client_metadata.session_id: 01a0216b-…                             (body)
 请求还是同一个会话、还是钉在同一条路由，所以两边的重试预算是叠加的，不是互相取代。
 
 `on_conflict: switch` 是退回旧行为的开关。
+
+### 钉子没守住的那一轮（`routing.session_affinity.off_route`）
+
+钉子有守不住的时候：TTL 到期、重新探测把那个部署拿掉了、或者 `on_conflict: switch`。这时候
+请求身上还背着只有原部署能解的 reasoning。
+
+`off_route: strip`（默认）：**把 `input` 里带 `encrypted_content` 的 reasoning item 摘掉再
+发。** 这一轮丢掉模型自己的推理过程，只凭对话内容作答。`off_route: send` 是照发不误、让
+Azure 拒绝。
+
+选 `strip` 不是「准确 vs 降级」的取舍：被拒绝的结果是 400 `invalid_encrypted_content`，
+codex 收到直接 `turn.failed` 且不重试，整个 run 结束。少一轮推理上下文，run 吸收得了。
+
+这是兜底，不是机制本身。把会话留在自己的部署上是钉子和 `on_conflict` 的职责，所以每一次
+触发都留了痕迹，三个地方都能看到：
+
+```bash
+# 1. 累计计数。跑完一趟 run 想知道「到底有没有触发过」，看这个就够了，不用翻日志
+curl -s http://127.0.0.1:8811/healthz | python -m json.tool   # session_affinity.stripped_turns
+
+# 2. 事件流。kind 是 stripped，算在 problems 里，看板的「问题」筛选直接能看到（图标 ✂）
+curl -s 'http://127.0.0.1:8811/events?kind=problems&limit=50' | python -m json.tool
+
+# 3. 日志。一行 WARNING
+grep 'off its pinned deployment' proxy.log
+```
+
+```
+WARNING /v1/responses model=gpt-5.6-sol is off its pinned deployment;
+        dropped 1 encrypted reasoning item(s) so gpt4v-scus/gpt-5.6-sol can answer it
+```
+
+`pin` 那个 kind 没有算进 problems，`stripped` 算了。区别在于：钉住一个会话是机制在正常
+工作，放进去会让「问题」筛选被每个会话一行淹掉；而摘掉密文是机制已经没守住，那一轮是靠
+丢掉推理上下文换来的。**这种日志成串出现，说明亲和没守住，那才是要修的东西。**
 
 ### 第一轮仍然可以切
 

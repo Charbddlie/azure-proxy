@@ -38,6 +38,9 @@ KINDS = (
     "failover",     # left one route for the next in the chain
     "held",         # a pinned session queued for its own endpoint instead
     "pin",          # a conversation was bound to a route, or lost its binding
+    "stripped",     # a turn went out without the encrypted reasoning it came
+                    # with, because it could not be kept on the deployment that
+                    # can read it
     "timeout",      # upstream took longer than the request timeout
     "exhausted",    # every route in the chain failed; the caller got a 503
     "token",        # the Azure credential was refreshed, or could not be
@@ -46,8 +49,14 @@ KINDS = (
 # Kinds that mean something needs looking at. The dashboard's "problems only"
 # filter is this set, and it is defined here rather than there so that adding a
 # kind forces a decision about which half it belongs to.
+#
+# `stripped` is in it and `pin` is not, which is the distinction worth keeping:
+# pinning a session is the mechanism working, and putting it here would bury
+# the filter under one line per conversation. A strip is the mechanism having
+# already failed — the turn survived, but it answered without its own reasoning,
+# and a run of them means affinity is not holding.
 PROBLEM_KINDS = frozenset(
-    {"throttle", "demote", "failover", "timeout", "exhausted"})
+    {"throttle", "demote", "failover", "timeout", "exhausted", "stripped"})
 
 LEVELS = ("debug", "info", "warning", "error")
 

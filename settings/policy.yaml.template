@@ -353,10 +353,16 @@ routing:
     #   prompt_cache_key: 01a0216b-…                       (body)
     #   client_metadata.session_id: 01a0216b-…             (body)
     #
-    # The header comes first because it costs nothing to read; the body fields
-    # are behind it so a client that sends one but not the other still works.
-    # Note codex sends `session-id`, NOT `x-session-id` — that one is kept last
-    # for Harbor, which is where the name in `forward_headers` came from.
+    # The body is behind the headers so a client that sends one but not the
+    # other still works. Note codex sends `session-id`, NOT `x-session-id` —
+    # that one is kept last for Harbor, which is where the name in
+    # `forward_headers` came from.
+    #
+    # Whichever of these matches, the requested MODEL is added to it. A pin
+    # binds one deployment's encrypted state, and one conversation id can cover
+    # more than one model — measured on 2026-08-25, two sessions on different
+    # models sharing a slot took turns overwriting each other's pin until both
+    # were routed somewhere that could not decrypt them.
     keys:
       - header:session-id
       - body:prompt_cache_key
@@ -385,6 +391,29 @@ routing:
     # Cap on any single wait, so a pinned endpoint that never recovers returns
     # an error instead of hanging. Retry-After has been seen at 1-8s.
     max_wait_seconds: 30
+
+    # What to send on a turn that could NOT be kept on its pinned deployment —
+    # because the pin has expired, because a re-probe took that deployment
+    # away, or because `on_conflict: switch` moved it.
+    #
+    #   strip  take the encrypted reasoning items out of `input`. The turn
+    #          loses the model's own account of how it got here and answers
+    #          from the conversation alone.
+    #   send   forward them and let Azure reject the call.
+    #
+    # `strip` because the two outcomes are not "accurate vs degraded": a
+    # rejected call is a 400 `invalid_encrypted_content`, which codex reports as
+    # `turn.failed` and does not retry. One turn reasoning from a slightly
+    # shorter context is a cost the run absorbs; a `turn.failed` ends it.
+    #
+    # This is a backstop, not the mechanism. Keeping the session on its own
+    # deployment is what `on_conflict` and the pin are for, so every turn this
+    # fires on leaves a trace: a `stripped` event (counted in `problems`, so the
+    # dashboard's filter shows it), a WARNING in the log, and a running total in
+    # /healthz under `session_affinity.stripped_turns` — the one to read after a
+    # run to find out whether it happened at all. A stream of them means
+    # affinity is not holding, and that is the thing to fix.
+    off_route: strip
 
     # A pin outlives a whole trial and no longer. Bounded so a long-lived proxy
     # does not accumulate them.

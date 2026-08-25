@@ -54,6 +54,7 @@ class Proxy:
                  spill_threshold=0.70, load_window=60, probe_seconds=0.5,
                  affinity=True, affinity_on_conflict="wait",
                  affinity_attempts=4, affinity_max_wait=30,
+                 affinity_off_route="strip",
                  foreign=True, foreign_reclaim=0.1, deployments=None,
                  faces=None):
         """endpoints: list of (name, url). Order is failover priority.
@@ -118,6 +119,7 @@ class Proxy:
                 "    on_conflict: {conflict}\n"
                 "    wait_attempts: {waits}\n"
                 "    max_wait_seconds: {maxwait}\n"
+                "    off_route: {offroute}\n"
                 "    ttl_seconds: 3600\n"
                 "    max_sessions: 4096\n"
                 "    sticky_include: [reasoning.encrypted_content]\n"
@@ -155,7 +157,7 @@ class Proxy:
                     reclaim=foreign_reclaim,
                     affinity="true" if affinity else "false",
                     conflict=affinity_on_conflict, waits=affinity_attempts,
-                    maxwait=affinity_max_wait,
+                    maxwait=affinity_max_wait, offroute=affinity_off_route,
                     weights=weights or "      {}\n",
                     compat="true" if responses_compat else "false"))
 
@@ -2289,14 +2291,20 @@ def test_session_id_falls_back_to_the_body_when_there_is_no_header():
         a.stop(); b.stop()
 
 
-def test_a_pin_to_a_vanished_endpoint_is_dropped():
-    """A pin must not be able to strand a session permanently.
+def test_a_pin_to_a_vanished_endpoint_is_not_honoured_or_destroyed():
+    """A pin must not strand a session, and reading it must not erase it.
 
     If a re-probe drops the pinned endpoint, the encrypted state is lost
     whatever happens — so refusing to route at all would turn one broken turn
-    into a broken run. The pin is discarded and the request goes somewhere that
-    works. Driven against the map directly; the interesting state is a pin that
-    no longer corresponds to any route, which is awkward to stage over HTTP.
+    into a broken run. The pin is not honoured and the request goes somewhere
+    that works.
+
+    It is not deleted, though. A lookup that declines to use an entry has no
+    business destroying it: the next successful response overwrites the slot
+    anyway, and deleting on read is how one unusable lookup becomes a session
+    that has silently lost its binding and gets balanced onto a deployment that
+    cannot decrypt what it carries. Driven against the map directly; a pin that
+    corresponds to no route is awkward to stage over HTTP.
     """
     sys.path.insert(0, ROOT)
     import logging
@@ -2311,6 +2319,7 @@ def test_a_pin_to_a_vanished_endpoint_is_dropped():
         affinity_ttl = 3600
         affinity_max = 16
         affinity_on_conflict = "wait"
+        affinity_off_route = "strip"
 
     def route(name):
         return Route(name, "http://x/", "v", DEPLOYMENT, "max_completion_tokens",
@@ -2322,9 +2331,176 @@ def test_a_pin_to_a_vanished_endpoint_is_dropped():
     assert aff.pinned("s1", [gone, live]) is gone
     # The endpoint disappears from the model's route list.
     assert aff.pinned("s1", [live]) is None, "a dead pin must not be honoured"
-    # And it is forgotten rather than re-checked forever.
+    # The entry survives being declined, so nothing else can be unpinned by it.
+    assert aff.report()["live_sessions"] == 1, aff.report()
+    # And it is still the binding if the endpoint comes back.
+    assert aff.pinned("s1", [gone, live]) is gone
     aff.pin("s1", live)
     assert aff.pinned("s1", [live]) is live
+
+
+def test_two_models_in_one_session_do_not_share_a_pin():
+    """One conversation id, two models, two bindings.
+
+    A pin binds one *deployment's* encrypted reasoning, and a session id does
+    not have to cover only one model. Measured on 2026-08-25: a gpt-5.6-sol
+    session and a gpt-5.6-terra session held the same slot and took turns
+    overwriting it, so each model's turns kept finding the other's route,
+    declining it, and being balanced onto a deployment that could not decrypt
+    what they carried. Every one of those turns was a 400
+    `invalid_encrypted_content`, which codex reports as `turn.failed`.
+
+    So the model belongs in the key. Two slots, no interference.
+    """
+    sys.path.insert(0, ROOT)
+    import logging
+    from proxy.server import Route, SessionAffinity
+    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
+
+    class Cfg:
+        affinity_enabled = True
+        affinity_keys = ["header:session-id", "body:prompt_cache_key"]
+        affinity_markers = ["reasoning.encrypted_content"]
+        affinity_ttl = 3600
+        affinity_max = 16
+        affinity_on_conflict = "wait"
+        affinity_off_route = "strip"
+
+    class Req:
+        def __init__(self, headers):
+            self.headers = headers
+
+    def route(endpoint, deployment):
+        return Route(endpoint, "http://x/", "v", deployment,
+                     "max_completion_tokens", 0, "openai/v1/responses")
+
+    aff = SessionAffinity(Cfg())
+    request = Req({"session-id": CODEX_SESSION})
+    sol = {"model": "sol", "include": ["reasoning.encrypted_content"]}
+    terra = {"model": "terra", "include": ["reasoning.encrypted_content"]}
+
+    k_sol, k_terra = aff.key(request, sol), aff.key(request, terra)
+    assert k_sol and k_terra
+    assert k_sol != k_terra, "one slot for two models: {}".format(k_sol)
+
+    a, b = route("alpha", "sol"), route("beta", "terra")
+    aff.pin(k_sol, a)
+    aff.pin(k_terra, b)
+    # Neither model's route list contains the other's deployment, which is what
+    # used to make each lookup discard the other's pin.
+    assert aff.pinned(k_sol, [a]) is a
+    assert aff.pinned(k_terra, [b]) is b
+    assert aff.pinned(k_sol, [a]) is a, "terra's turn unpinned sol"
+    assert aff.report()["live_sessions"] == 2, aff.report()
+
+
+def codex_reasoning_item():
+    """The item that only one deployment can read, as codex sends it back."""
+    return {"type": "reasoning", "id": "rs_03a861b6bc394df2016a8d4bfefb3c81",
+            "summary": [], "encrypted_content": "gAAAAABo" + "x" * 64}
+
+
+def test_a_turn_off_its_pinned_deployment_keeps_its_reasoning():
+    """On the route that minted it, the blob is forwarded untouched.
+
+    This is the case the whole mechanism exists to produce, and it is here so
+    that the stripping test below cannot pass by stripping everything.
+    """
+    a = FakeAzure("alpha", headers=ratelimit(limit_tokens=500000)).start()
+    b = FakeAzure("beta", headers=ratelimit(limit_tokens=500000)).start()
+    try:
+        p = Proxy([("alpha", a.url), ("beta", b.url)], balance="capacity",
+                  static_weights={"alpha": 1, "beta": 1})
+        try:
+            # Turn one carries no reasoning yet; it is what creates the pin.
+            status, _body, _h = sticky_ask(p)
+            assert status == 200, status
+            # Turn two comes back with the blob, and is pinned, so it is on the
+            # only deployment that can read it.
+            body = codex_turn(CODEX_SESSION)
+            body["input"] = list(body["input"]) + [codex_reasoning_item()]
+            status, _body, headers = p.post(
+                body, headers={"session-id": CODEX_SESSION},
+                path="/v1/responses")
+            assert status == 200, status
+
+            served = a if a.hits else b
+            sent = served.requests[-1]["body"]["input"]
+            kept = [i for i in sent if i.get("type") == "reasoning"]
+            assert len(kept) == 1, "the pinned deployment lost its reasoning"
+            assert kept[0]["encrypted_content"], kept[0]
+        finally:
+            p.close()
+    finally:
+        a.stop(); b.stop()
+
+
+def test_a_turn_off_its_pinned_deployment_loses_reasoning_not_the_run():
+    """Unpinned, the blob comes off rather than killing the turn.
+
+    A session whose pin has expired, or whose deployment a re-probe took away,
+    still carries reasoning only its old deployment can decrypt. Forwarding it
+    earns a 400 `invalid_encrypted_content`, which codex reports as
+    `turn.failed` and does not retry — the run ends. Dropping the item costs
+    the turn its reasoning context and nothing else.
+    """
+    a = FakeAzure("alpha", headers=ratelimit(limit_tokens=500000)).start()
+    try:
+        p = Proxy([("alpha", a.url)])
+        try:
+            # A session the proxy has never seen, already carrying a blob.
+            body = codex_turn("a-session-with-no-pin-here")
+            body["input"] = list(body["input"]) + [codex_reasoning_item()]
+            status, _body, _h = p.post(
+                body, headers={"session-id": "a-session-with-no-pin-here"},
+                path="/v1/responses")
+            assert status == 200, status
+
+            sent = a.requests[-1]["body"]["input"]
+            assert not [i for i in sent if i.get("type") == "reasoning"], sent
+            # Only the unreadable item goes; the conversation is intact.
+            assert len(sent) == len(body["input"]) - 1, sent
+
+            # A silent fallback is a fallback nobody notices has become the
+            # normal case, so it has to be visible without reading the log: a
+            # counter to check after a run, and a `problems` event during one.
+            _s, health = p.get("/healthz")
+            aff = health["session_affinity"]
+            assert aff["stripped_turns"] == 1, aff
+            assert aff["off_route"] == "strip", aff
+
+            _s, seen = p.get("/events?kind=problems&limit=200")
+            stripped = [e for e in seen["events"] if e["kind"] == "stripped"]
+            assert len(stripped) == 1, seen["events"]
+            assert stripped[0]["level"] == "warning", stripped[0]
+            assert stripped[0]["stripped"] == 1, stripped[0]
+            assert stripped[0]["endpoint"] == "alpha", stripped[0]
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_off_route_send_forwards_the_blob_untouched():
+    """`off_route: send` is the escape hatch back to letting Azure refuse it."""
+    a = FakeAzure("alpha", headers=ratelimit(limit_tokens=500000)).start()
+    try:
+        p = Proxy([("alpha", a.url)], affinity_off_route="send")
+        try:
+            body = codex_turn("another-session-with-no-pin")
+            body["input"] = list(body["input"]) + [codex_reasoning_item()]
+            status, _body, _h = p.post(
+                body, headers={"session-id": "another-session-with-no-pin"},
+                path="/v1/responses")
+            assert status == 200, status
+
+            sent = a.requests[-1]["body"]["input"]
+            kept = [i for i in sent if i.get("type") == "reasoning"]
+            assert len(kept) == 1, sent
+        finally:
+            p.close()
+    finally:
+        a.stop()
 
 
 def test_affinity_evicts_by_ttl_and_count():
@@ -2342,6 +2518,7 @@ def test_affinity_evicts_by_ttl_and_count():
         affinity_ttl = 3600
         affinity_max = 5
         affinity_on_conflict = "wait"
+        affinity_off_route = "strip"
 
     r = Route("alpha", "http://x/", "v", DEPLOYMENT, "max_completion_tokens", 0)
     aff = SessionAffinity(Cfg())

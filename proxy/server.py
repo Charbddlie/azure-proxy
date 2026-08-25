@@ -258,6 +258,9 @@ class Config:
             self.affinity_on_conflict = "wait"
         self.affinity_attempts = int(a.get("wait_attempts", 4))
         self.affinity_max_wait = float(a.get("max_wait_seconds", 30))
+        self.affinity_off_route = a.get("off_route", "strip")
+        if self.affinity_off_route not in ("strip", "send"):
+            self.affinity_off_route = "strip"
 
         self.forward_headers = policy["request"]["forward_headers"]
         self.responses_compat = policy["request"].get("responses_compat", True)
@@ -1336,6 +1339,13 @@ class SessionAffinity:
         # a long-lived proxy should not grow without limit.
         self._pins: "collections.OrderedDict[str, List]" = \
             collections.OrderedDict()
+        # Cumulative, never reset: "did the fallback fire at all during my run"
+        # is the question this answers, and it should be one read of /healthz
+        # rather than a grep over a log that runs to tens of megabytes.
+        self._stripped = 0
+
+    def note_stripped(self) -> None:
+        self._stripped += 1
 
     # -- identification ---------------------------------------------------
     def sticky(self, body: dict) -> bool:
@@ -1368,6 +1378,18 @@ class SessionAffinity:
         return False
 
     def key(self, request: Request, body: dict) -> Optional[str]:
+        """The pin slot for this request: who is asking, and for which model.
+
+        The model belongs in the key because a pin binds one *deployment's*
+        encrypted state, and one conversation id can cover more than one model
+        — a session whose main model is gpt-5.6-sol may also send a turn for
+        gpt-5.6-terra, and those two blobs are minted by two different
+        deployments. Keying on the conversation alone gives them one slot to
+        share, so each turn overwrites the other's pin and both sessions end up
+        routed to a deployment that cannot decrypt what they carry.
+        """
+        model = body.get("model")
+        model = model.strip() if isinstance(model, str) else ""
         for spec in self.cfg.affinity_keys:
             where, _, name = spec.partition(":")
             if where == "header":
@@ -1377,7 +1399,7 @@ class SessionAffinity:
                 for part in name.split("."):
                     value = value.get(part) if isinstance(value, dict) else None
             if isinstance(value, str) and value.strip():
-                return "{}={}".format(spec, value.strip())
+                return "{}={}\0model={}".format(spec, value.strip(), model)
         return None
 
     # -- the map ----------------------------------------------------------
@@ -1395,11 +1417,20 @@ class SessionAffinity:
                routes: List[Route]) -> Optional[Route]:
         """The route this session is bound to, if it is still usable.
 
-        A pin naming a route that no longer serves the model is dropped rather
-        than approximated — the sibling deployment on the same endpoint is not
-        the same destination, and neither is another endpoint. The state is lost
-        either way, and refusing to route at all would be worse than routing
-        somewhere it might work.
+        A pin naming a route that no longer serves the model is not honoured —
+        the sibling deployment on the same endpoint is not the same
+        destination, and neither is another endpoint. The state is lost either
+        way, and refusing to route at all would be worse than routing somewhere
+        it might work.
+
+        It is not deleted either. Reading is not the place to destroy a
+        binding: the entry belongs to whoever pinned it, this request has
+        already decided not to use it, and the next successful response on this
+        slot overwrites it anyway. Deleting here is what turns one unusable
+        lookup into a session that has silently lost its pin and will be
+        balanced onto a deployment that cannot decrypt what it carries — a dead
+        run rather than a degraded turn. A stale entry costs one slot until the
+        TTL or the LRU takes it.
         """
         if not key:
             return None
@@ -1415,8 +1446,7 @@ class SessionAffinity:
                 return route
         _ev("pin", "warning",
             "session pinned to %s, which no longer serves this model; "
-            "dropping the pin", entry[0], route=entry[0], dropped=True)
-        self._pins.pop(key, None)
+            "routing without the pin", entry[0], route=entry[0], dropped=True)
         return None
 
     def pin(self, key: Optional[str], route: Route) -> None:
@@ -1446,6 +1476,8 @@ class SessionAffinity:
             counts[endpoint] = counts.get(endpoint, 0) + 1
         return {"enabled": self.cfg.affinity_enabled,
                 "on_conflict": self.cfg.affinity_on_conflict,
+                "off_route": self.cfg.affinity_off_route,
+                "stripped_turns": self._stripped,
                 "live_sessions": len(self._pins),
                 "sessions_per_route": routes,
                 "sessions_per_endpoint": counts}
@@ -2368,6 +2400,32 @@ def _apply_responses_compat(body: dict) -> Dict[str, int]:
     return stats
 
 
+def _strip_encrypted_reasoning(body: dict) -> Tuple[dict, int]:
+    """`body` without the reasoning items only one deployment can read.
+
+    Azure encrypts the reasoning chain with a key belonging to the resource
+    that produced it, so handing it to any other deployment earns a 400
+    `invalid_encrypted_content` — which codex reports as `turn.failed`, ending
+    the run. Affinity exists to make sure that never happens; this is what to
+    do on the turns where it could not be kept, so that losing a pin costs the
+    turn its reasoning context instead of costing the run.
+
+    Returns a shallow copy, because the caller's `body` is reused by the other
+    attempts and `input` is a list it shares.
+    """
+    items = body.get("input")
+    if not isinstance(items, list):
+        return body, 0
+    kept = [i for i in items
+            if not (isinstance(i, dict) and i.get("type") == "reasoning"
+                    and i.get("encrypted_content"))]
+    if len(kept) == len(items):
+        return body, 0
+    out = dict(body)
+    out["input"] = kept
+    return out, len(items) - len(kept)
+
+
 async def _body_and_model(request: Request):
     """(body, model, None) or (None, None, error response)."""
     try:
@@ -2460,6 +2518,20 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     for i, route in enumerate(attempts):
         is_last = i == len(attempts) - 1
         payload = dict(body)
+        # Off the deployment that minted them, the encrypted reasoning items in
+        # this body are unreadable and Azure rejects the whole call. `pinned` is
+        # the only route that can read them: anywhere else — no pin at all, or
+        # `switch` moving on from it — they have to come off, or the turn dies
+        # instead of merely forgetting how it got here.
+        if sticky and route is not pinned and cfg.affinity_off_route == "strip":
+            payload, dropped = _strip_encrypted_reasoning(payload)
+            if dropped:
+                affinity.note_stripped()
+                _ev("stripped", "warning",
+                    "%s model=%s is off its pinned deployment; dropped %d "
+                    "encrypted reasoning item(s) so %s can answer it",
+                    face, requested, dropped, route,
+                    route=route, face=face, model=requested, stripped=dropped)
         payload["model"] = route.deployment
         quota.note_attempt(route)
         entry = quota.charge(route, quota.estimate_tokens(route, request_bytes),

@@ -316,7 +316,7 @@ def render_groups(groups: List[Group], width: int, height: int, offset: int,
 
 EVENT_FILTERS = ("全部", "问题", "他人容量")
 PROBLEM_KINDS = frozenset(
-    {"throttle", "demote", "failover", "timeout", "exhausted"})
+    {"throttle", "demote", "failover", "timeout", "exhausted", "stripped"})
 
 
 def filter_events(events: List[dict], mode: int) -> List[dict]:
