@@ -1330,22 +1330,88 @@ class SessionAffinity:
     the balancer like any other. That is what keeps affinity from collapsing
     into "every session on endpoint one" — sessions are distributed as they
     start, and only then held.
+
+    Two books, because a client session is not one conversation. `_pins` binds
+    (conversation, model) to an exact route, which is what each thread's own
+    reasoning needs. `_family` binds the conversation alone to an ENDPOINT, and
+    is what a thread consults when it has no pin of its own — the case that
+    matters being a subagent, which opens a new thread on a new model already
+    holding ciphertext its parent minted. See `family`.
     """
 
     def __init__(self, config: Config):
         self.cfg = config
-        # session key -> [endpoint name, last used]. Ordered so the oldest entry
-        # is cheap to evict; a benchmark opens a bounded number of sessions but
-        # a long-lived proxy should not grow without limit.
+        # session key -> [route, last used]. Ordered so the oldest entry is
+        # cheap to evict; a benchmark opens a bounded number of sessions but a
+        # long-lived proxy should not grow without limit.
         self._pins: "collections.OrderedDict[str, List]" = \
+            collections.OrderedDict()
+        # family key -> [endpoint name, last used]. The coarser book: see
+        # `family` below. Same eviction rules, same bound.
+        self._family: "collections.OrderedDict[str, List]" = \
             collections.OrderedDict()
         # Cumulative, never reset: "did the fallback fire at all during my run"
         # is the question this answers, and it should be one read of /healthz
         # rather than a grep over a log that runs to tens of megabytes.
         self._stripped = 0
+        self._inherited = 0
+        self._rejected = 0
+        # family -> when its ciphertext was last found to be unplaceable. See
+        # `tainted`.
+        self._refused: "collections.OrderedDict[str, float]" = \
+            collections.OrderedDict()
 
-    def note_stripped(self) -> None:
+    def note_stripped(self, family: Optional[str] = None) -> None:
         self._stripped += 1
+        self._taint(family)
+
+    def note_inherited(self) -> None:
+        self._inherited += 1
+
+    def note_rejected(self, family: Optional[str] = None) -> None:
+        """An endpoint refused this family's ciphertext outright."""
+        self._rejected += 1
+        self._taint(family)
+
+    def _taint(self, family: Optional[str]) -> None:
+        if not family:
+            return
+        self._refused[family] = time.time()
+        self._refused.move_to_end(family)
+        while len(self._refused) > self.cfg.affinity_max:
+            self._refused.popitem(last=False)
+
+    def tainted(self, family: Optional[str]) -> bool:
+        """Does this family still hold ciphertext nothing here can place?
+
+        Sticky, not one-shot, and that is the whole of what it is for. The
+        proxy strips a REQUEST; it cannot strip the client's transcript, and
+        codex rebuilds `input` from that transcript every turn. So a session
+        that was stripped once goes on resending the same unreadable items on
+        every subsequent turn — and the turn after the strip is pinned again,
+        looks readable, and is refused. Measured 2026-08-25: a session that
+        survived a stripped turn died on the next one with
+
+            <- 400 /v1/responses ... invalid_encrypted_content
+
+        Once tainted, the family keeps being stripped until its entry expires.
+        That costs it reasoning continuity for the rest of the hour, which is
+        the same trade `off_route: strip` already makes and the same direction:
+        a turn that has forgotten how it got here is a cost the run absorbs, a
+        refused turn ends it. Over-stripping a session that could have
+        recovered is the price, and it is small — a session only gets here
+        after it has already been moved off the endpoint that minted its state,
+        and the pin follows it to the new one rather than back.
+        """
+        if not family:
+            return False
+        at = self._refused.get(family)
+        if at is None:
+            return False
+        if time.time() - at > self.cfg.affinity_ttl:
+            self._refused.pop(family, None)
+            return False
+        return True
 
     # -- identification ---------------------------------------------------
     def sticky(self, body: dict) -> bool:
@@ -1377,6 +1443,20 @@ class SessionAffinity:
 
         return False
 
+    def _conversation(self, request: Request, body: dict) -> Optional[str]:
+        """The conversation id this request belongs to, whatever carries it."""
+        for spec in self.cfg.affinity_keys:
+            where, _, name = spec.partition(":")
+            if where == "header":
+                value = request.headers.get(name)
+            else:
+                value = body
+                for part in name.split("."):
+                    value = value.get(part) if isinstance(value, dict) else None
+            if isinstance(value, str) and value.strip():
+                return "{}={}".format(spec, value.strip())
+        return None
+
     def key(self, request: Request, body: dict) -> Optional[str]:
         """The pin slot for this request: who is asking, and for which model.
 
@@ -1388,30 +1468,91 @@ class SessionAffinity:
         share, so each turn overwrites the other's pin and both sessions end up
         routed to a deployment that cannot decrypt what they carry.
         """
+        conversation = self._conversation(request, body)
+        if conversation is None:
+            return None
         model = body.get("model")
         model = model.strip() if isinstance(model, str) else ""
-        for spec in self.cfg.affinity_keys:
-            where, _, name = spec.partition(":")
-            if where == "header":
-                value = request.headers.get(name)
-            else:
-                value = body
-                for part in name.split("."):
-                    value = value.get(part) if isinstance(value, dict) else None
-            if isinstance(value, str) and value.strip():
-                return "{}={}\0model={}".format(spec, value.strip(), model)
-        return None
+        return "{}\0model={}".format(conversation, model)
+
+    def family(self, request: Request, body: dict) -> Optional[str]:
+        """The slot for everything one client session has going at once.
+
+        The same key without the model, and it exists because a codex session
+        is not one conversation. When the master calls
+        `collaboration.spawn_agent`, the subagent opens its OWN thread — a
+        different `thread-id`, the SAME `session-id` — on a different model,
+        and codex seeds that thread with an `agent_message` item it inherited
+        from the parent. Measured on 2026-08-25, that item carries the parent's
+        ciphertext:
+
+            {"type": "agent_message",
+             "content": [{...},
+                         {"type": "encrypted_content",
+                          "encrypted_content": "gAAAAABqjaoo…"}]}
+
+        The blob was minted by the master's endpoint. `key` gives the subagent
+        a slot of its own — correctly, because its own reasoning is minted
+        wherever it lands — but that slot is empty on the subagent's first
+        turn, so the balancer placed it anywhere and the parent's blob went to
+        an endpoint that could not read it:
+
+            event: error   {"code": "invalid_encrypted_content",
+                            "message": "Encrypted function output content
+                                        could not be decrypted or decoded."}
+            event: response.failed
+
+        which codex reports as `stream disconnected before completion` and the
+        worker's first turn dies. Intermittent, because a balancer that
+        happened to pick the master's endpoint produced a working subagent —
+        with three endpoints serving the model, roughly one spawn in three.
+
+        So the family pin holds a whole session's threads on ONE endpoint,
+        while `key` still binds each thread+model to its exact deployment. The
+        endpoint is the useful unit here: the parent's blob has to survive a
+        move to a *different deployment* on the same resource (sol -> terra),
+        which the per-route pin cannot express and which the subagent case
+        requires by construction.
+        """
+        return self._conversation(request, body)
 
     # -- the map ----------------------------------------------------------
     def _expire(self, now: float) -> None:
         ttl = self.cfg.affinity_ttl
-        while self._pins:
-            key, entry = next(iter(self._pins.items()))
-            if now - entry[1] <= ttl:
-                break
-            self._pins.popitem(last=False)
-        while len(self._pins) > self.cfg.affinity_max:
-            self._pins.popitem(last=False)
+        for book in (self._pins, self._family):
+            while book:
+                _key, entry = next(iter(book.items()))
+                if now - entry[1] <= ttl:
+                    break
+                book.popitem(last=False)
+            while len(book) > self.cfg.affinity_max:
+                book.popitem(last=False)
+
+    def home(self, family: Optional[str],
+             routes: List[Route]) -> Tuple[Optional[str], List[Route]]:
+        """The endpoint this session's state lives on, and the way in.
+
+        Used when the exact (conversation, model) slot is empty but the family
+        one is not — which is precisely a subagent's first turn. The answer is
+        an endpoint name and the subset of `routes` that sits on it, so the
+        balancer still chooses between that endpoint's deployments and
+        failover inside the resource still works.
+
+        An empty subset is not an error and does not clear the entry: the
+        session's endpoint simply does not serve this model. The caller strips
+        the ciphertext and routes wherever it likes, which costs the turn its
+        inherited context and nothing else.
+        """
+        if not family:
+            return None, []
+        now = time.time()
+        self._expire(now)
+        entry = self._family.get(family)
+        if entry is None:
+            return None, []
+        entry[1] = now
+        self._family.move_to_end(family)
+        return entry[0], [r for r in routes if r.endpoint == entry[0]]
 
     def pinned(self, key: Optional[str],
                routes: List[Route]) -> Optional[Route]:
@@ -1449,18 +1590,46 @@ class SessionAffinity:
             "routing without the pin", entry[0], route=entry[0], dropped=True)
         return None
 
-    def pin(self, key: Optional[str], route: Route) -> None:
-        if not key:
-            return
-        entry = self._pins.get(key)
-        if entry is None:
-            _ev("pin", "info", "session pinned to %s (%d live)", route,
-                len(self._pins) + 1, route=route, live=len(self._pins) + 1)
-            self._pins[key] = [str(route), time.time()]
-        else:
-            entry[0], entry[1] = str(route), time.time()
-        self._pins.move_to_end(key)
-        self._expire(time.time())
+    def pin(self, key: Optional[str], route: Route,
+            family: Optional[str] = None) -> None:
+        """Record where this conversation's state now lives.
+
+        Both books are written on every successful sticky response. A move is
+        logged rather than being made silently: a pin that changes route is how
+        a session loses state it is still carrying, and the previous outage
+        could not be read out of proxy.log because this branch said nothing.
+        """
+        now = time.time()
+        if key:
+            entry = self._pins.get(key)
+            if entry is None:
+                _ev("pin", "info", "session pinned to %s (%d live)", route,
+                    len(self._pins) + 1, route=route, live=len(self._pins) + 1)
+                self._pins[key] = [str(route), now]
+            else:
+                if entry[0] != str(route):
+                    _ev("pin", "warning",
+                        "session moved from %s to %s; state minted on the old "
+                        "one is no longer readable", entry[0], route,
+                        route=route, from_route=entry[0], moved=True)
+                entry[0], entry[1] = str(route), now
+            self._pins.move_to_end(key)
+
+        if family:
+            entry = self._family.get(family)
+            if entry is None:
+                self._family[family] = [route.endpoint, now]
+            else:
+                if entry[0] != route.endpoint:
+                    _ev("pin", "warning",
+                        "session's endpoint moved from %s to %s; threads "
+                        "spawned before this carry state it cannot read",
+                        entry[0], route.endpoint,
+                        route=route, from_endpoint=entry[0], moved=True)
+                entry[0], entry[1] = route.endpoint, now
+            self._family.move_to_end(family)
+
+        self._expire(now)
 
     def report(self) -> dict:
         now = time.time()
@@ -1478,7 +1647,17 @@ class SessionAffinity:
                 "on_conflict": self.cfg.affinity_on_conflict,
                 "off_route": self.cfg.affinity_off_route,
                 "stripped_turns": self._stripped,
+                # How often a thread was placed on its session's endpoint
+                # rather than by the balancer — the subagent case. Read next to
+                # stripped_turns: inherited means the parent's state survived,
+                # stripped means it did not.
+                "inherited_turns": self._inherited,
+                # Turns an endpoint actually refused. Zero is the number to
+                # expect; anything else says routing let ciphertext reach an
+                # endpoint that could not read it, and the log says which.
+                "rejected_turns": self._rejected,
                 "live_sessions": len(self._pins),
+                "live_families": len(self._family),
                 "sessions_per_route": routes,
                 "sessions_per_endpoint": counts}
 
@@ -1963,6 +2142,45 @@ THROTTLE_HEADER = "retry-after"
 # Azure introduces another code that means "come back later".
 INBAND_RATE_LIMIT = b"rate_limit_exceeded"
 
+# Azure refuses a request the same way it throttles one: HTTP 200, then an
+# `error` event and `response.failed`. A proxy that only records status lines
+# writes that down as a healthy 200 — which is why, during the 2026-08-25
+# subagent outage, every client saw
+#
+#   stream disconnected before completion: Encrypted function output content
+#   could not be decrypted or decoded.
+#
+# and `grep -i "could not be decrypted" proxy.log` returned nothing at all. The
+# refusal is not in the head either: hold_bytes is 16KB and a codex-shaped
+# response.created runs to 46KB, so the probe is long finished by the time the
+# error event goes past. It has to be read off the relay, which is the only
+# place that sees every byte.
+#
+# Read, logged, and otherwise left alone: the stream still belongs to the
+# caller and is forwarded unchanged.
+_STREAM_ERROR_EVENT = re.compile(rb"(?:\A|\n)event:[ \t]*error\r?\n")
+_STREAM_ERROR_CODE = re.compile(rb'"code"\s*:\s*"([A-Za-z0-9_.-]{3,64})"')
+_STREAM_ERROR_MESSAGE = re.compile(rb'"message"\s*:\s*"((?:[^"\\]|\\.){0,240})"')
+
+# How much of what follows an `error` event to keep in order to read its code
+# and message out. The event itself is a few hundred bytes; the rest is the
+# `response.failed` that follows it.
+ERROR_TAIL_BYTES = 4096
+
+# The event that says a stream is a whole answer. Its absence is the only thing
+# that separates "the turn is done" from "the connection stopped" — measured
+# 2026-08-25, an upstream ended a stream mid-answer with no error event at all,
+# a fully-formed function call and nothing after it, and the caller reported it
+# as "stream disconnected before completion" with no reason available anywhere.
+STREAM_COMPLETED = b"response.completed"
+
+# What Azure says when ciphertext reaches an endpoint that cannot read it. Two
+# messages, one code: "The encrypted content for item rs_… could not be
+# verified" for a reasoning item on the buffered face, and "Encrypted function
+# output content could not be decrypted or decoded" for the `agent_message` a
+# subagent inherits from its parent, in-stream.
+ENCRYPTED_REJECTED = b"invalid_encrypted_content"
+
 # Events that can precede the real answer without being any of it. A stream that
 # has produced only these has told the caller nothing, which is what makes it
 # safe to throw away and start again somewhere else; anything outside this set
@@ -2022,9 +2240,10 @@ def _read_total_tokens(blob: bytes) -> Optional[int]:
 class _StreamWatch:
     """Watches a stream go past without altering, delaying or reframing it.
 
-    Answers two questions from raw bytes: is this 200 actually a throttle, and
-    what did it cost. Carries a few bytes of overlap between chunks so neither
-    marker can hide on a chunk boundary.
+    Answers three questions from raw bytes: is this 200 actually a throttle,
+    what did it cost, and did the upstream fail the turn on its way through.
+    Carries a few bytes of overlap between chunks so no marker can hide on a
+    chunk boundary.
 
     The scan is NOT bounded to the head of the stream any more, and that was the
     bug that made the first version of this useless. It used to stop after 16KB
@@ -2036,12 +2255,22 @@ class _StreamWatch:
     already doing; guessing where the interesting part is costs correctness.
     """
 
-    __slots__ = ("_overlap", "rate_limited", "total_tokens")
+    __slots__ = ("_overlap", "rate_limited", "total_tokens", "_error_tail",
+                 "completed")
 
     def __init__(self):
         self._overlap = b""
         self.rate_limited = False
         self.total_tokens: Optional[int] = None
+        # Did the upstream ever say it had finished? A stream that stops
+        # without this is a turn the client reports as "disconnected before
+        # completion", whether or not anything explained why.
+        self.completed = False
+        # The bytes that followed an `error` event, capped at ERROR_TAIL_BYTES.
+        # None until one goes past. Accumulating a bounded tail is what makes
+        # the code readable whichever chunk boundary it lands on; the marker
+        # itself is short enough for the overlap to bridge.
+        self._error_tail: Optional[bytearray] = None
 
     def feed(self, chunk: bytes) -> bool:
         """Returns True on the chunk that first reveals a rate limit."""
@@ -2052,8 +2281,26 @@ class _StreamWatch:
         total = _read_total_tokens(window)
         if total is not None:
             self.total_tokens = total
+        if not self.completed and STREAM_COMPLETED in window:
+            self.completed = True
+        if self._error_tail is None:
+            match = _STREAM_ERROR_EVENT.search(window)
+            if match:
+                self._error_tail = bytearray(window[match.end():])
+        elif len(self._error_tail) < ERROR_TAIL_BYTES:
+            self._error_tail.extend(chunk)
         self._overlap = window[-OVERLAP_BYTES:]
         return found
+
+    def upstream_error(self) -> Optional[Tuple[str, str]]:
+        """(code, message) of the in-band error this stream carried, if any."""
+        if self._error_tail is None:
+            return None
+        window = bytes(self._error_tail[:ERROR_TAIL_BYTES])
+        code = _STREAM_ERROR_CODE.search(window)
+        message = _STREAM_ERROR_MESSAGE.search(window)
+        return (code.group(1).decode("ascii", "replace") if code else "unknown",
+                message.group(1).decode("utf-8", "replace") if message else "")
 
 
 _captured = [0]
@@ -2239,7 +2486,8 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                   head: _StreamHead, request_bytes: int = 0,
                   entry: Optional[List[float]] = None,
                   counted: bool = False,
-                  model: Optional[str] = None) -> StreamingResponse:
+                  model: Optional[str] = None,
+                  family: Optional[str] = None) -> StreamingResponse:
     """Forward the upstream body byte for byte as it arrives.
 
     Nothing here parses SSE, reframes it, or waits for it. Passing the bytes
@@ -2247,14 +2495,26 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
     encrypted reasoning among them — intact on the way back. The bytes the probe
     already read go out first, in the chunks they arrived in.
 
-    The scan looks but does not touch. Its answers only reach the quota tracker,
-    which is the whole point: past this line the stream belongs to the caller
-    and cannot be retried, so the only thing left to influence is where the
-    *next* request goes. `counted` says a rate limit was already charged during
-    the probe, so a stream relayed anyway on the last route is not counted twice.
+    The scan looks but does not touch. Its answers only reach the quota tracker
+    and the log, which is the whole point: past this line the stream belongs to
+    the caller and cannot be retried, so the only thing left to influence is
+    where the *next* request goes. `counted` says a rate limit was already
+    charged during the probe, so a stream relayed anyway on the last route is
+    not counted twice.
+
+    A stream that ends in an `error` event is a failed turn wearing a 200, and
+    it is written down as one. `family` is the client session it belongs to: an
+    `invalid_encrypted_content` refusal is remembered against it, so every
+    later turn of that session goes out without the ciphertext this one was
+    refused for, whatever the routing decides.
     """
     async def body():
         sent = 0
+        # Whether the upstream iterator ran out, as opposed to this generator
+        # being closed early. Only the first case says anything about the
+        # upstream: a client that hangs up mid-turn also lands in `finally`,
+        # and warning about that would blame the wrong end.
+        drained = False
         watch = _StreamWatch()
         watch.rate_limited = counted
         # Only accumulated when diagnostics are on; otherwise it stays empty and
@@ -2294,6 +2554,7 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                 inspect(chunk)
                 sent += len(chunk)
                 yield chunk
+            drained = True
         except httpx.HTTPError as e:
             # No failover once the client has bytes: a second attempt would
             # splice two streams together in its parser. The break is passed on
@@ -2310,6 +2571,20 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
             quota.settle(route, entry, request_bytes, watch.total_tokens)
             if keep:
                 _capture_stream(route, resp, bytes(seen))
+            _note_upstream_error(watch.upstream_error(), route, face, model,
+                                 family, sent)
+            if drained and not watch.completed and not watch.upstream_error():
+                # The upstream stopped mid-answer and said nothing about why.
+                # Unretryable — the caller already has the bytes, and splicing
+                # a second attempt onto them would corrupt its parser — but it
+                # must not be filed as a clean 200 either, which is what the
+                # line below on its own would do.
+                _ev("upstream_error", "warning",
+                    "!! %s stopped after %d bytes without response.completed "
+                    "and without an error; the caller sees a turn that ended "
+                    "early", route, sent,
+                    route=route, face=face, model=model,
+                    error_code="truncated", bytes=sent, in_stream=True)
             _ev("response", "info",
                 "<- %s stream ended %s %d bytes route=%s %.1fs",
                 face, resp.status_code, sent, route,
@@ -2321,6 +2596,31 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
     return StreamingResponse(body(), status_code=resp.status_code,
                              headers=_relay_headers(resp, route),
                              media_type=resp.headers.get("content-type"))
+
+
+def _note_upstream_error(failure: Optional[Tuple[str, str]], route: Route,
+                         face: str, model: Optional[str],
+                         family: Optional[str], sent: int) -> None:
+    """Write down an upstream refusal that arrived inside a 200.
+
+    Rate limits are left alone: they have their own line, from the code that
+    also demotes the route, and saying it twice would only make the log harder
+    to read. Everything else lands here, which until now was nowhere.
+    """
+    if failure is None:
+        return
+    code, message = failure
+    if code.encode() in cfg.stream_retry_markers:
+        return
+    # `server_error` arrives with no `message` at all — type, code, and a
+    # headers object. Naming the code is the whole of what it has to say.
+    _ev("upstream_error", "warning",
+        "!! %s answered 200 and then failed the turn: %s%s (after %d bytes)",
+        route, code, ": " + message if message else "", sent,
+        route=route, face=face, model=model, error_code=code,
+        error=message, bytes=sent, in_stream=True)
+    if code == ENCRYPTED_REJECTED.decode() and cfg.affinity_enabled:
+        affinity.note_rejected(family)
 
 
 def _error(status: int, message: str, code: str) -> JSONResponse:
@@ -2401,29 +2701,99 @@ def _apply_responses_compat(body: dict) -> Dict[str, int]:
 
 
 def _strip_encrypted_reasoning(body: dict) -> Tuple[dict, int]:
-    """`body` without the reasoning items only one deployment can read.
+    """`body` without the ciphertext only one endpoint can read.
 
-    Azure encrypts the reasoning chain with a key belonging to the resource
-    that produced it, so handing it to any other deployment earns a 400
-    `invalid_encrypted_content` — which codex reports as `turn.failed`, ending
-    the run. Affinity exists to make sure that never happens; this is what to
-    do on the turns where it could not be kept, so that losing a pin costs the
-    turn its reasoning context instead of costing the run.
+    Azure encrypts with a key belonging to the resource that produced it, so
+    handing it to any other endpoint earns `invalid_encrypted_content` — a 400
+    on the buffered face, and on the streaming face a 200 that carries
 
-    Returns a shallow copy, because the caller's `body` is reused by the other
-    attempts and `input` is a list it shares.
+        event: error   {"code": "invalid_encrypted_content", …}
+        event: response.failed
+
+    which codex reports as a failed turn either way. Affinity exists to make
+    sure that never happens; this is what to do on the turns where it could not
+    be kept, so that losing a pin costs the turn its context instead of costing
+    the run.
+
+    Two places carry it, and both have been seen live:
+
+      * a top-level `reasoning` item with `encrypted_content` — the model's own
+        chain of thought, on every codex turn after the first.
+      * an `encrypted_content` entry inside another item's `content` list —
+        which is how codex 0.148 hands a subagent the message its parent wrote
+        for it. Missing this one is what let a stripped subagent turn fail
+        anyway: the item is an `agent_message`, not a `reasoning`, so the
+        type test above walked straight past it.
+
+    So the rule is the field, not the item type. An item whose only content was
+    ciphertext is dropped rather than sent with an empty `content`, which the
+    validator rejects.
+
+    Returns a copy down to every dict it modifies, because the caller's `body`
+    is reused by the other attempts and `input` is a list it shares.
     """
     items = body.get("input")
     if not isinstance(items, list):
         return body, 0
-    kept = [i for i in items
-            if not (isinstance(i, dict) and i.get("type") == "reasoning"
-                    and i.get("encrypted_content"))]
-    if len(kept) == len(items):
+
+    dropped = 0
+    kept: List = []
+    for item in items:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+
+        if item.get("type") == "reasoning" and item.get("encrypted_content"):
+            dropped += 1
+            continue
+
+        content = item.get("content")
+        if isinstance(content, list) and any(
+                isinstance(c, dict) and c.get("encrypted_content")
+                for c in content):
+            clean = [c for c in content
+                     if not (isinstance(c, dict) and c.get("encrypted_content"))]
+            dropped += len(content) - len(clean)
+            if not clean:
+                continue
+            item = dict(item)
+            item["content"] = clean
+        elif item.get("encrypted_content"):
+            # Some other item type carrying it at the top. Take the field and
+            # leave the item: it is the ciphertext that is unreadable, not the
+            # tool call or message wrapped around it.
+            dropped += 1
+            item = {k: v for k, v in item.items() if k != "encrypted_content"}
+
+        kept.append(item)
+
+    if not dropped:
         return body, 0
     out = dict(body)
     out["input"] = kept
-    return out, len(items) - len(kept)
+    return out, dropped
+
+
+def _carries_encrypted(body: dict) -> bool:
+    """Is there endpoint-bound ciphertext in this request's `input`?
+
+    Same two places `_strip_encrypted_reasoning` looks, asked as a question.
+    Used only to decide whether a routing decision is worth warning about:
+    `include: ["reasoning.encrypted_content"]` makes a request sticky from its
+    first turn, before there is anything to protect, so "sticky" on its own
+    says nothing about whether this particular turn is at risk.
+    """
+    for item in body.get("input") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("encrypted_content"):
+            return True
+        content = item.get("content")
+        if isinstance(content, list) and any(
+                isinstance(c, dict) and c.get("encrypted_content")
+                for c in content):
+            return True
+    return False
 
 
 async def _body_and_model(request: Request):
@@ -2472,8 +2842,22 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     # rather than a walk across the others. Moving it would trade a slow request
     # for a guaranteed decryption failure.
     session = affinity.key(request, body) if cfg.affinity_enabled else None
+    family = affinity.family(request, body) if cfg.affinity_enabled else None
     sticky = bool(session) and affinity.sticky(body)
     pinned = affinity.pinned(session, routes) if sticky else None
+    # This family has been found carrying ciphertext that could not be placed,
+    # so it goes out stripped wherever it goes — the client resends the same
+    # unreadable items every turn, so one stripped retry is not enough. No
+    # event of its own: the per-route `stripped` warning below fires whenever
+    # this actually removes something, and saying it twice per turn for an hour
+    # would drown the log this is meant to make readable.
+    tainted = affinity.tainted(family) if sticky else False
+    # The endpoint that owns this session's state, and the routes onto it.
+    # Consulted only when the exact slot is empty, which for codex means the
+    # first turn of a thread — including a subagent's, which arrives already
+    # carrying ciphertext its parent minted. See SessionAffinity.family.
+    home, local = affinity.home(family, routes) if sticky and pinned is None \
+        else (None, [])
     if pinned is not None and cfg.affinity_on_conflict == "wait":
         attempts = [pinned] * max(1, 1 + cfg.affinity_attempts)
     elif pinned is not None:
@@ -2481,10 +2865,36 @@ async def _forward(request: Request, body: dict, routes: List[Route],
         # like anything else. Faster, and wrong for codex.
         attempts = [pinned] + [r for r in routes if r is not pinned]
         attempts = attempts[:cfg.max_attempts]
+    elif local:
+        # This thread has no pin of its own but its session does. Balance
+        # inside that endpoint — a second deployment there is a second quota,
+        # and the ciphertext is readable across both — then let the rest of the
+        # world follow as a fallback, stripped, so an endpoint that has gone
+        # down costs the turn its inherited context rather than the turn.
+        affinity.note_inherited()
+        rest = [r for r in routes if r.endpoint != home]
+        attempts = (quota.order(local) + quota.order(rest))[:cfg.max_attempts]
+        _ev("inherited", "info",
+            "%s model=%s has no pin of its own; its session's state is on %s, "
+            "so it goes there (%d route(s))",
+            face, requested, home, len(local),
+            face=face, model=requested, endpoint=home, routes=len(local))
     else:
         # Balancing decides the order; max_attempts still decides the depth, and
         # the list is a permutation of `routes`, so no endpoint is tried twice.
         attempts = quota.order(routes)[:cfg.max_attempts]
+        if sticky and family and _carries_encrypted(body):
+            # Nothing knows where this ciphertext came from — a proxy restart,
+            # an expired pin, or a client that opened a thread the proxy never
+            # saw the parent of. It may well be rejected, so say so here rather
+            # than leaving the next occurrence to be reconstructed from the
+            # client's error message.
+            _ev("unpinned", "warning",
+                "%s model=%s carries encrypted state but has no pin and no "
+                "session endpoint; routing it to %s on the balancer's word",
+                face, requested, attempts[0] if attempts else "nowhere",
+                face=face, model=requested,
+                route=str(attempts[0]) if attempts else None)
     held = pinned is not None and cfg.affinity_on_conflict == "wait"
     if held:
         _ev("held", "info", "%s model=%s held on pinned %s (%d attempts)",
@@ -2518,18 +2928,26 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     for i, route in enumerate(attempts):
         is_last = i == len(attempts) - 1
         payload = dict(body)
-        # Off the deployment that minted them, the encrypted reasoning items in
-        # this body are unreadable and Azure rejects the whole call. `pinned` is
-        # the only route that can read them: anywhere else — no pin at all, or
-        # `switch` moving on from it — they have to come off, or the turn dies
-        # instead of merely forgetting how it got here.
-        if sticky and route is not pinned and cfg.affinity_off_route == "strip":
+        # Off the endpoint that minted it, the ciphertext in this body is
+        # unreadable and Azure rejects the whole call. Two routes can read it:
+        # the exact pin, and — when there is no pin yet — any deployment on the
+        # endpoint this session's state lives on, which is what carries a
+        # subagent's inherited `agent_message` across from its parent's model.
+        # Anywhere else it has to come off, or the turn dies instead of merely
+        # forgetting how it got here.
+        readable = route is pinned or (pinned is None and home is not None
+                                       and route.endpoint == home)
+        if sticky and (tainted or not readable) \
+                and cfg.affinity_off_route == "strip":
             payload, dropped = _strip_encrypted_reasoning(payload)
             if dropped:
-                affinity.note_stripped()
+                # Taints the family as it strips: the items are still in the
+                # client's transcript and will be back next turn, on a route
+                # that by then looks readable. See SessionAffinity.tainted.
+                affinity.note_stripped(family)
                 _ev("stripped", "warning",
-                    "%s model=%s is off its pinned deployment; dropped %d "
-                    "encrypted reasoning item(s) so %s can answer it",
+                    "%s model=%s is off the endpoint that minted its state; "
+                    "dropped %d encrypted item(s) so %s can answer it",
                     face, requested, dropped, route,
                     route=route, face=face, model=requested, stripped=dropped)
         payload["model"] = route.deployment
@@ -2666,11 +3084,11 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                         reason=reason, in_stream=True, last_route=True)
 
                 if sticky:
-                    affinity.pin(session, route)
+                    affinity.pin(session, route, family)
                 return _relay_stream(resp, route, face, started, head,
                                      request_bytes, entry,
                                      counted=bool(head.retry_reason) or throttled,
-                                     model=requested)
+                                     model=requested, family=family)
             else:
                 # Everything else is the caller's answer, including a 4xx from
                 # the deployment: parameters are forwarded untouched, so a 400
@@ -2689,8 +3107,20 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                     route=route, face=face, model=requested, stream=False,
                     status=resp.status_code,
                     seconds=round(time.monotonic() - started, 1))
+                # The buffered face's shape of the same refusal: a 400 whose
+                # body names invalid_encrypted_content. Same treatment — say so
+                # in the log, and make the client's retry go out stripped.
+                if sticky and ENCRYPTED_REJECTED in resp.content:
+                    _ev("upstream_error", "warning",
+                        "!! %s refused %s model=%s for the encrypted state it "
+                        "carried (%s)", route, face, requested,
+                        ENCRYPTED_REJECTED.decode(),
+                        route=route, face=face, model=requested,
+                        error_code=ENCRYPTED_REJECTED.decode(),
+                        status=resp.status_code)
+                    affinity.note_rejected(family)
                 if sticky and resp.status_code < 400:
-                    affinity.pin(session, route)
+                    affinity.pin(session, route, family)
                 return _relay(resp, route, request_bytes, entry,
                               counted=retryable)
 

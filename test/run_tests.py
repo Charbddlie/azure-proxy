@@ -2394,6 +2394,258 @@ def test_two_models_in_one_session_do_not_share_a_pin():
     assert aff.report()["live_sessions"] == 2, aff.report()
 
 
+def test_a_subagent_starts_on_the_endpoint_its_parent_minted_state_on():
+    """The other half of the same fact: two models, but one endpoint.
+
+    Separating the two models' pins is right for the reasoning each of them
+    mints, and on its own it is what broke codex subagents. Measured
+    2026-08-25: when a master calls `collaboration.spawn_agent`, the worker
+    opens a thread on a DIFFERENT model carrying an `agent_message` whose
+    content holds the PARENT's ciphertext. Its own slot is empty on that first
+    turn, so the balancer placed it wherever it liked and the parent's blob
+    went to an endpoint that could not read it —
+
+        event: error   {"code": "invalid_encrypted_content",
+                        "message": "Encrypted function output content could
+                                    not be decrypted or decoded."}
+
+    — which codex reports as "stream disconnected before completion". It
+    succeeded whenever the balancer happened to pick the parent's endpoint,
+    which is why it looked intermittent rather than broken.
+
+    So the conversation id alone, without the model, binds the ENDPOINT, and a
+    thread with no pin of its own starts there. Driven against the map
+    directly: two models on one session is awkward to stage over HTTP.
+    """
+    sys.path.insert(0, ROOT)
+    import logging
+    from proxy.server import Route, SessionAffinity
+    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
+
+    class Cfg:
+        affinity_enabled = True
+        affinity_keys = ["header:session-id", "body:prompt_cache_key"]
+        affinity_markers = ["reasoning.encrypted_content"]
+        affinity_ttl = 3600
+        affinity_max = 16
+        affinity_on_conflict = "wait"
+        affinity_off_route = "strip"
+
+    class Req:
+        def __init__(self, headers):
+            self.headers = headers
+
+    def route(endpoint, deployment):
+        return Route(endpoint, "http://x/", "v", deployment,
+                     "max_completion_tokens", 0, "openai/v1/responses")
+
+    aff = SessionAffinity(Cfg())
+    # One codex session. The worker sends the master's session-id and its own
+    # thread-id, so this is the same request object for both.
+    request = Req({"session-id": CODEX_SESSION})
+    master = {"model": "sol", "include": ["reasoning.encrypted_content"]}
+    worker = {"model": "terra", "include": ["reasoning.encrypted_content"]}
+
+    alpha_sol, beta_sol = route("alpha", "sol"), route("beta", "sol")
+    alpha_terra, beta_terra = route("alpha", "terra"), route("beta", "terra")
+
+    family = aff.family(request, master)
+    assert family == aff.family(request, worker), \
+        "master and worker are not the same family"
+
+    # The master's first turn lands on alpha and is pinned there.
+    aff.pin(aff.key(request, master), alpha_sol, family)
+
+    # The worker has no pin of its own...
+    assert aff.pinned(aff.key(request, worker), [alpha_terra, beta_terra]) is None
+    # ...but its session does, and it names the endpoint, not the deployment.
+    home, local = aff.home(family, [alpha_terra, beta_terra])
+    assert home == "alpha", home
+    assert local == [alpha_terra], local
+
+    # The master's own slot is untouched by any of this.
+    assert aff.pinned(aff.key(request, master), [alpha_sol, beta_sol]) is alpha_sol
+
+    # An endpoint that does not serve the worker's model is not an error: the
+    # caller strips and routes freely rather than refusing to route at all.
+    home, local = aff.home(family, [beta_terra])
+    assert home == "alpha" and local == [], (home, local)
+
+    report = aff.report()
+    assert report["live_families"] == 1, report
+    assert report["live_sessions"] == 1, report
+
+
+def test_a_refused_family_keeps_going_out_stripped():
+    """One refusal taints the session, and the taint does not wear off in a turn.
+
+    The proxy strips a REQUEST; it cannot strip the client's transcript, and
+    codex rebuilds `input` from that transcript every turn. So the items that
+    were refused come straight back on the next one — which is pinned again by
+    then, looks readable, and is refused again. Measured 2026-08-25: a session
+    that survived a stripped turn died on the very next one with a 400
+    `invalid_encrypted_content`.
+
+    So the note is sticky rather than one-shot, and a strip sets it as surely
+    as a refusal does: both mean the same thing, that this family is carrying
+    items the endpoint it is going to cannot read.
+    """
+    sys.path.insert(0, ROOT)
+    from proxy.server import SessionAffinity
+
+    class Cfg:
+        affinity_enabled = True
+        affinity_keys = ["header:session-id"]
+        affinity_markers = ["reasoning.encrypted_content"]
+        affinity_ttl = 3600
+        affinity_max = 16
+        affinity_on_conflict = "wait"
+        affinity_off_route = "strip"
+
+    aff = SessionAffinity(Cfg())
+    assert aff.tainted("f1") is False, "nothing has been refused yet"
+
+    aff.note_rejected("f1")
+    assert aff.tainted("f1") is True
+    # Reading does not spend it: the next turn carries the same items.
+    assert aff.tainted("f1") is True
+    assert aff.tainted("f2") is False, "one session's taint is not another's"
+
+    # A strip taints too, and for the same reason.
+    aff.note_stripped("f2")
+    assert aff.tainted("f2") is True
+
+    report = aff.report()
+    assert report["rejected_turns"] == 1, report
+    assert report["stripped_turns"] == 1, report
+
+    # It expires with everything else, so a conversation that has gone quiet
+    # does not hold a session id hostage for the life of the process.
+    Cfg.affinity_ttl = -1
+    assert aff.tainted("f1") is False
+    assert aff.tainted("f2") is False
+
+
+def test_the_blob_a_parent_hands_a_subagent_comes_off_too():
+    """Stripping follows the field, not the item type.
+
+    The first version of this looked for `type: "reasoning"` items, which is
+    where a model's own chain of thought lives. It is not where codex puts the
+    message a master writes for its worker: that is an `agent_message` whose
+    `content` list holds an `encrypted_content` entry beside the plain text.
+    Walking past it is what let a stripped subagent turn be refused anyway.
+
+    The plain text stays. That is the point of stripping rather than dropping:
+    the worker still gets its instructions, just not whatever the encrypted
+    channel added to them.
+    """
+    sys.path.insert(0, ROOT)
+    from proxy.server import _strip_encrypted_reasoning, _carries_encrypted
+
+    blob = "gAAAAABo" + "x" * 64
+    body = {"input": [
+        {"type": "message", "content": [{"type": "input_text", "text": "hi"}]},
+        codex_reasoning_item(),
+        # As captured off codex 0.148 on 2026-08-25.
+        {"type": "agent_message", "id": "amsg_1", "author": "/root",
+         "content": [{"type": "input_text", "text": "do the thing"},
+                     {"type": "encrypted_content", "encrypted_content": blob}]},
+        # Nothing but ciphertext: the item goes, rather than being sent with an
+        # empty `content` the validator would reject.
+        {"type": "agent_message", "id": "amsg_2",
+         "content": [{"type": "encrypted_content", "encrypted_content": blob}]},
+        # And the field on an item of some type this proxy has not seen.
+        {"type": "custom_tool_call", "id": "ctc_1", "encrypted_content": blob},
+    ]}
+    assert _carries_encrypted(body)
+
+    out, dropped = _strip_encrypted_reasoning(body)
+    assert dropped == 4, dropped
+    assert not _carries_encrypted(out), out
+    kinds = [i["type"] for i in out["input"]]
+    assert kinds == ["message", "agent_message", "custom_tool_call"], kinds
+    assert out["input"][1]["content"] == [
+        {"type": "input_text", "text": "do the thing"}], out["input"][1]
+    assert out["input"][1]["author"] == "/root", "the item lost more than its blob"
+    assert "encrypted_content" not in out["input"][2], out["input"][2]
+
+    # The caller's body is reused by the other attempts and must not be edited.
+    assert len(body["input"]) == 5 and _carries_encrypted(body)
+
+    # A body with nothing to strip is handed back as-is, not copied.
+    clean = {"input": [{"type": "message"}]}
+    assert _strip_encrypted_reasoning(clean) == (clean, 0)
+
+
+def test_a_turn_the_upstream_failed_inside_a_200_is_read_off_the_bytes():
+    """The refusal Azure sends mid-stream, and where it actually sits.
+
+    Every one of these arrives as HTTP 200 with an `error` event in the body,
+    so a proxy that files responses by status code writes them down as
+    successes — which is what happened: during the 2026-08-25 subagent outage
+    every client saw the turn fail and `grep` over proxy.log returned nothing.
+
+    It cannot be found in the head, either. The probe holds 16KB and a
+    codex-shaped `response.created` echoes the whole request back at 46KB, so
+    the error event is tens of kilobytes past the end of the window. It has to
+    be read off the relay, at whatever chunk size the transport happens to
+    deliver — hence the sizes below, the smallest of which splits the marker,
+    the code and the message across three reads.
+    """
+    sys.path.insert(0, ROOT)
+    from proxy.server import _StreamWatch
+
+    def stream(*events):
+        return b"".join(b"event: %s\ndata: %s\n\n" % (k, v) for k, v in events)
+
+    refused = stream(
+        (b"response.created", b'{"type":"response.created","response":{"x":"'
+                              + b"p" * 46000 + b'"}}'),
+        (b"error", b'{"type":"error","error":{"type":"invalid_request_error",'
+                   b'"code":"invalid_encrypted_content","message":"Encrypted '
+                   b'function output content could not be decrypted or '
+                   b'decoded.","param":null}}'),
+        (b"response.failed", b'{"type":"response.failed"}'))
+
+    for size in (37, 512, 16384, 1 << 20):
+        watch = _StreamWatch()
+        for i in range(0, len(refused), size):
+            watch.feed(refused[i:i + size])
+        code, message = watch.upstream_error()
+        assert code == "invalid_encrypted_content", (size, code)
+        assert message.startswith("Encrypted function output"), (size, message)
+        assert not watch.completed, size
+
+    # `server_error` carries no message at all — only a type, a code and a
+    # headers object. The code is the whole of what it has to say.
+    bare = stream((b"error", b'{"type":"error","error":{"type":"server_error",'
+                             b'"code":"server_error","headers":{}}}'))
+    watch = _StreamWatch()
+    watch.feed(bare)
+    assert watch.upstream_error() == ("server_error", ""), watch.upstream_error()
+
+    # A whole answer says nothing here, however it is chunked.
+    healthy = stream(
+        (b"response.created", b'{"type":"response.created"}'),
+        (b"response.completed", b'{"type":"response.completed",'
+                                b'"response":{"usage":{"total_tokens":11}}}'))
+    for size in (7, 4096):
+        watch = _StreamWatch()
+        for i in range(0, len(healthy), size):
+            watch.feed(healthy[i:i + size])
+        assert watch.upstream_error() is None, size
+        assert watch.completed, size
+        assert watch.total_tokens == 11, size
+
+    # And a stream that simply stops: no error to report, but not an answer
+    # either, which is the distinction the log line depends on.
+    watch = _StreamWatch()
+    watch.feed(stream((b"response.created", b'{"type":"response.created"}'),
+                      (b"response.output_item.done", b'{"x":1}')))
+    assert watch.upstream_error() is None
+    assert not watch.completed
+
+
 def codex_reasoning_item():
     """The item that only one deployment can read, as codex sends it back."""
     return {"type": "reasoning", "id": "rs_03a861b6bc394df2016a8d4bfefb3c81",

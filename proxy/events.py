@@ -38,6 +38,12 @@ KINDS = (
     "failover",     # left one route for the next in the chain
     "held",         # a pinned session queued for its own endpoint instead
     "pin",          # a conversation was bound to a route, or lost its binding
+    "inherited",    # a thread with no pin of its own was placed on the endpoint
+                    # its session's state lives on — a subagent's first turn
+    "unpinned",     # a request carrying encrypted state had nothing to place it
+                    # by, so the balancer chose and it may well be refused
+    "upstream_error",  # the upstream failed the turn inside a 200, in an SSE
+                    # `error` event, or named a refusal in a buffered body
     "stripped",     # a turn went out without the encrypted reasoning it came
                     # with, because it could not be kept on the deployment that
                     # can read it
@@ -55,8 +61,16 @@ KINDS = (
 # the filter under one line per conversation. A strip is the mechanism having
 # already failed — the turn survived, but it answered without its own reasoning,
 # and a run of them means affinity is not holding.
+#
+# `inherited` is out for the same reason as `pin`: placing a subagent on its
+# parent's endpoint is the mechanism working, once per spawn. `unpinned` is in,
+# because it is the one case where the proxy knowingly sends ciphertext
+# somewhere that may refuse it. `upstream_error` is in and belongs there most of
+# all: a turn the upstream failed inside a 200 used to leave no trace here at
+# all, which is why the 2026-08-25 outage could not be read out of proxy.log.
 PROBLEM_KINDS = frozenset(
-    {"throttle", "demote", "failover", "timeout", "exhausted", "stripped"})
+    {"throttle", "demote", "failover", "timeout", "exhausted", "stripped",
+     "unpinned", "upstream_error"})
 
 LEVELS = ("debug", "info", "warning", "error")
 

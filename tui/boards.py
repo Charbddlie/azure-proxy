@@ -315,8 +315,14 @@ def render_groups(groups: List[Group], width: int, height: int, offset: int,
 # --------------------------------------------------------------------------
 
 EVENT_FILTERS = ("全部", "问题", "他人容量")
+# Kept in step with proxy/events.py::PROBLEM_KINDS by hand, because the
+# dashboard talks to the proxy over HTTP and imports nothing from it. It had
+# already drifted once: `unpinned` and `upstream_error` were added on the
+# server and the filter here went on hiding exactly the two kinds that say a
+# turn was refused for state it was carrying.
 PROBLEM_KINDS = frozenset(
-    {"throttle", "demote", "failover", "timeout", "exhausted", "stripped"})
+    {"throttle", "demote", "failover", "timeout", "exhausted", "stripped",
+     "unpinned", "upstream_error"})
 
 
 def filter_events(events: List[dict], mode: int) -> List[dict]:
