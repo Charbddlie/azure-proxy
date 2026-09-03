@@ -207,14 +207,21 @@ class Group:
 
 SORTS = ("activity", "name", "capacity")
 
-# How many distinct model versions stay visible when idle. The newest three
-# — 5.6, 5.5, 5.4 as of 2026-08 — with everything behind them hidden unless it
-# is actually carrying traffic.
+# How many distinct model versions stay visible when idle, counted WITHIN each
+# family. The newest three text models — 5.6, 5.5, 5.4 as of 2026-08 — and the
+# newest three image models, with everything behind them hidden unless it is
+# actually carrying traffic.
+#
+# Per family, because the families number independently: gpt-image-2 is the
+# newest image model there is, and ranking its `2` against gpt-5.6's `5.6` on
+# one list buries the current image model under three generations of text. The
+# image face is also the quietest one on the proxy — 2 RPM on gpt-image-2 —
+# so an activity rule alone would keep it off screen almost always.
 #
 # A COUNT of versions rather than a fixed floor, because a floor rots: pinning
 # it at 5.4 keeps 5.4 on screen forever, and every new release would need an
 # edit here to take effect. Counting slides on its own — when 5.7 lands, 5.4
-# drops off the bottom.
+# drops off the bottom, and when gpt-image-3 lands it takes its own slot.
 #
 # And versions rather than release dates, even though the dates are exact and
 # right there in the data. They are too closely spaced to cut on: gpt-5.3-codex
@@ -223,7 +230,10 @@ SORTS = ("activity", "name", "capacity")
 # the list; version numbers decide what is old. Two questions, two signals.
 KEEP_RECENT_VERSIONS = 3
 
-_VERSION = re.compile(r"^gpt-(\d+)(?:\.(\d+))?")
+# `gpt-<family>-<major>[.<minor>]`, family optional: gpt-5.6-sol is ("", 5, 6)
+# and gpt-image-1.5 is ("image", 1, 5). The family word has to be letters only,
+# so gpt-4o still parses as the plain family at version 4.
+_VERSION = re.compile(r"^gpt-(?:([a-z]+)-)?(\d+)(?:\.(\d+))?")
 
 # Strength within one release, weakest number = strongest model. Only ever a
 # tiebreak: several models ship on the same day (gpt-5.6-luna/sol/terra all on
@@ -234,12 +244,18 @@ _TIER_DEFAULT = 3               # the plain model, between codex and mini
 
 
 def version_of(name: str) -> Optional[tuple]:
-    """(major, minor) parsed out of a model name, or None for a family we
-    cannot rank — the o-series, or anything that is not `gpt-<n>`."""
+    """(family, major, minor) parsed out of a model name, or None for a family
+    we cannot rank — the o-series, or anything that is not `gpt-…`.
+
+    The family is part of the key so that versions are only ever compared
+    against their own line: gpt-image-2 is the second image model, not an
+    ancient text one.
+    """
     match = _VERSION.match(name or "")
     if not match:
         return None
-    return int(match.group(1)), int(match.group(2) or 0)
+    return (match.group(1) or "", int(match.group(2)),
+            int(match.group(3) or 0))
 
 
 def tier_of(name: str) -> int:
@@ -313,15 +329,27 @@ class Snapshot:
         # The versions that stay on screen when nothing is using them. Computed
         # from what this proxy actually serves rather than from a list written
         # down somewhere, so a newly probed model needs no code change to show
-        # up and push an old one off.
-        present = {v for v in (version_of(g.name) for g in self.models) if v}
-        self._recent = set(sorted(present, reverse=True)[:KEEP_RECENT_VERSIONS])
+        # up and push an old one off. Counted per family, so the image models
+        # get their own three slots instead of competing with the text ones.
+        present: Dict[str, set] = {}
+        for group in self.models:
+            version = version_of(group.name)
+            if version:
+                present.setdefault(version[0], set()).add(version)
+        self._recent = set()
+        for versions in present.values():
+            self._recent.update(
+                sorted(versions, reverse=True)[:KEEP_RECENT_VERSIONS])
 
     # -- what is worth showing --------------------------------------------
     def is_legacy(self, name: str) -> bool:
         """Is this an old model, by version rather than by date.
 
-        A family with no `gpt-<n>` version — the o-series — counts as legacy.
+        Old means "old within its own family": the newest few gpt-<n> releases
+        stay, and so do the newest few gpt-image-<n>, because a caller asking
+        for an image model has no use at all for the text list.
+
+        A family with no version at all — the o-series — counts as legacy.
         That is what was asked for, and it is the only honest answer available:
         nothing in the name says where `o3` sits relative to `gpt-5.4`. It also
         means an unfamiliar family would be hidden while idle, which is why the

@@ -11,9 +11,9 @@ back linearly in between (see the AIMD note in proxy/server.py). `free` is
 what is left over, and is therefore only as trustworthy as the estimate beside
 it. Drawing them as one bar is the point: they add up to exactly one deployment.
 
-The `ours` part is subdivided by face — chat and Responses, streamed or not —
-in the same colour, because they are slices of one number rather than four
-numbers. See tui/theme.py.
+The `ours` part is subdivided by face — chat and Responses, streamed or not,
+and the images face — in the same colour, because they are slices of one number
+rather than five numbers. See tui/theme.py.
 
 An unknown ceiling draws as neither full nor empty. `load` returns None when
 the deployment has never answered, and None means *unknown*: a route that has
@@ -29,7 +29,7 @@ from rich.text import Text
 from . import theme
 from .layout import allocate
 
-FACES = ("chat", "chat_stream", "responses", "responses_stream")
+FACES = ("chat", "chat_stream", "responses", "responses_stream", "image")
 
 
 def capacity_bar(width: int, by_face: Optional[Dict[str, float]],
@@ -38,7 +38,7 @@ def capacity_bar(width: int, by_face: Optional[Dict[str, float]],
 
     `by_face` is /routes' `our_load_by_face`, or None when the ceiling is not
     known. `foreign` is `foreign_load`. The total this proxy is using is not a
-    separate argument: it is the sum of the four faces, which /routes builds to
+    separate argument: it is the sum of the faces, which /routes builds to
     equal `our_load` exactly. Passing both would be passing the same number
     twice and inviting them to disagree.
 
@@ -66,13 +66,14 @@ def capacity_bar(width: int, by_face: Optional[Dict[str, float]],
         used = total
 
     cells = allocate(width, ours + [max(0.0, foreign), max(0.0, 1.0 - used)])
-    for name, n in zip(FACES, cells[:4]):
+    for name, n in zip(FACES, cells):
         if n:
             bar.append(theme.FACE_GLYPH.get(name, "█") * n, style=theme.OURS)
-    if cells[4]:
-        bar.append(theme.FOREIGN_GLYPH * cells[4], style=theme.FOREIGN)
-    if cells[5]:
-        bar.append(theme.FREE_GLYPH * cells[5], style=theme.FREE)
+    if cells[len(FACES)]:
+        bar.append(theme.FOREIGN_GLYPH * cells[len(FACES)],
+                   style=theme.FOREIGN)
+    if cells[len(FACES) + 1]:
+        bar.append(theme.FREE_GLYPH * cells[len(FACES) + 1], style=theme.FREE)
     return bar
 
 

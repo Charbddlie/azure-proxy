@@ -56,7 +56,8 @@ class Proxy:
                  affinity_attempts=4, affinity_max_wait=30,
                  affinity_off_route="strip",
                  foreign=True, foreign_reclaim=0.1, deployments=None,
-                 faces=None):
+                 faces=None, images=None, image_attempts=3,
+                 image_max_wait=30):
         """endpoints: list of (name, url). Order is failover priority.
 
         deployments: {endpoint name: [{"name": …, "capacity_tokens": …}, …]},
@@ -68,6 +69,12 @@ class Proxy:
         faces: {endpoint name: ["chat"] | ["responses"] | both}, for a
         deployment that serves one face and not the other. Azure gates the two
         separately and some models really are Responses-only.
+
+        images: {endpoint name: [{"name": deployment, "model": …,
+        "image_edits": bool, "capacity_requests": …}, …]}. A separate argument
+        from `deployments` because image deployments are a separate set: they
+        serve no text face, they are on some endpoints and not others, and the
+        model they publish is not the one the text routes publish.
 
         responses: whether the fake endpoints serve the Responses API. Set it
         False to model a deployment that only answers on chat/completions —
@@ -114,6 +121,9 @@ class Proxy:
                 "    hold_seconds: {probe}\n"
                 "    hold_bytes: 16384\n"
                 "    retry_on_codes: [rate_limit_exceeded]\n"
+                "  image:\n"
+                "    max_attempts: {imgattempts}\n"
+                "    max_wait_seconds: {imgwait}\n"
                 "  session_affinity:\n"
                 "    enabled: {affinity}\n"
                 "    on_conflict: {conflict}\n"
@@ -153,6 +163,7 @@ class Proxy:
                     demote=demote_seconds, halflife=demote_halflife,
                     spill=spill_threshold, window=load_window,
                     probe=probe_seconds,
+                    imgattempts=image_attempts, imgwait=image_max_wait,
                     foreign="true" if foreign else "false",
                     reclaim=foreign_reclaim,
                     affinity="true" if affinity else "false",
@@ -176,6 +187,9 @@ class Proxy:
             """
             return (deployments or {}).get(name) or [{"name": DEPLOYMENT}]
 
+        def image_plan(name):
+            return (images or {}).get(name) or []
+
         def faces_for(name):
             return [f for f in ((faces or {}).get(name) or both) if f in both]
 
@@ -189,18 +203,42 @@ class Proxy:
                     hop[field] = spec[field]
             return hop
 
-        sources = dict(header, endpoints=[
-            dict({"name": name, "url": url, "api_version": "test-version",
-                  "auth": "cli", "priority": i, "status": "ok",
-                  "deployments": [
-                      dict(spec, limit_param="max_completion_tokens",
-                           faces=faces_for(name))
-                      for spec in plan(name)]}, **endpoint_extra)
-            for i, (name, url) in enumerate(endpoints)])
-        models = dict(header, models={MODEL: {"routes": [
+        def image_route(name, i, spec):
+            hop = {"endpoint": name, "deployment": spec["name"], "priority": i,
+                   "limit_param": "max_completion_tokens", "faces": ["image"],
+                   "image_edits": bool(spec.get("image_edits", True))}
+            for field in ("capacity_requests", "capacity_tokens"):
+                if spec.get(field) is not None:
+                    hop[field] = spec[field]
+            return hop
+
+        def endpoint_entry(i, name, url):
+            entry = dict({"name": name, "url": url,
+                          "api_version": "test-version",
+                          "auth": "cli", "priority": i, "status": "ok",
+                          "deployments": [
+                              dict(spec, limit_param="max_completion_tokens",
+                                   faces=faces_for(name))
+                              for spec in plan(name)]}, **endpoint_extra)
+            entry["image_status"] = "ok" if image_plan(name) else "not_probed"
+            entry["deployments"] += [
+                dict(spec, limit_param="max_completion_tokens",
+                     faces=["image"])
+                for spec in image_plan(name)]
+            return entry
+
+        sources = dict(header,
+                       endpoints=[endpoint_entry(i, name, url)
+                                  for i, (name, url) in enumerate(endpoints)])
+        routes = {MODEL: {"routes": [
             route(name, i, spec)
             for i, (name, _url) in enumerate(endpoints)
-            for spec in plan(name)]}})
+            for spec in plan(name)]}}
+        for i, (name, _url) in enumerate(endpoints):
+            for spec in image_plan(name):
+                routes.setdefault(spec["model"], {"routes": []})["routes"] \
+                    .append(image_route(name, i, spec))
+        models = dict(header, models=routes)
         _dump(os.path.join(self.home, "runtime", "sources.json"), sources)
         _dump(os.path.join(self.home, "runtime", "models.json"), models)
 
@@ -234,6 +272,23 @@ class Proxy:
             self.url(path),
             data=json.dumps(body).encode(),
             headers=dict({"Content-Type": "application/json"}, **(headers or {})),
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read()), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = {"_raw": raw.decode("utf-8", "replace")}
+            return e.code, parsed, dict(e.headers)
+
+    def post_raw(self, path, blob, content_type, timeout=60, headers=None):
+        """POST a body the harness does not encode. For the multipart face."""
+        req = urllib.request.Request(
+            self.url(path), data=blob,
+            headers=dict({"Content-Type": content_type}, **(headers or {})),
             method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -3355,23 +3410,92 @@ def test_arm_plan_keeps_two_deployments_of_one_model_apart():
 
 
 def test_arm_plan_drops_what_this_proxy_cannot_serve():
-    """Batch SKUs, image deployments, half-built ones. None are chat routes.
+    """Batch SKUs, half-built ones, and anything with no face at all.
 
     All three would fail the data-plane probe anyway; excluding them here saves
     the request and keeps the reason in one readable place rather than in a
-    status code.
+    status code. An embeddings deployment is the third case: it has a
+    capability, it just is not one this proxy has a face for.
     """
     plan = probe_module.plan_deployments([
         arm("gpt-4.1-batch", "gpt-4.1", sku="DataZoneBatch", capacity=30000),
         arm("o4-mini", "o4-mini", sku="GlobalBatch", capacity=200000),
-        arm("gpt-image-2", "gpt-image-2", capacity=2,
-            capabilities={"imageGenerations": "true", "imageEdits": "true"}),
-        arm("dall-e-3", "dall-e-3", sku="Standard", capacity=1,
-            capabilities={"imageGenerations": "true"}),
+        arm("embed", "text-embedding-3-large", capacity=100,
+            capabilities={"embeddings": "true"}),
         arm("half-built", "gpt-5.5", state="Creating"),
         arm("gpt-5.6-sol", "gpt-5.6-sol"),
     ])
     assert [d["deployment"] for d in plan] == ["gpt-5.6-sol"], plan
+
+
+def test_arm_plan_keeps_image_deployments_off_the_text_probes():
+    """An image deployment is planned, and probed only on the face it has.
+
+    It has to be planned — the proxy serves /v1/images/* now — and it must not
+    be probed on chat, because a gpt-image deployment answers chat/completions
+    with a refusal that would then be counted into the ENDPOINT's chat status.
+    A resource holding one dead-looking deployment is not a dead resource.
+    """
+    plan = probe_module.plan_deployments([
+        arm("gpt-image-2", "gpt-image-2", capacity=2,
+            capabilities={"imageGenerations": "true", "imageEdits": "true"}),
+        arm("gpt-image-1.5", "gpt-image-1.5", capacity=30,
+            capabilities={"imageGenerations": "true"}),
+        arm("gpt-5.6-sol", "gpt-5.6-sol"),
+    ])
+    by_name = {d["deployment"]: d for d in plan}
+    assert set(by_name) == {"gpt-image-2", "gpt-image-1.5", "gpt-5.6-sol"}, plan
+    assert by_name["gpt-image-2"]["probe_faces"] == ["image"], plan
+    assert by_name["gpt-5.6-sol"]["probe_faces"] == ["chat", "responses"], plan
+    # imageEdits is ARM's word and is never probed: an edits call has to carry
+    # a real image. It is what /v1/images/edits refuses a generations-only
+    # model on.
+    assert by_name["gpt-image-2"]["image_edits"] is True, plan
+    assert by_name["gpt-image-1.5"]["image_edits"] is False, plan
+
+    assert [d["deployment"] for d in probe_module.planned_for(plan, "chat")] \
+        == ["gpt-5.6-sol"], plan
+    assert sorted(d["deployment"]
+                  for d in probe_module.planned_for(plan, "image")) \
+        == ["gpt-image-1.5", "gpt-image-2"], plan
+
+
+def test_arm_plan_drops_a_retired_image_deployment():
+    """dall-e-3 on gpt4v-swc is `Disabled` and answers 410. The provisioning
+    state catches it before anything is spent finding that out."""
+    plan = probe_module.plan_deployments([
+        arm("Dalle3", "dall-e-3", sku="Standard", capacity=1, state="Disabled",
+            capabilities={"imageGenerations": "true"}),
+    ])
+    assert plan == [], plan
+
+
+def test_image_probe_reads_a_refusal_as_proof_of_life():
+    """The probe sends an empty prompt so that nothing is generated.
+
+    What comes back is a refusal, and which refusal it is answers the whole
+    question. Codes measured 2026-08-29 against gpt4v-swc.
+    """
+    alive = probe_module.alive_on_image
+    assert alive((400, "empty_string", "Invalid 'prompt': empty string."))
+    assert alive((400, "missing_required_parameter", "Missing 'prompt'."))
+    # Quota, which means Azure counted the call against this deployment: the
+    # deployment is there and we are allowed in. gpt-image-2 holds 2 RPM and
+    # answers this way most of the time.
+    assert alive((429, "RateLimitReached", "exceeded the call rate limit"))
+    # A chat deployment, a missing one, a retired one, no data action.
+    assert not alive((400, "OperationNotSupported", "does not work with gpt-4.1"))
+    assert not alive((404, "DeploymentNotFound", "does not exist"))
+    assert not alive((410, "410", "deprecated and no longer available"))
+    assert not alive((401, None, "PermissionDenied"))
+
+    assert probe_module.classify_images(
+        [(400, "empty_string", "")])[0] == "ok"
+    assert probe_module.classify_images([])[0] == "not_probed"
+    assert probe_module.classify_images(
+        [(401, None, "")])[0] == "auth_denied"
+    assert probe_module.classify_images(
+        [(400, "OperationNotSupported", "")])[0] == "unsupported"
 
 
 def test_arm_capacity_prefers_rate_limits_and_falls_back_to_the_sku():
@@ -3794,6 +3918,347 @@ def test_a_test_proxy_does_not_touch_the_real_pidfile():
             p.close()
     finally:
         a.stop()
+
+
+# --------------------------------------------------------------------------
+# the images faces
+# --------------------------------------------------------------------------
+#
+# gpt-image-* deployments are a third set alongside the chat and Responses ones:
+# they serve no text face, they exist on some endpoints and not others, and
+# their quota is granted in requests per minute and granted meanly — 2 RPM for
+# gpt-image-2 against 30 for gpt-image-1.5, measured on gpt4v-swc. Everything
+# below follows from those three facts.
+
+IMAGE_MODEL = "test-image-model"
+IMAGE_DEPLOYMENT = "test-image-deployment"      # different, to catch routing
+
+
+def image_endpoint(name, deployment=IMAGE_DEPLOYMENT, model=IMAGE_MODEL,
+                   edits=True, capacity=30):
+    return {name: [{"name": deployment, "model": model, "image_edits": edits,
+                    "capacity_requests": capacity}]}
+
+
+def generate(proxy, model=IMAGE_MODEL, timeout=60, **kw):
+    return proxy.post(dict({"prompt": "a red circle", "model": model}, **kw),
+                      timeout=timeout, path="/v1/images/generations")
+
+
+def multipart(model=IMAGE_MODEL, prompt="make it blue", image=b"\x89PNG-fake",
+              extra=None):
+    """One images/edits body, built the way an OpenAI SDK builds it."""
+    boundary = "----azureproxytest0123456789"
+    parts = []
+    fields = [("prompt", prompt), ("model", model)]
+    fields += sorted((extra or {}).items())
+    for name, value in fields:
+        if value is None:
+            continue
+        parts.append(('--{}\r\nContent-Disposition: form-data; name="{}"'
+                      '\r\n\r\n{}\r\n'.format(boundary, name, value)).encode())
+    parts.append(('--{}\r\nContent-Disposition: form-data; name="image"; '
+                  'filename="a.png"\r\nContent-Type: image/png\r\n\r\n'
+                  .format(boundary)).encode())
+    parts.append(image)
+    parts.append(b"\r\n")
+    parts.append("--{}--\r\n".format(boundary).encode())
+    return (b"".join(parts),
+            "multipart/form-data; boundary=" + boundary)
+
+
+def test_image_generations_routes_to_an_image_deployment():
+    """The plain case, and the one the whole face exists for.
+
+    The deployment name is rewritten into the URL path, not into the body:
+    Azure reads it from the path for the images faces, which is what lets the
+    multipart face below relay its body untouched.
+    """
+    a = FakeAzure("alpha").start()
+    try:
+        p = Proxy([("alpha", a.url)], images=image_endpoint("alpha"))
+        try:
+            status, body, headers = generate(p)
+            assert status == 200, body
+            assert body["data"][0]["b64_json"] == "aW1hZ2U=", body
+            assert headers["x-azure-proxy-route"] == \
+                "alpha/" + IMAGE_DEPLOYMENT, headers
+            sent = a.requests[-1]
+            assert sent["path"] == (
+                "/openai/deployments/{}/images/generations"
+                "?api-version=test-version".format(IMAGE_DEPLOYMENT)), sent
+            assert sent["body"]["prompt"] == "a red circle", sent
+            assert sent["headers"]["authorization"] == \
+                "Bearer test-token-abc", sent
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_image_edits_relays_the_multipart_body_byte_for_byte():
+    """The body is scanned for `model` and then forwarded, not re-encoded.
+
+    Two things are being asserted at once and both matter. The proxy found the
+    model in a multipart body without a multipart parser — there is none in
+    requirements.txt — and the megabytes of image that usually accompany it
+    were not decoded and rebuilt to change a field Azure ignores anyway.
+    """
+    a = FakeAzure("alpha").start()
+    try:
+        p = Proxy([("alpha", a.url)], images=image_endpoint("alpha"))
+        try:
+            blob, content_type = multipart()
+            status, body, _headers = p.post_raw(
+                "/v1/images/edits", blob, content_type)
+            assert status == 200, body
+            sent = a.requests[-1]
+            assert sent["path"] == (
+                "/openai/deployments/{}/images/edits"
+                "?api-version=test-version".format(IMAGE_DEPLOYMENT)), sent
+            assert sent["raw"] == blob, "the multipart body was not relayed intact"
+            # Including the client's own boundary, which is inside the body and
+            # would be a broken request if it disagreed with the header.
+            assert sent["headers"]["content-type"] == content_type, sent
+            # And the model the caller named is still in there, untouched. Azure
+            # takes the deployment from the path, so rewriting it would be work
+            # done to change nothing.
+            assert IMAGE_MODEL.encode() in sent["raw"], sent
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_image_edits_needs_multipart_and_a_model():
+    """Both refusals are local, and both say which one it was."""
+    a = FakeAzure("alpha").start()
+    try:
+        p = Proxy([("alpha", a.url)], images=image_endpoint("alpha"))
+        try:
+            status, body, _ = p.post_raw(
+                "/v1/images/edits", b'{"model": "x"}', "application/json")
+            assert status == 400, body
+            assert body["error"]["code"] == "not_multipart", body
+
+            blob, content_type = multipart(model=None)
+            status, body, _ = p.post_raw("/v1/images/edits", blob, content_type)
+            assert status == 400, body
+            assert body["error"]["code"] == "missing_model", body
+            assert not a.requests, "a local refusal must not reach upstream"
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_image_edits_is_refused_for_a_generations_only_model():
+    """imageEdits is a separate ARM capability, and gpt-image-1.5 on gpt4v-swc
+    has it while a deployment could equally not. Saying so beats relaying
+    Azure's version of the same complaint."""
+    a = FakeAzure("alpha").start()
+    try:
+        p = Proxy([("alpha", a.url)],
+                  images=image_endpoint("alpha", edits=False))
+        try:
+            blob, content_type = multipart()
+            status, body, _ = p.post_raw("/v1/images/edits", blob, content_type)
+            assert status == 404, body
+            assert body["error"]["code"] == "no_image_edits_route", body
+            assert "does not serve /images/edits" in body["error"]["message"], body
+            # Generations still work for the same model.
+            assert generate(p)[0] == 200
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_image_face_retries_the_same_deployment_on_429():
+    """The one place the images faces deliberately break the failover rule.
+
+    Every other face makes at most one attempt per route: a second try at an
+    endpoint that just refused wastes a request when others are standing by.
+    Image models usually have exactly one deployment, so that rule would hand
+    the first 429 to a caller who — going by the OpenAI SDK's defaults for
+    image calls — has set maxRetries to 0. A per-minute request ceiling refills
+    on a clock, so waiting for it is the right move rather than a wasted one.
+    """
+    a = FakeAzure("alpha", [
+        Behaviour(status=429, headers={"Retry-After": "1"}),
+        Behaviour(status=429, headers={"Retry-After": "1"}),
+        Behaviour(status=200),
+    ]).start()
+    try:
+        p = Proxy([("alpha", a.url)], images=image_endpoint("alpha"),
+                  image_attempts=3, image_max_wait=2)
+        try:
+            status, body, _ = generate(p, timeout=30)
+            assert status == 200, body
+            assert len(a.requests) == 3, a.requests
+            assert all("/images/generations" in r["path"] for r in a.requests)
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_image_face_still_fails_over_between_endpoints():
+    """Cycling attempts does not mean giving up on the other routes: the order
+    is the balancer's, and the cycle only starts once it is exhausted."""
+    a = FakeAzure("alpha", [Behaviour(status=429)]).start()
+    b = FakeAzure("beta").start()
+    try:
+        p = Proxy([("alpha", a.url), ("beta", b.url)],
+                  images=dict(image_endpoint("alpha"),
+                              **image_endpoint("beta")),
+                  balance="strict_priority", image_attempts=2,
+                  image_max_wait=1)
+        try:
+            status, body, _ = generate(p, timeout=30)
+            assert status == 200, body
+            assert body["from"] == "beta", body
+            assert len(a.requests) == 1 and len(b.requests) == 1
+        finally:
+            p.close()
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_image_models_are_listed_and_kept_off_the_text_faces():
+    """A gpt-image deployment has no text face at all, and a caller who sends
+    one to /v1/chat/completions should be told where it lives rather than that
+    it does not exist."""
+    a = FakeAzure("alpha").start()
+    try:
+        p = Proxy([("alpha", a.url)], images=image_endpoint("alpha"))
+        try:
+            _status, listed = p.get("/v1/models")
+            by_id = {m["id"]: m for m in listed["data"]}
+            assert by_id[IMAGE_MODEL]["faces"] == ["image", "image_edits"], by_id
+            assert by_id[MODEL]["faces"] == ["chat", "responses"], by_id
+
+            status, body = ask(p, model=IMAGE_MODEL)[:2]
+            assert status == 404, body
+            assert body["error"]["code"] == "no_chat_route", body
+            assert "/v1/images/generations" in body["error"]["message"], body
+
+            # And the mirror: a chat model is not an image model.
+            status, body, _ = generate(p, model=MODEL)
+            assert status == 404, body
+            assert body["error"]["code"] == "no_image_route", body
+            assert "is not an image model" in body["error"]["message"], body
+            assert not a.requests, "no local 404 should have gone upstream"
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_image_traffic_lands_in_its_own_ledger_slot():
+    """One deployment ceiling serves every face, so the images face spends the
+    same budget as the text ones and has to be visible in the same bar."""
+    a = FakeAzure("alpha", headers=ratelimit(limit_requests=30)).start()
+    try:
+        p = Proxy([("alpha", a.url)], images=image_endpoint("alpha"))
+        try:
+            assert generate(p)[0] == 200
+            _status, report = p.get("/routes")
+            assert "image" in report["faces"], report["faces"]
+            route = report["routes"]["alpha/" + IMAGE_DEPLOYMENT]
+            assert route["sent_by_face"]["image"]["requests"] == 1, route
+            assert route["sent_by_face"]["chat"]["requests"] == 0, route
+            assert route["our_load_by_face"]["image"] > 0, route
+            assert report["model_faces"][IMAGE_MODEL] == \
+                ["image", "image_edits"], report["model_faces"]
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_responses_image_tool_gets_a_deployment_named_for_it():
+    """Azure refuses `tools: [{"type": "image_generation"}]` unless a header
+    names an image deployment, and the name is only valid on the endpoint the
+    turn landed on. A caller cannot know either — which endpoint the balancer
+    picked, or what is deployed there — so the proxy fills it in, and holds the
+    turn to an endpoint that has something to fill it with.
+    """
+    a = FakeAzure("alpha").start()          # no image deployment
+    b = FakeAzure("beta").start()
+    try:
+        p = Proxy([("alpha", a.url), ("beta", b.url)],
+                  images=image_endpoint("beta"), balance="strict_priority")
+        try:
+            status, body, _ = p.post(
+                {"model": MODEL, "input": "draw a cat",
+                 "tools": [{"type": "image_generation"}]},
+                path="/v1/responses")
+            assert status == 200, body
+            # alpha is the priority route and has no image deployment, so the
+            # turn was moved rather than sent somewhere it would 400.
+            assert not a.requests, "went to the endpoint with nothing to name"
+            sent = b.requests[-1]
+            assert sent["headers"]["x-ms-oai-image-generation-deployment"] == \
+                IMAGE_DEPLOYMENT, sent["headers"]
+
+            # A turn that does not ask to draw is not narrowed, and gets no
+            # header it did not ask for.
+            status, body, _ = p.post({"model": MODEL, "input": "hi"},
+                                     path="/v1/responses")
+            assert status == 200, body
+            assert a.requests, "an ordinary turn should still use the top route"
+            assert "x-ms-oai-image-generation-deployment" not in \
+                a.requests[-1]["headers"], a.requests[-1]["headers"]
+        finally:
+            p.close()
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_responses_image_tool_leaves_a_caller_supplied_header_alone():
+    """Filling the header in is a convenience, not a policy. A caller who names
+    a deployment has a reason, and is not overruled."""
+    a = FakeAzure("alpha").start()
+    try:
+        p = Proxy([("alpha", a.url)],
+                  images=image_endpoint("alpha", deployment="big-image"))
+        try:
+            status, body, _ = p.post(
+                {"model": MODEL, "input": "draw a cat",
+                 "tools": [{"type": "image_generation"}]},
+                headers={"x-ms-oai-image-generation-deployment": "mine"},
+                path="/v1/responses")
+            assert status == 200, body
+            assert a.requests[-1]["headers"][
+                "x-ms-oai-image-generation-deployment"] == "mine", a.requests[-1]
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_multipart_model_is_read_without_a_parser():
+    """The scan, on its own. It reads one field out of a structure whose
+    framing is fixed by RFC 7578, and must not be fooled by a field that merely
+    looks like the one it wants."""
+    from proxy.server import _multipart_model as read
+    blob, _ct = multipart(model="gpt-image-2")
+    assert read(blob) == "gpt-image-2"
+    # A filename part carrying extra Content-Disposition parameters, and a
+    # part with its own headers before the blank line.
+    assert read(
+        b'--b\r\nContent-Disposition: form-data; name="model"; charset=utf-8\r\n'
+        b'Content-Type: text/plain\r\n\r\ngpt-image-1.5\r\n--b--\r\n'
+    ) == "gpt-image-1.5"
+    # No model field at all, and an empty one.
+    assert read(b'--b\r\nContent-Disposition: form-data; name="prompt"\r\n'
+                b'\r\nhi\r\n--b--\r\n') is None
+    assert read(b'--b\r\nContent-Disposition: form-data; name="model"\r\n'
+                b'\r\n\r\n--b--\r\n') is None
+    assert read(b"") is None
 
 
 # --------------------------------------------------------------------------

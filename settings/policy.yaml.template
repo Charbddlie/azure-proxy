@@ -509,6 +509,29 @@ routing:
     retry_on_codes:
       - rate_limit_exceeded
 
+  # The images faces, /v1/images/generations and /v1/images/edits.
+  #
+  # They retry on different terms from the text faces because they fail on
+  # different terms. Image quota is granted in requests per minute and granted
+  # meanly — gpt-image-2 holds 2 RPM, gpt-image-1.5 holds 30 — while a single
+  # call takes 10 to 25 seconds. A 429 there is the ordinary shape of a busy
+  # minute, not the sign of a storm.
+  image:
+    # Attempts, not routes. Every other face makes at most one attempt per
+    # route and never returns to one it has left, because a second try at an
+    # endpoint that just refused is a wasted request when three others are
+    # standing by. Image models usually have exactly one deployment, so that
+    # rule would hand the first 429 straight to the caller; here the attempt
+    # list cycles through whatever routes exist.
+    max_attempts: 3
+
+    # The ceiling on how long one of those waits may be. The wait itself is
+    # Azure's own Retry-After — it knows when the minute's budget refills and
+    # the proxy does not — and this only stops a deployment that never recovers
+    # from holding the caller indefinitely. Observed Retry-After on gpt-image-2:
+    # 6 to 17 seconds.
+    max_wait_seconds: 30
+
 request:
   # Parameters are forwarded untouched. Only `model` is rewritten, to the
   # native deployment name of whichever route is chosen. If a deployment

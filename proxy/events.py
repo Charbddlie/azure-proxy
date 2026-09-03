@@ -49,6 +49,8 @@ KINDS = (
                     # can read it
     "timeout",      # upstream took longer than the request timeout
     "exhausted",    # every route in the chain failed; the caller got a 503
+    "image_tool",   # a Responses turn asked the model to draw, so the attempt
+                    # list was held to endpoints with an image deployment to name
     "token",        # the Azure credential was refreshed, or could not be
 )
 

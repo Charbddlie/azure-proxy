@@ -69,8 +69,8 @@ def severity(total_load):
 # -- glyphs ----------------------------------------------------------------
 #
 # Ordered heaviest to lightest within `ours` so that a stacked bar reads as a
-# gradient rather than as noise, and so the four are still distinguishable at
-# one cell each. All four are drawn in OURS.
+# gradient rather than as noise, and so they are still distinguishable at one
+# cell each. All of them are drawn in OURS.
 #
 # The keys are the FACES names from proxy/server.py. They must stay in step;
 # the bar falls back to the last glyph for a name it does not know rather than
@@ -82,12 +82,14 @@ FACE_GLYPH = {
     "chat_stream": "▓",
     "responses": "▒",
     "responses_stream": "▚",
+    "image": "▞",
 }
 FACE_LABEL = {
     "chat": "chat",
     "chat_stream": "chat~",
     "responses": "resp",
     "responses_stream": "resp~",
+    "image": "img",
 }
 FOREIGN_GLYPH = "░"
 FREE_GLYPH = "·"
@@ -117,5 +119,6 @@ EVENT_STYLE = {
     "stripped":  ("✂", CRIT),
     "timeout":   ("◷", WARN),
     "exhausted": ("✖", CRIT),
+    "image_tool": ("▣", ACCENT),
     "token":     ("⚿", LABEL),
 }

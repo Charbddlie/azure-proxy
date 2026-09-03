@@ -1,10 +1,10 @@
 """Local OpenAI-compatible proxy over Azure OpenAI.
 
-Exposes two unauthenticated faces on loopback, /v1/chat/completions and
-/v1/responses. Picks an endpoint for the requested model, attaches Azure
-credentials, rewrites `model` to that endpoint's deployment name, and forwards
-everything else untouched. Retries on 429/5xx/transport errors by moving to the
-next endpoint that serves the model.
+Exposes four unauthenticated faces on loopback: /v1/chat/completions,
+/v1/responses, /v1/images/generations and /v1/images/edits. Picks an endpoint
+for the requested model, attaches Azure credentials, rewrites `model` to that
+endpoint's deployment name, and forwards everything else untouched. Retries on
+429/5xx/transport errors by moving to the next endpoint that serves the model.
 
 Which endpoint goes first is `routing.balance`, in three flavours:
 `strict_priority` walks the probe's order, `priority_threshold` walks it until
@@ -13,10 +13,12 @@ the head route is carrying more than its share and then moves down, and
 three walk the same chain on failure — balancing reorders the attempts, it does
 not change what counts as a failure or how many are allowed.
 
-The two faces are routed separately: Azure gates the Responses API behind its
-own data action and does not serve it on older api-versions, so a model
-reachable through chat/completions may have no responses route at all. The
-probe decides which is which.
+The faces are routed separately, because they are separate sets of deployments.
+Azure gates the Responses API behind its own data action and does not serve it
+on older api-versions, so a model reachable through chat/completions may have no
+responses route at all; the image models are a third set again, on whichever
+resources happen to hold a gpt-image-* deployment. The probe decides which is
+which.
 
     python -m proxy
     uvicorn proxy.server:app --host 127.0.0.1 --port 8787
@@ -107,20 +109,47 @@ BALANCE_MODES = ("strict_priority", "priority_threshold", "capacity")
 # start meaning something else.
 BALANCE_ALIASES = {"priority": "strict_priority", "weighted": "capacity"}
 
-# The four ways a request can arrive, as far as the ledger is concerned: two
-# faces times streamed or not. Quota does not care about the distinction — one
-# deployment ceiling serves all four — but an operator does, because the four
-# fail differently. Streamed Responses calls are the ones Azure refuses with a
-# 200 plus retry-after (see THROTTLE_HEADER), and they are the ones session
-# affinity pins. A load figure that cannot say which of the four it is made of
-# cannot tell you which of those mechanisms you are watching.
+# The ways a request can arrive, as far as the ledger is concerned: the two text
+# faces times streamed or not, plus the image face. Quota does not care about the
+# distinction — one deployment ceiling serves all of them — but an operator does,
+# because they fail differently. Streamed Responses calls are the ones Azure
+# refuses with a 200 plus retry-after (see THROTTLE_HEADER), and they are the
+# ones session affinity pins. A load figure that cannot say which of them it is
+# made of cannot tell you which mechanism you are watching.
+#
+# The image face has no streamed twin here. gpt-image-* can stream partial
+# images, and such a call is relayed like any other stream, but it is one
+# request against a per-minute request ceiling either way, and the ledger has
+# nothing to gain from splitting it.
 #
 # The order is the display order, and the index is what goes in the ledger.
-FACES = ("chat", "chat_stream", "responses", "responses_stream")
+# tui/bars.py and tui/theme.py carry the same list and must stay in step.
+FACES = ("chat", "chat_stream", "responses", "responses_stream", "image")
+
+# The paths the four handlers register under, which are also what `face` is
+# throughout: the string a log line shows and the thing face_code reads.
+CHAT_FACE = "/v1/chat/completions"
+RESPONSES_FACE = "/v1/responses"
+IMAGE_FACES = {"generations": "/v1/images/generations",
+               "edits": "/v1/images/edits"}
+
+# The Responses API can draw pictures itself, through `tools: [{"type":
+# "image_generation"}]`, but Azure will not choose a deployment for it:
+#
+#   {"error": {"message": "imagegen deployment must be provided through
+#              header: x-ms-oai-image-generation-deployment", ...}}
+#
+# So a caller has to know a deployment name, on the endpoint their model
+# happened to be balanced onto — two things the proxy exists to hide. It fills
+# the header in per attempt instead, and keeps the attempt on an endpoint that
+# has an image deployment to name. A header the caller set is left alone.
+IMAGE_TOOL_HEADER = "x-ms-oai-image-generation-deployment"
 
 
 def face_code(face: str, stream: bool) -> int:
     """The FACES index for one request. `face` is the request path."""
+    if face.startswith("/v1/images/"):
+        return 4
     base = 2 if face.endswith("responses") else 0
     return base + (1 if stream else 0)
 
@@ -142,11 +171,13 @@ class Route:
 
     __slots__ = ("endpoint", "url", "api_version", "deployment",
                  "limit_param", "priority", "responses_path",
-                 "model_version", "capacity_requests", "capacity_tokens")
+                 "model_version", "capacity_requests", "capacity_tokens",
+                 "image_edits", "scope")
 
     def __init__(self, endpoint, url, api_version, deployment, limit_param,
                  priority, responses_path=None, model_version=None,
-                 capacity_requests=None, capacity_tokens=None):
+                 capacity_requests=None, capacity_tokens=None,
+                 image_edits=False, scope=None):
         self.endpoint = endpoint
         self.url = url
         self.api_version = api_version
@@ -162,8 +193,19 @@ class Route:
         # The quota ARM says this deployment holds, in the units the runtime
         # later reads off x-ratelimit-limit-*. None when the probe could not ask
         # ARM — an older runtime/, or an endpoint discovered by guesswork.
+        # Image deployments carry a request ceiling and no token one, which the
+        # load calculation already handles: it takes whichever ceiling it has.
         self.capacity_requests = capacity_requests
         self.capacity_tokens = capacity_tokens
+        # Whether this image deployment also serves /images/edits. From ARM's
+        # capability flag, never measured — an edits probe would have to carry a
+        # real image.
+        # The data-plane audience this endpoint's token must be minted for.
+        # None means the default scope (cognitiveservices.azure.com); the
+        # AI-Foundry project endpoint sets ai.azure.com, and the same resource
+        # returns 401 for a token minted for the other one. See TOKENS registry.
+        self.image_edits = image_edits
+        self.scope = scope
 
     def chat_target(self) -> str:
         return "{}openai/deployments/{}/chat/completions?api-version={}".format(
@@ -173,6 +215,21 @@ class Route:
         # No deployment in the path here: the Responses API takes it from the
         # body's `model`, which _forward has already rewritten.
         return self.url + self.responses_path
+
+    def image_target(self, kind: str) -> str:
+        """generations or edits.
+
+        Azure endpoints put the deployment in the path; an AI-Foundry project
+        endpoint (openai/v1, deployment in the body) has no api-version segment
+        and takes the deployment from `model`, exactly as its Responses face
+        does. `responses_path` being an openai/v1 shape is what tells them
+        apart — the same signal the probe settled the endpoint on.
+        """
+        if "/api/projects/" in self.url or \
+                (self.scope or "").startswith("https://ai.azure.com"):
+            return "{}openai/v1/images/{}".format(self.url, kind)
+        return "{}openai/deployments/{}/images/{}?api-version={}".format(
+            self.url, self.deployment, kind, self.api_version)
 
     def __repr__(self):
         return "{}/{}".format(self.endpoint, self.deployment)
@@ -244,6 +301,28 @@ class Config:
             str(code).encode() for code in
             (s.get("retry_on_codes") or ["rate_limit_exceeded"])]
 
+        # The image face retries differently, because it fails differently.
+        # Image quota is granted in requests per minute and granted meanly —
+        # 2 RPM for gpt-image-2, 30 for gpt-image-1.5 — while one call takes
+        # 10-25 seconds, so a 429 is the ordinary case rather than the sign of a
+        # storm. Two consequences, both of them settings rather than code:
+        #
+        #   * `max_attempts` here is a number of ATTEMPTS, not of routes. Most
+        #     image models have exactly one deployment, so the text faces' rule
+        #     — one attempt per route, never the same route twice — would hand
+        #     the first 429 straight back to the caller. Here the attempt list
+        #     cycles through the routes instead.
+        #   * the wait between them is Azure's own Retry-After rather than a
+        #     blind exponential, because a per-minute ceiling refills on a
+        #     schedule Azure knows and the proxy does not.
+        #
+        # Clients are the reason this belongs here rather than in them: the
+        # OpenAI SDK's image calls are routinely made with maxRetries: 0, and
+        # one 429 is then a failed page rather than a slow one.
+        i = r.get("image") or {}
+        self.image_attempts = int(i.get("max_attempts", 3))
+        self.image_max_wait = float(i.get("max_wait_seconds", 30))
+
         a = r.get("session_affinity") or {}
         self.affinity_enabled = bool(a.get("enabled", True))
         self.affinity_keys = list(a.get("keys") or [
@@ -268,6 +347,12 @@ class Config:
         self.refresh_margin = policy["auth"]["refresh_margin_seconds"]
         self.expected_account = policy["auth"].get("expected_account")
 
+        # Every distinct data-plane scope in play. The default from policy is
+        # always present; an endpoint may pin its own (the AI-Foundry project
+        # path uses ai.azure.com). The token layer holds one cache per scope.
+        self.scopes = {self.scope} | {
+            e["scope"] for e in sources["endpoints"] if e.get("scope")}
+
         # Give the Azure CLI its own directory before anything shells out to it.
         # AzureCliCredential spawns `az` with a copy of os.environ, so setting
         # it here is enough for the credential, the background refresher and the
@@ -284,18 +369,25 @@ class Config:
                 self.az_config_dir = os.path.join(ROOT, self.az_config_dir)
             os.environ["AZURE_CONFIG_DIR"] = self.az_config_dir
 
-        # An endpoint counts as usable if either face is up. They are gated
+        # An endpoint counts as usable if any face is up. They are gated
         # separately by Azure and they fail separately: a resource whose chat
         # face is refused can still serve the Responses API, and dropping it
         # entirely would take working routes down with the broken one.
         meta = {e["name"]: e for e in sources["endpoints"]
-                if "ok" in (e["status"], e.get("responses_status"))}
-        self.endpoints = [(e["name"], e["status"], e.get("responses_status", "?"))
+                if "ok" in (e["status"], e.get("responses_status"),
+                            e.get("image_status"))}
+        self.endpoints = [(e["name"], e["status"], e.get("responses_status", "?"),
+                           e.get("image_status", "?"))
                           for e in sources["endpoints"]]
         self.routes: Dict[str, List[Route]] = {}
         self.responses_routes: Dict[str, List[Route]] = {}
+        self.image_routes: Dict[str, List[Route]] = {}
+        # The subset that also serves /images/edits. Separate rather than
+        # filtered at request time so the 404 for an edits call against a
+        # generations-only model can name what is available.
+        self.image_edit_routes: Dict[str, List[Route]] = {}
         for name, spec in models["models"].items():
-            built, responses = [], []
+            built, responses, images = [], [], []
             for hop in spec["routes"]:
                 ep = meta.get(hop["endpoint"])
                 if ep is None:
@@ -311,6 +403,8 @@ class Config:
                     model_version=hop.get("model_version"),
                     capacity_requests=hop.get("capacity_requests"),
                     capacity_tokens=hop.get("capacity_tokens"),
+                    image_edits=bool(hop.get("image_edits")),
+                    scope=ep.get("scope"),
                 )
                 # Absent `faces` means a runtime/ written before the Responses
                 # API existed here. Default it to chat only, so a stale probe
@@ -320,11 +414,13 @@ class Config:
                 # Not every deployment has a chat face. gpt-5-pro and the codex
                 # models answer chat/completions with a flat 400 and serve the
                 # Responses API only, so listing them as chat routes would offer
-                # a destination that cannot work.
+                # a destination that cannot work. gpt-image-* have neither.
                 if "chat" in faces:
                     built.append(route)
                 if "responses" in faces and route.responses_path:
                     responses.append(route)
+                if "image" in faces:
+                    images.append(route)
             # Candidate order in endpoints.yaml is failover priority, and
             # capacity breaks ties within one endpoint — a model served twice by
             # the same resource should be reached for at its larger deployment
@@ -332,10 +428,29 @@ class Config:
             # same key probe/probe.py:route_sort_key writes it in.
             built.sort(key=_route_sort_key)
             responses.sort(key=_route_sort_key)
+            images.sort(key=_route_sort_key)
             if built:
                 self.routes[name] = built
             if responses:
                 self.responses_routes[name] = responses
+            if images:
+                self.image_routes[name] = images
+                edits = [r for r in images if r.image_edits]
+                if edits:
+                    self.image_edit_routes[name] = edits
+
+        # Which image deployment to name on an endpoint, for the Responses
+        # API's built-in image_generation tool: Azure will not pick one itself
+        # and refuses the call without the header. Largest ceiling first, so the
+        # default is the one with room rather than whichever sorted first.
+        best: Dict[str, Tuple[float, str]] = {}
+        for routes in self.image_routes.values():
+            for route in routes:
+                size = route.capacity_requests or 0.0
+                if size > best.get(route.endpoint, (-1.0, ""))[0]:
+                    best[route.endpoint] = (size, route.deployment)
+        self.image_deployments: Dict[str, str] = {
+            endpoint: deployment for endpoint, (_size, deployment) in best.items()}
 
         self.generated_at = models.get("_generated_at")
 
@@ -1845,11 +1960,25 @@ def clear_pidfile() -> None:
 cfg = Config()
 _setup_logging(cfg.log_level)
 tokens = TokenCache(cfg.scope, cfg.refresh_margin)
+# One token cache per distinct data-plane scope. `tokens` is the default-scope
+# cache and stays the common path; an endpoint that pins its own scope (the
+# AI-Foundry project path uses ai.azure.com) gets its own cache here, and a
+# route names its scope so _forward can mint the matching token per attempt.
+TOKEN_CACHES: Dict[str, TokenCache] = {cfg.scope: tokens}
+for _scope in cfg.scopes:
+    TOKEN_CACHES.setdefault(_scope, TokenCache(_scope, cfg.refresh_margin))
+
+
+def token_cache_for(scope: Optional[str]) -> TokenCache:
+    """The cache for a route's scope; the default cache when it names none."""
+    return TOKEN_CACHES.get(scope or cfg.scope, tokens)
+
+
 quota = QuotaTracker(cfg)
 affinity = SessionAffinity(cfg)
 app = FastAPI(title="azure-proxy", docs_url=None, redoc_url=None)
 client: Optional[httpx.AsyncClient] = None
-_refresher: Optional[asyncio.Task] = None
+_refreshers: List[asyncio.Task] = []
 STARTED_AT = time.time()
 
 
@@ -1914,34 +2043,41 @@ def _log_startup():
     if status["have_token"]:
         log.info("token good for %.1fm", status["expires_in_seconds"] / 60)
 
-    for name, chat, responses in cfg.endpoints:
-        log.info("endpoint %-28s chat=%-22s responses=%s", name, chat, responses)
+    for name, chat, responses, image in cfg.endpoints:
+        log.info("endpoint %-28s chat=%-22s responses=%-14s image=%s",
+                 name, chat, responses, image)
     # One record for the whole of the above rather than fifteen. The startup
     # narration is a dozen lines because a person reading a log wants them
     # separately; an event stream wants the one line that says the proxy came
     # up, and everything those dozen lines established is already in /healthz.
     _ev("boot", "info",
         "%d models on /v1/chat/completions, %d on /v1/responses, "
-        "probed at %s",
-        len(cfg.routes), len(cfg.responses_routes), cfg.generated_at,
+        "%d on /v1/images/*, probed at %s",
+        len(cfg.routes), len(cfg.responses_routes), len(cfg.image_routes),
+        cfg.generated_at,
         chat_models=len(cfg.routes), responses_models=len(cfg.responses_routes),
+        image_models=len(cfg.image_routes),
         balance=cfg.balance, endpoints=[e[0] for e in cfg.endpoints],
         account=account, probed_at=cfg.generated_at)
 
 
 @app.on_event("startup")
 async def _startup():
-    global client, _refresher
+    global client
     client = httpx.AsyncClient(timeout=httpx.Timeout(cfg.timeout, connect=15.0))
-    await tokens.get()      # fail loudly at boot rather than on the first request
-    _refresher = asyncio.create_task(tokens.run_background_refresh())
+    # Prime every scope's token at boot rather than on the first request, so a
+    # bad login fails loudly here. One background refresher per cache.
+    for cache in TOKEN_CACHES.values():
+        await cache.get()
+    _refreshers[:] = [asyncio.create_task(cache.run_background_refresh())
+                      for cache in TOKEN_CACHES.values()]
     _log_startup()
 
 
 @app.on_event("shutdown")
 async def _shutdown():
-    if _refresher:
-        _refresher.cancel()
+    for task in _refreshers:
+        task.cancel()
     if client:
         await client.aclose()
 
@@ -1949,10 +2085,16 @@ async def _shutdown():
 @app.get("/healthz")
 async def healthz():
     token = tokens.status()
-    ok = token["have_token"] and token["expires_in_seconds"] > 0
+    # Healthy means every scope in use has a live token, not just the default:
+    # a dead ai.azure.com login would take the AI-Foundry routes down while the
+    # default scope still looked fine.
+    per_scope = {scope: cache.status() for scope, cache in TOKEN_CACHES.items()}
+    ok = all(s["have_token"] and s["expires_in_seconds"] > 0
+             for s in per_scope.values())
     return {"ok": ok,
             "models": len(cfg.routes),
             "responses_models": len(cfg.responses_routes),
+            "image_models": len(cfg.image_routes),
             "probed_at": cfg.generated_at,
             "az_config_dir": cfg.az_config_dir,
             "responses_compat": cfg.responses_compat,
@@ -1969,7 +2111,8 @@ async def healthz():
             "uptime_seconds": round(time.time() - STARTED_AT, 1),
             "load_window_seconds": cfg.load_window,
             "session_affinity": affinity.report(),
-            "token": token}
+            "token": token,
+            "tokens": per_scope}
 
 
 @app.get("/routes")
@@ -1987,11 +2130,12 @@ async def routes_report():
     first is this proxy's own ledger, the second is Azure's. When they tell
     different stories, someone else is spending the same deployment's quota.
     """
-    # Both faces draw from the same (endpoint, deployment) buckets, so union
+    # Every face draws from the same (endpoint, deployment) buckets, so union
     # them rather than reporting one model twice under two headings.
     merged: Dict[str, List[Route]] = dict(cfg.routes)
-    for name, routes in cfg.responses_routes.items():
-        merged.setdefault(name, routes)
+    for table in (cfg.responses_routes, cfg.image_routes):
+        for name, routes in table.items():
+            merged.setdefault(name, routes)
     report = quota.report(merged)
     # Which endpoint a request lands on is no longer decided by the balancer
     # alone: a pinned session overrides it entirely. Reporting the pins next to
@@ -2000,16 +2144,22 @@ async def routes_report():
     report["session_affinity"] = affinity.report()
     # Which faces each model can actually be reached on. The dashboard's model
     # view needs it to explain why a model with three sources shows traffic on
-    # only one of the four bar segments — a Responses-only model cannot produce
-    # a chat segment, and that is configuration, not an anomaly.
+    # only one of the bar segments — a Responses-only model cannot produce a
+    # chat segment, and that is configuration, not an anomaly.
     report["model_faces"] = {
         name: [f for f, table in (("chat", cfg.routes),
-                                  ("responses", cfg.responses_routes))
+                                  ("responses", cfg.responses_routes),
+                                  ("image", cfg.image_routes),
+                                  ("image_edits", cfg.image_edit_routes))
                if name in table]
         for name in merged}
     report["endpoints"] = [
-        {"name": name, "chat": chat, "responses": responses}
-        for name, chat, responses in cfg.endpoints]
+        {"name": name, "chat": chat, "responses": responses, "image": image}
+        for name, chat, responses, image in cfg.endpoints]
+    # Which deployment the Responses API's image_generation tool is pointed at
+    # on each endpoint. It is the one routing decision a caller cannot see from
+    # the model name, because it is not made from the model name.
+    report["image_deployments"] = dict(cfg.image_deployments)
     return report
 
 
@@ -2040,10 +2190,15 @@ async def events_feed(since: int = 0, limit: int = 500,
 
 @app.get("/v1/models")
 async def list_models():
-    # The union of the two faces, not the chat one. A model can be served on
+    # The union of every face, not the chat one. A model can be served on
     # /v1/responses and nowhere else — the pro and codex deployments are — and
-    # listing only what chat can reach would leave them undiscoverable.
-    names = sorted(set(cfg.routes) | set(cfg.responses_routes))
+    # the gpt-image-* deployments are on the images faces and nowhere at all
+    # otherwise. Listing only what chat can reach would leave them
+    # undiscoverable.
+    tables = (("chat", cfg.routes), ("responses", cfg.responses_routes),
+              ("image", cfg.image_routes), ("image_edits", cfg.image_edit_routes))
+    names = sorted(set(cfg.routes) | set(cfg.responses_routes)
+                   | set(cfg.image_routes))
     return {
         "object": "list",
         "data": [
@@ -2053,23 +2208,30 @@ async def list_models():
                 "owned_by": "azure",
                 # Not part of the OpenAI schema; harmless to clients and the
                 # fastest way to see a model's failover depth and which of the
-                # two faces it can be reached on.
+                # faces it can be reached on.
                 "routes": [r.endpoint for r in
                            (cfg.routes.get(name)
-                            or cfg.responses_routes.get(name) or [])],
-                "faces": ([f for f, table in (("chat", cfg.routes),
-                                              ("responses",
-                                               cfg.responses_routes))
-                           if name in table]),
+                            or cfg.responses_routes.get(name)
+                            or cfg.image_routes.get(name) or [])],
+                "faces": [f for f, table in tables if name in table],
             }
             for name in names
         ],
     }
 
 
-def _upstream_headers(incoming, token: str) -> dict:
+def _upstream_headers(incoming, token: str,
+                      content_type: str = "application/json") -> dict:
+    """Ours first, then the caller's, minus the ones that are not theirs to set.
+
+    `content_type` is a parameter because /v1/images/edits is multipart: its
+    body is relayed byte for byte, so the boundary the client chose has to
+    travel with it. It still cannot come from `incoming` — content-type is in
+    STRIP_REQUEST_HEADERS precisely so that a forwarded one cannot arrive
+    alongside ours as `application/json,application/json`.
+    """
     headers = {"Authorization": "Bearer " + token,
-               "Content-Type": "application/json"}
+               "Content-Type": content_type}
     if cfg.forward_headers:
         for k, v in incoming.items():
             if k.lower() not in STRIP_REQUEST_HEADERS:
@@ -2809,10 +2971,56 @@ async def _body_and_model(request: Request):
     return body, requested, None
 
 
+# --------------------------------------------------------------------------
+# multipart, read but not parsed
+# --------------------------------------------------------------------------
+#
+# /v1/images/edits arrives as multipart/form-data carrying the image, and
+# usually a mask beside it. The proxy needs exactly one thing out of it — the
+# value of the `model` field, so it knows which deployment to send it to — and
+# then relays the body byte for byte, because Azure takes the deployment from
+# the URL path and ignores a `model` that disagrees with it.
+#
+# So the body is scanned, not parsed. A full parser would mean a dependency
+# (starlette's form() needs python-multipart, which is not in requirements.txt)
+# and a re-encode of several megabytes of PNG to change nothing. The scan below
+# reads one small text field out of a structure whose framing is fixed by
+# RFC 7578, and gets no further into the body than the end of that field.
+_MULTIPART_FIELD = re.compile(
+    br'name="model"'            # the field, in the Content-Disposition line
+    br'(?:;[^\r\n]*)?\r\n'      # anything else on that line: filename, etc.
+    br'(?:[^\r\n]+\r\n)*'       # the part's remaining headers, if any
+    br'\r\n'                    # the blank line that ends them
+    br'([^\r\n]*)')             # the value, up to the CRLF before the boundary
+
+
+def _multipart_model(blob: bytes) -> Optional[str]:
+    """The `model` form field's value, or None if the body does not carry one."""
+    found = _MULTIPART_FIELD.search(blob)
+    if not found:
+        return None
+    try:
+        return found.group(1).decode("utf-8").strip() or None
+    except UnicodeDecodeError:
+        return None
+
+
 async def _forward(request: Request, body: dict, routes: List[Route],
                    target_of: Callable[[Route], str], requested: str,
-                   face: str) -> Response:
-    """Try each route in turn until one answers. Shared by both faces."""
+                   face: str, raw: Optional[bytes] = None,
+                   content_type: str = "application/json",
+                   image_tool: bool = False) -> Response:
+    """Try each route in turn until one answers. Shared by every face.
+
+    `raw` is the body to send when it must not be re-serialised — the multipart
+    of an /v1/images/edits call. `body` is then whatever could be read out of it
+    for the log and the routing decision, not something that will be sent.
+    """
+    # The image face is not a variation on the text ones, it is a different
+    # shape of failure: one deployment per model, a per-minute request ceiling
+    # in the low tens, and calls that take 10-25 seconds. See Config's image
+    # block for why that changes the attempt list and the wait between attempts.
+    is_image = face.startswith("/v1/images/")
     stream = bool(body.get("stream"))
     ledger_face = face_code(face, stream)
     _ev("request", "info", "-> %s model=%s stream=%s", face, requested, stream,
@@ -2834,7 +3042,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
             "Azure credentials unavailable ({}). {}".format(e, LOGIN_HINT),
             "credentials_unavailable")
 
-    headers = _upstream_headers(request.headers, token)
+    headers = _upstream_headers(request.headers, token, content_type)
 
     # Where this request is allowed to go. A conversation carrying encrypted
     # reasoning is bound to the endpoint that produced it (see SessionAffinity),
@@ -2843,7 +3051,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     # for a guaranteed decryption failure.
     session = affinity.key(request, body) if cfg.affinity_enabled else None
     family = affinity.family(request, body) if cfg.affinity_enabled else None
-    sticky = bool(session) and affinity.sticky(body)
+    sticky = bool(session) and not is_image and affinity.sticky(body)
     pinned = affinity.pinned(session, routes) if sticky else None
     # This family has been found carrying ciphertext that could not be placed,
     # so it goes out stripped wherever it goes — the client resends the same
@@ -2879,6 +3087,16 @@ async def _forward(request: Request, body: dict, routes: List[Route],
             "so it goes there (%d route(s))",
             face, requested, home, len(local),
             face=face, model=requested, endpoint=home, routes=len(local))
+    elif is_image:
+        # Cycled, not truncated. Most image models have one deployment, so a
+        # permutation of the routes is a list of length one and the first 429
+        # would be the caller's answer. Repeating the same route is right here
+        # for the reason repeating it on a text face would be wrong: the refusal
+        # is a per-minute request ceiling that refills on a clock, not a sign
+        # that this destination is unwell.
+        ordered = quota.order(routes)
+        attempts = [ordered[i % len(ordered)]
+                    for i in range(max(1, cfg.image_attempts))]
     else:
         # Balancing decides the order; max_attempts still decides the depth, and
         # the list is a permutation of `routes`, so no endpoint is tried twice.
@@ -2909,11 +3127,16 @@ async def _forward(request: Request, body: dict, routes: List[Route],
         right number rather than a blind exponential. Capped, because a pinned
         endpoint that never recovers must eventually give the error back to the
         caller rather than hang.
+
+        An image retry is the same argument from the other direction: it is
+        usually queueing for the only deployment that serves the model, and
+        Azure states how long the ceiling has left to refill.
         """
-        if held:
+        if held or is_image:
+            cap = cfg.affinity_max_wait if held else cfg.image_max_wait
             wait = _as_number(hint) or cfg.backoff_initial
-            wait = min(max(wait, 0.5), cfg.affinity_max_wait)
-            return wait, "waiting {:.1f}s for pinned {}".format(wait, next_route)
+            wait = min(max(wait, 0.5), cap)
+            return wait, "waiting for {}".format(next_route)
         return (delay + random.random() * cfg.backoff_jitter,
                 "retrying {}".format(next_route))
     delay = cfg.backoff_initial
@@ -2923,10 +3146,36 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     # The size of the body the caller sent, which is all the proxy knows about
     # what this request will cost before the answer comes back. See
     # QuotaTracker.estimate_tokens.
-    request_bytes = _as_number(request.headers.get("content-length")) or 0
+    #
+    # Zero on the image face, which is not the same as unknown: it turns the
+    # dispatch charge into a nominal one token and stops `settle` from learning
+    # a tokens-per-byte ratio. Both are deliberate. An edits call's body is
+    # megabytes of PNG that bear no relation to what it will be billed, and an
+    # image deployment publishes a request ceiling and no token one — so the
+    # ledger figure that matters for it is the request count, which is charged
+    # by the entry existing at all.
+    request_bytes = 0.0 if is_image else (
+        _as_number(request.headers.get("content-length")) or 0)
 
     for i, route in enumerate(attempts):
         is_last = i == len(attempts) - 1
+        # A route that pins a non-default scope needs its own token (the base
+        # `headers` holds the default-scope one). Resolved here, before the route
+        # is charged below, so a lapsed scope skips cleanly without leaving an
+        # uncharged-then-unsettled entry in the ledger. Warm from the background
+        # refresher, so this is a lookup rather than an `az` spawn.
+        route_token = None
+        if route.scope and route.scope != cfg.scope:
+            try:
+                route_token = await token_cache_for(route.scope).get()
+            except TokenUnavailable as e:
+                last_error = "no {} credential: {}".format(route.scope, e)
+                _ev("token", "warning",
+                    "%s model=%s skipping %s: no token for scope %s (%s)",
+                    face, requested, route, route.scope, e,
+                    route=route, face=face, model=requested, ok=False,
+                    scope=route.scope, error=str(e))
+                continue
         payload = dict(body)
         # Off the endpoint that minted it, the ciphertext in this body is
         # unreadable and Azure rejects the whole call. Two routes can read it:
@@ -2957,12 +3206,35 @@ async def _forward(request: Request, body: dict, routes: List[Route],
         log.debug("%s model=%s attempt %d/%d on %s",
                   face, requested, i + 1, len(attempts), route)
 
+        # The Responses API's built-in image_generation tool needs to be told
+        # which deployment to draw with, per attempt, because the answer is a
+        # property of the endpoint the attempt landed on. See the handler for
+        # why the attempt list is already restricted to endpoints that have one.
+        attempt_headers = headers
+        # A route may authenticate against a non-default scope (the AI-Foundry
+        # project endpoint uses ai.azure.com); its token was resolved at the top
+        # of the loop, before this route was charged, so a lapsed scope skips
+        # the route rather than settling a charge it never sent.
+        if route_token is not None:
+            attempt_headers = dict(attempt_headers,
+                                   Authorization="Bearer " + route_token)
+        if image_tool:
+            deployment = cfg.image_deployments.get(route.endpoint)
+            if deployment:
+                attempt_headers = dict(attempt_headers,
+                                       **{IMAGE_TOOL_HEADER: deployment})
+
         try:
             # stream=True returns as soon as the response headers are in, which
             # is what makes the retry decision possible before any body has been
             # handed to the client. A buffered reply just reads it straight back.
-            upstream = client.build_request("POST", target_of(route),
-                                            json=payload, headers=headers)
+            #
+            # `content=` rather than `json=` when the caller's body must survive
+            # unchanged: an images/edits multipart, whose boundary is already in
+            # the Content-Type header that came with it.
+            upstream = client.build_request(
+                "POST", target_of(route), headers=attempt_headers,
+                **({"content": raw} if raw is not None else {"json": payload}))
             resp = await client.send(upstream, stream=True)
         except httpx.TimeoutException:
             # A slow reasoning call and a hung one are indistinguishable here.
@@ -3135,13 +3407,52 @@ async def _forward(request: Request, body: dict, routes: List[Route],
         delay *= cfg.backoff_multiplier
 
     _ev("exhausted", "error",
-        "<- 503 %s model=%s: all %d route(s) failed; last: %s",
+        "<- 503 %s model=%s: all %d attempt(s) failed; last: %s",
         face, requested, len(attempts), last_error,
         face=face, model=requested, attempts=len(attempts),
         status=503, error=last_error,
         tried=[str(r) for r in attempts])
-    return _error(503, "all {} route(s) for {!r} failed; last: {}".format(
+    return _error(503, "all {} attempt(s) for {!r} failed; last: {}".format(
         len(attempts), requested, last_error), "all_routes_failed")
+
+
+def _other_faces(requested: str, *tables) -> List[str]:
+    """The faces, by name, that can reach `requested` — for a 404 to point at.
+
+    A name that exists on another face is not a typo, and saying "unknown
+    model" sends the caller hunting for one. gpt-5-pro really is served only on
+    /v1/responses; gpt-image-2 really is served only on the images faces.
+    """
+    return [name for name, table in tables if requested in table]
+
+
+def _image_404(requested: str, table: Dict[str, List[Route]], face: str,
+               code: str) -> JSONResponse:
+    """The images faces' version of the 404 the text faces send."""
+    elsewhere = _other_faces(requested,
+                             ("/v1/chat/completions", cfg.routes),
+                             ("/v1/responses", cfg.responses_routes))
+    if elsewhere:
+        return _error(
+            404,
+            "model {!r} is not an image model (it is reachable on {}). Models "
+            "on {}: {}".format(requested, ", ".join(elsewhere), face,
+                               ", ".join(sorted(table)) or "none"),
+            code)
+    return _error(
+        404,
+        "unknown model {!r}; available on {}: {}".format(
+            requested, face, ", ".join(sorted(table)) or "none"),
+        "model_not_found")
+
+
+def _wants_image_tool(body: dict) -> bool:
+    """Does this Responses call ask the model to generate an image itself?"""
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    return any(isinstance(t, dict) and t.get("type") == "image_generation"
+               for t in tools)
 
 
 @app.post("/v1/chat/completions")
@@ -3152,17 +3463,22 @@ async def chat_completions(request: Request):
 
     routes = cfg.routes.get(requested)
     if not routes:
-        if requested in cfg.responses_routes:
+        elsewhere = _other_faces(requested,
+                                 ("/v1/responses", cfg.responses_routes),
+                                 ("/v1/images/generations", cfg.image_routes))
+        if elsewhere:
             # The mirror of the case below, and now a real one: gpt-5-pro and
             # the codex models answer chat/completions with a flat 400 and are
-            # served only on /v1/responses. The name is right and the model
-            # works — telling the caller it does not exist would send them
-            # hunting for a typo that is not there.
+            # served only on /v1/responses, and the gpt-image-* deployments
+            # have no text face at all. The name is right and the model works —
+            # telling the caller it does not exist would send them hunting for a
+            # typo that is not there.
             return _error(
                 404,
                 "model {!r} has no chat/completions route (it is reachable on "
-                "/v1/responses). Models with a chat face: {}".format(
-                    requested, ", ".join(sorted(cfg.routes)) or "none"),
+                "{}). Models with a chat face: {}".format(
+                    requested, ", ".join(elsewhere),
+                    ", ".join(sorted(cfg.routes)) or "none"),
                 "no_chat_route")
         return _error(
             404,
@@ -3171,7 +3487,7 @@ async def chat_completions(request: Request):
             "model_not_found")
 
     return await _forward(request, body, routes, Route.chat_target, requested,
-                          "/v1/chat/completions")
+                          CHAT_FACE)
 
 
 @app.post("/v1/responses")
@@ -3182,15 +3498,18 @@ async def responses(request: Request):
 
     routes = cfg.responses_routes.get(requested)
     if not routes:
-        if requested in cfg.routes:
+        elsewhere = _other_faces(requested,
+                                 ("/v1/chat/completions", cfg.routes),
+                                 ("/v1/images/generations", cfg.image_routes))
+        if elsewhere:
             # Worth distinguishing from an unknown model: the name is right and
             # the model works, just not on this face. Sending "unknown model"
             # would send someone hunting for a typo that is not there.
             return _error(
                 404,
                 "model {!r} has no Responses API route (it is reachable on "
-                "/v1/chat/completions). Models with a responses face: {}".format(
-                    requested,
+                "{}). Models with a responses face: {}".format(
+                    requested, ", ".join(elsewhere),
                     ", ".join(sorted(cfg.responses_routes)) or "none"),
                 "no_responses_route")
         return _error(
@@ -3210,5 +3529,97 @@ async def responses(request: Request):
                       changed["descriptions"], changed["client_metadata"],
                       CLIENT_METADATA_KEY)
 
+    # A turn that asks the model to draw needs an image deployment named in a
+    # header, and the name is only valid on the endpoint it lives on. So the
+    # attempt list is narrowed to endpoints that have one before the balancer
+    # sees it, and _forward fills the header in per attempt. Without this the
+    # call is a coin flip: it works when the balancer happens to pick the
+    # resource that holds gpt-image-*, and 400s when it does not.
+    image_tool = (_wants_image_tool(body)
+                  and IMAGE_TOOL_HEADER not in request.headers)
+    if image_tool:
+        with_images = [r for r in routes if r.endpoint in cfg.image_deployments]
+        if not with_images:
+            _ev("image_tool", "warning",
+                "%s model=%s asks for the image_generation tool but no endpoint "
+                "serving it has an image deployment; forwarding as-is",
+                RESPONSES_FACE, requested,
+                face=RESPONSES_FACE, model=requested, ok=False)
+            image_tool = False
+        else:
+            if len(with_images) < len(routes):
+                _ev("image_tool", "info",
+                    "%s model=%s asks for the image_generation tool; holding it "
+                    "to the %d of %d route(s) with an image deployment",
+                    RESPONSES_FACE, requested, len(with_images), len(routes),
+                    face=RESPONSES_FACE, model=requested,
+                    routes=len(with_images), of=len(routes))
+            routes = with_images
+
     return await _forward(request, body, routes, Route.responses_target,
-                          requested, "/v1/responses")
+                          requested, RESPONSES_FACE, image_tool=image_tool)
+
+
+# --------------------------------------------------------------------------
+# The images faces
+# --------------------------------------------------------------------------
+
+
+@app.post("/v1/images/generations")
+async def images_generations(request: Request):
+    body, requested, err = await _body_and_model(request)
+    if err is not None:
+        return err
+
+    routes = cfg.image_routes.get(requested)
+    if not routes:
+        return _image_404(requested, cfg.image_routes, "images/generations",
+                          "no_image_route")
+
+    return await _forward(request, body, routes,
+                          lambda r: r.image_target("generations"),
+                          requested, IMAGE_FACES["generations"])
+
+
+@app.post("/v1/images/edits")
+async def images_edits(request: Request):
+    """Multipart in, multipart out — the body is relayed exactly as it arrived.
+
+    Only the `model` field is read, and only to decide where to send it. Azure
+    takes the deployment from the URL path, so nothing in the body has to be
+    rewritten and several megabytes of image do not have to be re-encoded to
+    change a string Azure will ignore. See _multipart_model.
+    """
+    content_type = request.headers.get("content-type", "")
+    if not content_type.lower().startswith("multipart/form-data"):
+        return _error(
+            400,
+            "/v1/images/edits takes multipart/form-data, not {!r}".format(
+                content_type or "nothing"),
+            "not_multipart")
+
+    blob = await request.body()
+    requested = _multipart_model(blob)
+    if not requested:
+        return _error(400, "`model` is required", "missing_model")
+
+    routes = cfg.image_edit_routes.get(requested)
+    if not routes:
+        if requested in cfg.image_routes:
+            # A real distinction rather than a shade of the same 404: the model
+            # is on the images face and generates perfectly well, it just has no
+            # imageEdits capability. Sending "unknown model" for that would be a
+            # lie the caller cannot act on.
+            return _error(
+                404,
+                "model {!r} generates images but does not serve /images/edits. "
+                "Models that do: {}".format(
+                    requested, ", ".join(sorted(cfg.image_edit_routes)) or "none"),
+                "no_image_edits_route")
+        return _image_404(requested, cfg.image_edit_routes, "images/edits",
+                          "no_image_route")
+
+    return await _forward(request, {"model": requested}, routes,
+                          lambda r: r.image_target("edits"),
+                          requested, IMAGE_FACES["edits"],
+                          raw=blob, content_type=content_type)

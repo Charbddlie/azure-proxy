@@ -171,6 +171,10 @@ def is_responses(path: str) -> bool:
     return "responses" in path
 
 
+def is_images(path: str) -> bool:
+    return "/images/" in path
+
+
 def join_duplicates(items) -> dict:
     """Collapse repeated headers the way a real HTTP server reports them.
 
@@ -229,6 +233,11 @@ class FakeAzure:
                         "path": self.path,
                         "headers": join_duplicates(self.headers.items()),
                         "body": body,
+                        # The bytes as they arrived. /v1/images/edits relays a
+                        # multipart body without re-encoding it, and the only
+                        # way to assert that is to compare what was sent with
+                        # what turned up.
+                        "raw": raw,
                     })
                     behaviour = fake.behaviours[min(fake._index,
                                                     len(fake.behaviours) - 1)]
@@ -244,6 +253,18 @@ class FakeAzure:
 
             # -- replies ---------------------------------------------------
             def _default_body(self, body):
+                if is_images(self.path):
+                    # The images faces answer with base64, and with a usage
+                    # block that counts image tokens. `from` is where the test
+                    # reads which upstream served it, since there is no text
+                    # field to hide a name in.
+                    return {
+                        "created": 1788000000,
+                        "from": fake.name,
+                        "data": [{"b64_json": "aW1hZ2U="}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1,
+                                  "total_tokens": fake.total_tokens},
+                    }
                 if is_responses(self.path):
                     return {
                         "id": "resp_fake",

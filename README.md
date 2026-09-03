@@ -1,14 +1,17 @@
 # azure-proxy
 
 本地 OpenAI 协议代理。持有 Azure 凭据，对外暴露**无需鉴权**的
-`/v1/chat/completions` 和 `/v1/responses`。调用端只给模型名和参数，代理负责挑
+`/v1/chat/completions`、`/v1/responses`、`/v1/images/generations` 和
+`/v1/images/edits`。调用端只给模型名和参数，代理负责挑
 endpoint、附加凭据、把模型名换成该 endpoint 上的部署名，按每个部署各自的配额
 分摊流量，并在 429/5xx/流内限流时切到另一个部署重试。
 
-两个面**分开路由**。Azure 把 Responses API 挡在**独立的数据操作**
+几个面**分开路由**，因为它们本来就是不同的几组部署。Azure 把 Responses API 挡在
+**独立的数据操作**
 （`Microsoft.CognitiveServices/accounts/OpenAI/responses/write`）后面，老的
 api-version 也根本不提供这个接口——所以一个 chat 能用的模型完全可能没有 responses
-路由。谁支持哪个面由探测决定。
+路由。图像模型（`gpt-image-*`）又是另外一组：它们没有任何文本面，而且只存在于个别
+资源上（swc 有，scus 没有）。谁支持哪个面由探测决定。
 
 调用端有三类，行为都是实测的：
 
@@ -166,15 +169,17 @@ JSON 不支持注释这件事本身就在说明这一点。
 监听 `127.0.0.1:8811`（在 `settings/policy.yaml` 改）。共享机器上这个端口段常有别人的
 服务，换端口前先 `ss -lnt` 看一眼。
 
-五个接口：
+七个接口：
 
 | | |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI 协议，无需鉴权 |
 | `POST /v1/responses` | Responses API，流式与非流式都支持 |
+| `POST /v1/images/generations` | 生图，JSON。字段就是 OpenAI 那套 `model/prompt/n/size/quality` |
+| `POST /v1/images/edits` | 改图，multipart。body 原样转发，只读出 `model` 用来选路由 |
 | `GET /v1/models` | 可用模型 + 每个模型的路由链和支持的面 |
-| `GET /healthz` | 存活、两个面各有几个模型、凭据目录、上次探测时间、当前 `balance` 模式和溢出阈值、监听地址、已运行时长 |
-| `GET /routes` | 每条路由的声明配额与实测配额、自己账本的窗口用量（并按四个「面」拆开）、`our_load` / `foreign_load` / `total_load`、当前权重、429 次数、降权状态、钉住的会话 |
+| `GET /healthz` | 存活、每个面各有几个模型、凭据目录、上次探测时间、当前 `balance` 模式和溢出阈值、监听地址、已运行时长 |
+| `GET /routes` | 每条路由的声明配额与实测配额、自己账本的窗口用量（并按五个「面」拆开）、`our_load` / `foreign_load` / `total_load`、当前权重、429 次数、降权状态、钉住的会话 |
 | `GET /events` | 最近的结构化事件环，看板的数据源。`?since=<游标>&limit=&kind=`，`kind=problems` 只要出问题的那几类 |
 
 **不实现** `GET/DELETE /v1/responses/{id}`、`/cancel`、`/input_items`。没有调用方
@@ -183,8 +188,8 @@ JSON 不支持注释这件事本身就在说明这一点。
 响应头带 `x-azure-proxy-route`，写明这次实际走的是哪个 endpoint 的哪个部署。
 排查时先看它。
 
-日志在 `proxy.log`：启动摘要（当前 az 账号、token 寿命、每个 endpoint 两个面的状态、
-两个面各有几个模型）、每个请求进出各一行（模型、是否流式、走的哪条路由、耗时）、
+日志在 `proxy.log`：启动摘要（当前 az 账号、token 寿命、每个 endpoint 各个面的状态、
+每个面各有几个模型）、每个请求进出各一行（模型、是否流式、走的哪条路由、耗时）、
 每次故障切换、每次 token 刷新。**请求体和响应体在任何级别都不记**——prompt 是用户
 数据，`/events` 守同一条规矩。`settings/policy.yaml` 的 `server.log_level` 调级别，
 `debug` 会多打每次上游尝试。
@@ -260,9 +265,9 @@ gpt-5.4        ███▓▓▒▒▚░░░░··············�
 一条配额被三方瓜分，条形存在的理由就是这三者老被搞混：
 
 - **ours**（鼠尾草绿）—— 实测的，代理自己账本里这个窗口发出去的量。
-  四个字符是同一个数的四个切片，**同色不同字符**：`█` chat、`▓` chat 流式、
-  `▒` responses、`▚` responses 流式。它们抢的是同一个上限，所以是一个颜色；
-  给四种颜色会读成四条互不相干的条恰好挨在一起，那是错的心智模型。
+  五个字符是同一个数的五个切片，**同色不同字符**：`█` chat、`▓` chat 流式、
+  `▒` responses、`▚` responses 流式、`▞` 图像。它们抢的是同一个上限，所以是一个
+  颜色；给五种颜色会读成五条互不相干的条恰好挨在一起，那是错的心智模型。
 - **░ others**（灰褐）—— **推断的**，别的租户占了多少。只在被限流那一瞬间可观测，
   之后按 `foreign_reclaim_per_minute` 线性回收（见下面「别人也在用同一份配额」）。
 - **· free**（暗）—— 剩下的，因此只和旁边那个估计一样可信。
@@ -271,7 +276,7 @@ gpt-5.4        ███▓▓▒▒▚░░░░··············�
 *未知*：没被试过的路由报不出 limit 头，均衡器故意把它当「不忙」好让它有机会被试。
 画成 0% 等于断言这个部署是空的，那是另一个说法，而且没有证据。
 
-细到看不见的量会强行占一格。四次请求对 300k token 的上限是 1e-5，50 格的条上四个面
+细到看不见的量会强行占一格。四次请求对 300k token 的上限是 1e-5，50 格的条上五个面
 全部舍成 0、空白吃满整条 —— 那条条会说「这里什么都没发生」，而它恰恰是正在扛流量的
 那条。这一格是从最大的那段（一般是 free）借的。
 
@@ -331,6 +336,7 @@ P=.venv/bin/python
 $P probe/probe.py                    # 全部
 $P probe/probe.py --only endpoint-a   # 单个 endpoint
 $P probe/probe.py --no-responses     # 跳过 responses 那一轮
+$P probe/probe.py --no-images        # 跳过图像那一轮
 $P probe/probe.py --no-arm           # 不查 ARM，退回猜名单
 ```
 
@@ -361,10 +367,16 @@ $P probe/probe.py --no-arm           # 不查 ARM，退回猜名单
 网络不通）退回 `endpoints.yaml` 的 `deployments` 名单去猜，`sources.json` 里每个
 endpoint 的 `discovery` 字段记录了这次走的是哪条路（`arm` / `list`）。
 
-ARM 那一步就地排掉三类不可能是 chat 路由的部署，省下请求：**Batch SKU**
-（`gpt-4.1-batch`、`gpt-4o-data` 这类只走 batch API）、**图像部署**
-（`dall-e-3`、`gpt-image-*`，代理不提供那个面）、以及**还没建好的**
-（`provisioningState != Succeeded`）。
+ARM 那一步就地排掉三类部署，省下请求：**Batch SKU**
+（`gpt-4.1-batch`、`gpt-4o-data` 这类只走 batch API）、**还没建好或已停用的**
+（`provisioningState != Succeeded`，swc 上那个退役的 `Dalle3` 就是这样被挡掉的，
+它现在回 410）、以及**一个面都不占的**（embedding 部署）。
+
+留下来的每个部署带着**该探哪些面**，来自 ARM 的 capability 标记。这个门只朝一个方向
+关：图像部署不去探 chat，因为它对 `chat/completions` 的拒绝会被算进那个 **endpoint**
+的 chat 状态里——一个资源上挂了一个看起来是死的部署，不等于这个资源死了。反过来，
+带 chat 或 responses capability 的部署仍然两个面都探，和以前一样：只有 responses 面
+的那批模型对 chat 回一个光秃秃的 400，capability 标记不足以信任。
 
 `models.json` 按**真实模型名**归并。一个 endpoint 上同一模型有多个部署是常态——
 换个 SKU 再买一份就是**第二份独立配额**——它们是同一个名字下的多条路由，不是冲突。
@@ -385,6 +397,24 @@ ARM 那一步就地排掉三类不可能是 chat 路由的部署，省下请求�
 在 `/responses` 上回 200（实测 2026-08-21）。一个部署**任意一个面能用就算能用**，
 `faces` 记录它到底有哪些面。
 
+最后是**图像那一轮**，只探 ARM 说带 `imageGenerations` 的那些部署。它故意发一个
+**注定失败的请求**：`{"prompt": ""}`。生成一张 1024×1024 要花钱、要十几到二十几秒，
+而空 prompt 会被同一个部署、出于同样的原因、在一秒内拒掉，而且是在产出任何一个像素
+之前。回来的那个拒绝把该分的都分开了（2026-08-29 实测于 gpt4v-swc）：
+
+| 回应 | 结论 |
+|---|---|
+| `400 empty_string` / `missing_required_parameter` | 部署在、有权限、确实服务 imageGenerations |
+| `429 RateLimitReached` | **也算活的**，而且是更硬的证据：Azure 把这次调用记到了这个部署的账上。`gpt-image-2` 只有 2 RPM，多数时候就是这个回应 |
+| `400 OperationNotSupported` | 这是个 chat 部署 |
+| `404 DeploymentNotFound` | 不在 |
+| `410` | 模型已退役（swc 上的 `Dalle3`） |
+| `401` / `403` | 没有 data action |
+
+`imageEdits` **不探**——改图请求必须带一张真实的图片。它取自 ARM 的 capability 标记，
+记在路由的 `image_edits` 上，用来在调用端拿一个只会生成的模型去请求
+`/v1/images/edits` 时给出 404 `no_image_edits_route`，而不是把 Azure 的困惑转发回去。
+
 endpoint 级失败会被归类，而不是笼统的"不可用"：`dns_nxdomain`（资源已删除）、
 `public_access_disabled`（需私有终结点）、`auth_denied`（principal 缺 data action）、
 `no_known_deployments`（endpoint 正常但没有部署应答）。responses 面单独报
@@ -399,6 +429,9 @@ Azure 增删部署后重跑。`runtime/*.json` 头部有 `_generated_at`。
 ## 参数处理
 
 **全部原样透传。** 代理只改写 `model` 字段，其余不动。
+
+图像面连 `model` 都不改：Azure 从 URL 路径读部署名，body 里那个字段它不看。所以
+`/v1/images/edits` 的 multipart 是**逐字节**转发的，见「图像面」一节。
 
 如果某个部署拒绝某个参数，它的 400 原样回给调用端。代理不代为丢弃参数——那会让
 `--temperature 0.7` 表面成功、实际按默认值运行，benchmark 数字失去可比性，而且
@@ -419,7 +452,7 @@ chat/completions 那套结构去理解请求会踩空。回程也一样：SSE �
 `max_completion_tokens`**。给 `gpt-5.5` 设 16，16 个全被推理吃掉，`content` 是空串、
 `finish_reason` 是 `length`。给几百以上才有可见输出。
 
-### 唯一的例外：responses 面的两处改写
+### body 的唯一例外：responses 面的两处改写
 
 `request.responses_compat`（`settings/policy.yaml`，默认 `true`）。只作用于
 `/v1/responses`，chat 面不受影响：
@@ -444,6 +477,105 @@ chat/completions 那套结构去理解请求会踩空。回程也一样：SSE �
 结论：**改写留着，但别把它当成 codex 已经跑得通的证据。** 它已通过单元测试、且对常规
 流量零影响（全量回归全过）；codex 到底还卡不卡，只有真跑一次 codex 才知道。真跑之后
 如果发现根本不需要，把 `responses_compat` 设 `false` 就退回纯透传。
+
+---
+
+## 图像面（`/v1/images/*`）
+
+两个接口，OpenAI SDK 直接能用：
+
+```bash
+curl -s http://127.0.0.1:8811/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-image-1.5","prompt":"a red circle","size":"1024x1024","quality":"low"}'
+
+curl -s http://127.0.0.1:8811/v1/images/edits \
+  -F model=gpt-image-1.5 -F 'prompt=turn it blue' -F image=@in.png
+```
+
+swc 上有 `gpt-image-1.5`（30 RPM）和 `gpt-image-2`（2 RPM），`gpt-image-2` 在
+`yifanyang-foundry-img-polandcentral` 上还有一个部署（同样 2 RPM，合计 4 RPM），
+scus 和 eastus2 上一个都没有。所以图像面的路由表和 chat 的不是一套，**不能假定同样的
+endpoint 集合**。`GET /v1/models` 的 `faces` 里能看到 `image` 和 `image_edits`。
+
+`yifanyang-foundry-img-polandcentral` 只有图像部署，没有 chat 部署，所以探测把它的
+整体 `status` 记成 `unreachable`（chat 面一个都没答）而 `image_status` 是 `ok`。
+路由表按面建，图像路由照常注册。
+
+### 部署名在 URL 路径里，所以 multipart 原样转发
+
+Azure 的 `images/{generations,edits}` 从 **URL 路径**读部署名，body 里的 `model`
+和它不一致时以路径为准（2026-08-29 实测：向 `gpt-image-1.5` 的路径发一个写着
+`gpt-image-2` 的 body，返回 200，出图的是 `gpt-image-1.5`）。
+
+这件事决定了 `/v1/images/edits` 怎么写。改图的 body 是几 MB 的 multipart，代理需要
+从里面拿到的只有一个东西：`model` 的值，用来决定发去哪个部署。所以 body 被**扫描**
+而不是解析——按 RFC 7578 固定的分隔结构定位那一个小文本字段，读完就停，然后整个
+body **逐字节**转发，连客户端自己选的 boundary 一起。这样既不用为读一个字符串引入
+`python-multipart`（`requirements.txt` 至今只有六个包，每个都真的被 import），也
+不用把几 MB 的 PNG 解出来再编回去，去改一个 Azure 反正会忽略的字段。
+
+### 429 是常态，所以重试规则不一样
+
+图像配额按**每分钟请求数**给，而且给得很紧：`gpt-image-2` 每个部署 2 RPM。单次调用要
+10-25 秒。这两件事凑在一起，429 就是一个忙碌分钟的正常形状，不是出事的信号。
+
+其余的面每条路由最多试一次，试过就走，因为在旁边还有三个 endpoint 待命时回头再敲
+刚拒绝过你的那个是浪费。图像模型的部署很少，那条规则会把第一个 429 直接
+交给调用端——而调用端往往不重试（OpenAI SDK 调图像接口时 `maxRetries: 0` 很常见），
+一个 429 就等于一页幻灯片失败。
+
+所以图像面的尝试列表是**在路由里循环**的，等待用 Azure 自己的 `Retry-After` 而不是
+盲目指数退避——每分钟的额度什么时候回来，Azure 知道，代理不知道。两个旋钮在
+`settings/policy.yaml` 的 `routing.image` 下：
+
+```yaml
+routing:
+  image:
+    max_attempts: 3        # 尝试次数，不是路由数
+    max_wait_seconds: 60   # Retry-After 的上限，防止永不恢复的部署把调用端挂住
+```
+
+`gpt-image-2` 现在有两条路由，循环会在 swc 和 polandcentral 之间来回：
+
+```
+!! 429 from gpt4v-swc/gpt-image-2, waiting for yifanyang-foundry-img-polandcentral/gpt-image-2 in 4.0s
+!! 429 from yifanyang-foundry-img-polandcentral/gpt-image-2, waiting for gpt4v-swc/gpt-image-2 in 19.0s
+```
+
+2026-08-30 实测（4 并发，1024x1024，quality=low）：`max_wait_seconds` 是 30 时 1/4
+成功，抬到 60 之后 3/4 成功。原因在 `Retry-After` 的量级：两条路由都满的时候 Azure
+给的是 19-34 秒，30 的上限会把等待截断，把一个再等一会儿就能成的请求变成 429。
+剩下那个失败的是三次尝试用尽（62.5 秒，第三次拿到 60 秒的 `Retry-After`，正好顶到
+上限且没有尝试次数了）。2 并发稳定 200，**这是 `gpt-image-2` 的实用并发上限**。
+
+同期日志里还有 `throttled at our load 0.50: estimating 50% foreign load`——swc 上的
+`gpt-image-2` 有代理之外的人在用，实际能拿到的比账面 2 RPM 少。
+
+`load_window_seconds` 默认 60 秒对图像是**对的**，不需要按面另配：账本记的是
+**派发时刻**，天花板是每分钟请求数，两边同单位。单次调用耗时长不影响这个比值——
+要紧的是派发速率，不是每个请求在飞多久。
+
+**代理不会在 `gpt-image-1.5` 和 `gpt-image-2` 之间轮转**：路由表按模型名建，这是
+两个不同的模型，不是同一个模型的两条路由。要在两者之间溢出，得由调用端自己决定
+先要哪个。
+
+### Responses 面自己画图（`tools: [{"type": "image_generation"}]`）
+
+这条路以前能走通但要调用端自己填一个 header：Azure 不会替你挑图像部署，缺了就报
+
+```
+imagegen deployment must be provided through header:
+x-ms-oai-image-generation-deployment
+```
+
+而部署名只在**它所在的那个 endpoint** 上有效——调用端既不知道均衡器把这一轮发去了
+哪个资源，也不该知道那上面部署了什么。现在代理自己填：带 `image_generation` 工具的
+一轮会先被**收窄到有图像部署的 endpoint**，再逐次尝试地补上 header。调用端已经自己
+设了这个 header 的，不覆盖。
+
+哪个 endpoint 用哪个部署，`GET /routes` 的 `image_deployments` 里写着；同一资源上有
+多个时取配额最大的那个。
 
 ---
 
@@ -637,9 +769,15 @@ TPM ≈ 单请求 token 数 × 轮次频率 × 并发，和 n 只是线性关系
 `400 The requested operation is unsupported.`，走 `/v1/chat/completions` 会拿到
 404 `no_chat_route`（错误信息里会说清它在哪个面上）。
 
-以 `GET /v1/models` 为准，上面这份是 2026-08-21 探测的快照。
+**`gpt-image-1.5` `gpt-image-2` 只有图像面**，两个都支持 generations 和 edits。
+`gpt-image-1.5` 1 条路由在 swc；`gpt-image-2` 2 条，swc 和
+`yifanyang-foundry-img-polandcentral`。它们没有任何文本面，走文本接口同样拿
+404 `no_chat_route` /
+`no_responses_route`；反过来拿一个文本模型去 `/v1/images/*` 拿 404 `no_image_route`。
 
-一个模型在两个面上的路由数**可能不同，也可能只有一个面**。`GET /v1/models` 的
+以 `GET /v1/models` 为准，上面这份是 2026-08-29 探测的快照。
+
+一个模型在各个面上的路由数**可能不同，也可能只有一个面**。`GET /v1/models` 的
 `faces` 字段是准的，`runtime/models.json` 里每条路由的 `faces` 是它的来源。
 
 ### 权重是怎么来的（`capacity` 模式，以及后备链的排序）
