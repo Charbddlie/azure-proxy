@@ -23,7 +23,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import theme
-from .bars import capacity_bar, percent, si
+from .bars import capacity_bar, percent
 from .layout import column_widths, rows, truncate
 from .snapshot import Group, RouteView, Snapshot
 
@@ -121,9 +121,9 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
         row.add_column(justify="right", width=4, no_wrap=True)
         row.add_row(Text(truncate(label, label_width),
                          style=theme.TEXT if route.busy else theme.LABEL),
-                    capacity_bar(bar_width, route.by_face,
-                                 route.foreign_load),
-                    percent(route.total_load))
+                    capacity_bar(bar_width, route.qps_load_by_face,
+                                 route.qps_other_load),
+                    percent(route.qps_load))
         lines.append(row)
         if detail:
             # Indented to start where the bar starts, so the numbers sit under
@@ -133,17 +133,7 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
 
 
 def _detail(route: RouteView, width: int, indent: int) -> Text:
-    """The line under a bar: what the three claims actually are, in numbers.
-
-    `ours` and `others` are printed even when they are zero, because their
-    absence is what the reader is checking for — "is anyone else on this" has
-    a different answer from "we have not measured this yet", and only a printed
-    zero distinguishes them.
-
-    Built by appending clauses only while they fit. Truncating the finished
-    line would cut it mid-number, and a number missing its last digit is worse
-    than a clause that is not there at all.
-    """
+    """Current, outside and learned-safe QPS for one route."""
     indent = max(0, min(indent, width - 12))
     out = Text(" " * indent, style=theme.DIM, no_wrap=True)
     budget = width - indent
@@ -154,34 +144,17 @@ def _detail(route: RouteView, width: int, indent: int) -> Text:
         # line run a clause past the edge of the card.
         return cell_len(out.plain) - indent + cell_len(text) <= budget
 
-    if route.total_load is None:
-        out.append("尚未测得上限", style=theme.DIM)
-        granted = route.data.get("capacity_tokens")
-        if granted and room(" · granted 000k TPM"):
-            out.append(" · 授权 {}".format(si(granted, " TPM")),
-                       style=theme.DIM)
+    if route.capacity_qps is None:
+        out.append("尚未测得安全 QPS", style=theme.DIM)
         return out
 
-    out.append("ours ", style=theme.DIM)
-    out.append("{:.0f}%".format((route.our_load or 0.0) * 100), style=theme.OURS)
+    out.append("当前 ", style=theme.DIM)
+    out.append("{:.1f}".format(route.current_qps), style=theme.OURS)
     out.append(" · others ", style=theme.DIM)
-    out.append("{:.0f}%".format(route.foreign_load * 100), style=theme.FOREIGN)
-
-    age = route.data.get("foreign_observed_age_seconds")
-    if route.foreign_load > 0 and age is not None and room(" (00s)"):
-        # An estimate reclaimed linearly since the last throttle: how old it is
-        # decides how much of it to believe.
-        out.append(" ({:.0f}s)".format(age), style=theme.DIM)
-
-    sent = route.data.get("sent_requests_in_window") or 0
-    tokens = si(route.data.get("sent_tokens_in_window") or 0)
-    clause = " · {} req {}".format(sent, tokens)
+    out.append("{:.1f}".format(route.other_qps), style=theme.FOREIGN)
+    clause = " · 最大安全 {:.1f} QPS".format(route.capacity_qps or 0.0)
     if room(clause):
         out.append(clause, style=theme.DIM)
-        dimension = route.data.get("load_dimension")
-        unit = "TPM" if dimension == "tokens" else "RPM"
-        if dimension and room("/" + unit):
-            out.append("/{}".format(unit), style=theme.DIM)
 
     if route.parked > 0 and room(" parked 00s"):
         out.append("  parked {:.0f}s".format(route.parked), style=theme.CRIT)
@@ -200,8 +173,9 @@ def _source_card(group: Group, width: int, detail: bool, pinned: int,
     subtitle = Text()
     subtitle.append("{}/{} 在用".format(group.active, len(group.routes)),
                     style=theme.LABEL if group.active else theme.DIM)
-    subtitle.append(" · {}".format(si(group.capacity_tokens, " TPM")),
-                    style=theme.DIM)
+    if group.capacity_qps:
+        subtitle.append(" · 最大安全 {:.1f} QPS".format(group.capacity_qps),
+                        style=theme.DIM)
     if pinned:
         # Sessions carrying encrypted reasoning cannot be moved off the endpoint
         # that produced it. A source with pins is one the balancer has less say
@@ -220,36 +194,43 @@ def _source_card(group: Group, width: int, detail: bool, pinned: int,
     body = _route_rows(rows_shown, width - 4, _labels(rows_shown, "source"),
                        {}, detail)
     return Panel(RichGroup(subtitle, body), title=title, width=width,
-                 border_style=theme.severity(_load_or_none(group.peak_load)),
+                 border_style=theme.severity(
+                     _load_or_none(group.peak_qps_load)),
                  padding=(0, 1))
 
 
-def _model_card(group: Group, width: int, detail: bool) -> Panel:
+def _model_card(group: Group, width: int, detail: bool,
+                snapshot: Snapshot) -> Panel:
     title = Text()
     title.append(group.name, style=theme.TITLE)
 
     subtitle = Text()
-    subtitle.append("{} 个源".format(len(group.routes)), style=theme.LABEL)
+    sessions = snapshot.model_sessions(group.name)
+    total_sessions = sessions.get("total") or 0
+    subtitle.append("{} session".format(total_sessions),
+                    style=theme.ACCENT if total_sessions else theme.DIM)
+    types = sessions.get("types") or {}
+    if types:
+        subtitle.append(" · " + "/".join(
+            "{} {}".format(name, count)
+            for name, count in sorted(types.items())), style=theme.LABEL)
+    subtitle.append(" · {} 个源".format(len(group.routes)), style=theme.LABEL)
     if group.faces:
         subtitle.append(" · {}".format("+".join(group.faces)), style=theme.DIM)
-    subtitle.append(" · {}".format(si(group.capacity_tokens, " TPM")),
-                    style=theme.DIM)
+    if group.capacity_qps:
+        subtitle.append(" · 最大安全 {:.1f} QPS".format(group.capacity_qps),
+                        style=theme.DIM)
     if group.released:
         subtitle.append(" · {}".format(group.released), style=theme.DIM)
     if group.troubled:
         subtitle.append(" · {} demoted".format(group.troubled),
                         style=theme.WARN)
 
-    # The balancer's share of this model's traffic, next to the source name.
-    # It is the answer to "how much does this source actually offer" that the
-    # capacity figure alone does not give: a big deployment that keeps getting
-    # demoted has a large ceiling and a small share.
-    shares = {r.key: ("{:.0%}".format(r.share) if r.share is not None else "")
-              for r in group.routes}
     body = _route_rows(group.routes, width - 4, _labels(group.routes, "model"),
-                       shares, detail)
+                       {}, detail)
     return Panel(RichGroup(subtitle, body), title=title, width=width,
-                 border_style=theme.severity(_load_or_none(group.peak_load)),
+                 border_style=theme.severity(
+                     _load_or_none(group.peak_qps_load)),
                  padding=(0, 1))
 
 
@@ -302,7 +283,7 @@ def render_groups(groups: List[Group], width: int, height: int, offset: int,
                                       pins.get(group.name, 0),
                                       snapshot, show_all))
         else:
-            cards.append(_model_card(group, card_width, detail))
+            cards.append(_model_card(group, card_width, detail, snapshot))
 
     banded = rows(cards, per_row)
     visible = banded[offset:]
@@ -314,7 +295,7 @@ def render_groups(groups: List[Group], width: int, height: int, offset: int,
 # events
 # --------------------------------------------------------------------------
 
-EVENT_FILTERS = ("全部", "问题", "他人容量")
+EVENT_FILTERS = ("全部", "问题", "他人流量")
 # Kept in step with proxy/events.py::PROBLEM_KINDS by hand, because the
 # dashboard talks to the proxy over HTTP and imports nothing from it. It had
 # already drifted once: `unpinned` and `upstream_error` were added on the
@@ -414,6 +395,13 @@ def _event_change(event: dict, width: int) -> Text:
         return out
 
     if event.get("foreign_updated") or event.get("kind") == "foreign":
+        other_qps = event.get("other_qps")
+        capacity_qps = event.get("capacity_qps")
+        if other_qps is not None and capacity_qps:
+            out.append("others ", style=theme.DIM)
+            out.append("{:.1f} QPS".format(other_qps), style=theme.FOREIGN)
+            out.append(" / max {:.1f}".format(capacity_qps), style=theme.DIM)
+            return out
         before, after = event.get("foreign_before"), event.get("foreign_after")
         if before is not None and after is not None:
             out.append("others ", style=theme.DIM)

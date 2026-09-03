@@ -6,7 +6,7 @@
 # every script that checks the exit code, and they were not — configuration is
 # read once, at startup. Use ./restart.sh to pick up an edit.
 #
-# To watch it once it is up: ./start_tui.sh
+# To watch it once it is up: ./tui.sh
 set -euo pipefail
 
 cd "$(dirname "$0")"

@@ -146,8 +146,8 @@ def _header(snapshot: Snapshot) -> Table:
     spill = health.get("spill_threshold")
     if spill and snapshot.balance == "priority_threshold":
         left.append(" @{:.0%}".format(spill), style=theme.DIM)
-    if snapshot.load_window:
-        left.append("  window {:.0f}s".format(snapshot.load_window),
+    if snapshot.qps_window:
+        left.append("  QPS window {:g}s".format(snapshot.qps_window),
                     style=theme.DIM)
 
     right = Text()

@@ -32,9 +32,9 @@ LABEL = "#7c8894"           # field names, units
 DIM = "#4e565f"             # things present but not currently interesting
 TEXT = "#c3cad2"            # ordinary values
 
-OURS = "#7fa08a"            # sage: what THIS proxy is using
-FOREIGN = "#b39a72"         # tan: what everyone else is estimated to hold
-FREE = "#3b4149"            # the rest of the ceiling
+OURS = "#7fa08a"            # sage: this proxy's current QPS
+FOREIGN = "#b39a72"         # tan: outside QPS observed at the last throttle
+FREE = "#3b4149"            # the rest of the learned safe QPS
 
 OK = "#86a98e"
 WARN = "#c2a06a"            # muted amber
@@ -107,6 +107,7 @@ EVENT_STYLE = {
     "boot":      ("•", ACCENT),
     "request":   ("→", DIM),
     "response":  ("←", DIM),
+    "capacity":  ("↑", OK),
     "throttle":  ("▲", CRIT),
     "demote":    ("▼", WARN),
     "foreign":   ("◆", FOREIGN),

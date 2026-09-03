@@ -68,6 +68,38 @@ class RouteView:
         return self.data.get("foreign_load") or 0.0
 
     @property
+    def current_qps(self) -> float:
+        return self.data.get("current_qps") or 0.0
+
+    @property
+    def capacity_qps(self) -> Optional[float]:
+        return self.data.get("capacity_qps")
+
+    @property
+    def other_qps(self) -> float:
+        return self.data.get("other_qps") or 0.0
+
+    @property
+    def qps_load(self) -> Optional[float]:
+        if not self.capacity_qps:
+            return None
+        return (self.current_qps + self.other_qps) / self.capacity_qps
+
+    @property
+    def qps_other_load(self) -> float:
+        if not self.capacity_qps:
+            return 0.0
+        return self.other_qps / self.capacity_qps
+
+    @property
+    def qps_load_by_face(self) -> Optional[Dict[str, float]]:
+        if not self.capacity_qps:
+            return None
+        values = self.data.get("qps_by_face") or {}
+        return {name: (values.get(name) or 0.0) / self.capacity_qps
+                for name in values}
+
+    @property
     def by_face(self) -> Optional[Dict[str, float]]:
         return self.data.get("our_load_by_face")
 
@@ -94,15 +126,8 @@ class RouteView:
 
     @property
     def busy_load(self) -> float:
-        """`sort_load` with unknown folded into idle, for ranking cards.
-
-        The distinction between "measured at 0%" and "never measured" is real
-        and the bar draws it — but it is a fact about what the proxy has been
-        told, not about traffic, and letting it order the board put a quiet
-        gpt-5.4 above three newer models for no reason a reader could see.
-        Anything genuinely carrying load still sorts above both.
-        """
-        return max(self.sort_load, 0.0)
+        """Current QPS for activity ordering."""
+        return self.current_qps
 
     @property
     def released(self) -> Optional[str]:
@@ -150,6 +175,10 @@ class Group:
         return sum(r.data.get("capacity_requests") or 0.0 for r in self.routes)
 
     @property
+    def capacity_qps(self) -> float:
+        return sum(r.capacity_qps or 0.0 for r in self.routes)
+
+    @property
     def sent_requests(self) -> int:
         return sum(r.data.get("sent_requests_in_window") or 0
                    for r in self.routes)
@@ -179,6 +208,11 @@ class Group:
     def peak_busy(self) -> float:
         """The same peak, for ordering. See RouteView.busy_load."""
         return max([r.busy_load for r in self.routes] or [0.0])
+
+    @property
+    def peak_qps_load(self) -> float:
+        values = [r.qps_load for r in self.routes if r.qps_load is not None]
+        return max(values or [-1.0])
 
     @property
     def released(self) -> Optional[str]:
@@ -291,6 +325,7 @@ class Snapshot:
 
         self.balance = routes_doc.get("balance") or self.health.get("balance")
         self.load_window = routes_doc.get("load_window_seconds")
+        self.qps_window = routes_doc.get("qps_window_seconds")
         self.affinity = (routes_doc.get("session_affinity")
                          or self.health.get("session_affinity") or {})
         self.faces = routes_doc.get("faces") or []
@@ -340,6 +375,10 @@ class Snapshot:
         for versions in present.values():
             self._recent.update(
                 sorted(versions, reverse=True)[:KEEP_RECENT_VERSIONS])
+
+    def model_sessions(self, model: str) -> dict:
+        return ((self.affinity.get("sessions_per_model") or {}).get(model)
+                or {"total": 0, "types": {}})
 
     # -- what is worth showing --------------------------------------------
     def is_legacy(self, name: str) -> bool:
@@ -399,7 +438,7 @@ class Snapshot:
             return sorted(groups, key=lambda g: g.name)
         if mode == "capacity":
             return sorted(groups,
-                          key=lambda g: (-g.capacity_tokens, g.name))
+                          key=lambda g: (-g.capacity_qps, g.name))
         # Activity first — this is a dashboard, and the thing that is moving is
         # the thing to look at. `recency_key` settles everything below that:
         # newest release, then strongest variant, then name. Which matters more

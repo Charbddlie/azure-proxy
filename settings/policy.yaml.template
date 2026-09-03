@@ -154,6 +154,13 @@ routing:
     # ceiling it is divided by are quoted over the same period.
     load_window_seconds: 60
 
+    # Capacity is learned from real traffic in a short rolling window. Each
+    # successful request proves the dispatch QPS at that instant was safe; the
+    # largest safe observation only increases and is saved immediately. A
+    # throttle below that maximum attributes the QPS difference to others.
+    qps_window_seconds: 1.0
+    capacity_state_file: runtime/capacity.json
+
     # A request's token cost is charged when it is dispatched, because that is
     # when Azure charges it, and at that moment the only thing known about it is
     # how big the body was. So the initial estimate is bytes / this. Every

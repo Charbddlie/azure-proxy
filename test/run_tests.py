@@ -1709,6 +1709,67 @@ def route_state(proxy, name="alpha"):
     return report["routes"][name + "/" + DEPLOYMENT]
 
 
+def test_safe_qps_capacity_only_grows_and_survives_restart():
+    """Successful dispatch rates raise a monotonic, atomically saved maximum."""
+    sys.path.insert(0, ROOT)
+    import logging
+    from proxy.server import QuotaTracker, Route
+    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
+
+    directory = tempfile.mkdtemp(prefix="azure-proxy-capacity-")
+    try:
+        class Cfg:
+            capacity_state_file = os.path.join(directory, "capacity.json")
+            qps_window = 1.0
+            load_window = 60
+            chars_per_token = 4
+            foreign_enabled = False
+            foreign_reclaim = 0.0
+
+        route = Route("alpha", "http://x/", "v", "deployment",
+                      "max_completion_tokens", 0)
+        tracker = QuotaTracker(Cfg())
+        first = tracker.charge(route, 1)
+        second = tracker.charge(route, 1)
+        tracker.note_success(route, second)
+        assert tracker.state(route).safe_qps == 2.0
+
+        # A later, lower successful observation cannot lower the maximum.
+        tracker.note_success(route, first)
+        assert tracker.state(route).safe_qps == 2.0
+
+        restored = QuotaTracker(Cfg())
+        assert restored.state(route).safe_qps == 2.0
+        with open(Cfg.capacity_state_file) as f:
+            saved = json.load(f)
+        assert saved["routes"][str(route)] == 2.0, saved
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_throttle_below_safe_qps_attributes_the_difference_to_others():
+    sys.path.insert(0, ROOT)
+    import logging
+    from proxy.server import QuotaTracker, Route
+    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
+
+    class Cfg:
+        capacity_state_file = None
+        qps_window = 1.0
+        load_window = 60
+        chars_per_token = 4
+        foreign_enabled = False
+        foreign_reclaim = 0.0
+
+    route = Route("alpha", "http://x/", "v", "deployment",
+                  "max_completion_tokens", 0)
+    tracker = QuotaTracker(Cfg())
+    tracker.state(route).safe_qps = 7.0
+    moved = tracker.note_foreign(route, observed_qps=3.0)
+    assert tracker.state(route).other_qps == 4.0
+    assert moved["other_qps"] == 4.0, moved
+
+
 def test_foreign_load_is_estimated_from_a_throttle_at_low_load():
     """The headline case: barely any traffic from us, and still refused.
 
@@ -2529,6 +2590,36 @@ def test_a_subagent_starts_on_the_endpoint_its_parent_minted_state_on():
     report = aff.report()
     assert report["live_families"] == 1, report
     assert report["live_sessions"] == 1, report
+
+
+def test_affinity_reports_session_counts_and_types_per_model():
+    sys.path.insert(0, ROOT)
+    import logging
+    from proxy.server import Route, SessionAffinity
+    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
+
+    class Cfg:
+        affinity_enabled = True
+        affinity_keys = ["header:session-id"]
+        affinity_markers = ["reasoning.encrypted_content"]
+        affinity_ttl = 3600
+        affinity_max = 16
+        affinity_on_conflict = "wait"
+        affinity_off_route = "strip"
+
+    affinity = SessionAffinity(Cfg())
+    sol = Route("alpha", "http://x/", "v", "sol",
+                "max_completion_tokens", 0)
+    terra = Route("alpha", "http://x/", "v", "terra",
+                  "max_completion_tokens", 0)
+    affinity.pin("root\0model=gpt-5.6-sol", sol, "root", "codex")
+    affinity.pin("worker\0model=gpt-5.6-terra", terra, "root", "subagent")
+
+    report = affinity.report()["sessions_per_model"]
+    assert report["gpt-5.6-sol"] == {"total": 1,
+                                     "types": {"codex": 1}}, report
+    assert report["gpt-5.6-terra"] == {"total": 1,
+                                       "types": {"subagent": 1}}, report
 
 
 def test_a_refused_family_keeps_going_out_stripped():

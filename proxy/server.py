@@ -286,6 +286,12 @@ class Config:
             b.get("demote_recovery_halflife_seconds", 30))
         self.spill_threshold = float(b.get("spill_threshold", 0.70))
         self.load_window = float(b.get("load_window_seconds", 60))
+        self.qps_window = max(0.1, float(b.get("qps_window_seconds", 1.0)))
+        capacity_file = b.get("capacity_state_file", "runtime/capacity.json")
+        self.capacity_state_file = os.path.expanduser(str(capacity_file))
+        if not os.path.isabs(self.capacity_state_file):
+            self.capacity_state_file = os.path.join(ROOT,
+                                                    self.capacity_state_file)
         self.chars_per_token = float(b.get("assumed_chars_per_token", 4)) or 4.0
 
         f = b.get("foreign_load") or {}
@@ -539,6 +545,8 @@ class RouteState:
                  "penalty", "penalty_until", "penalty_at", "attempts", "ok",
                  "rate_limited", "errors", "last_status", "sent",
                  "tokens_per_char", "token_samples",
+                 "safe_qps", "other_qps", "qps_samples",
+                 "last_dispatch_qps",
                  "foreign", "foreign_at", "foreign_hold_until",
                  "foreign_samples", "foreign_our_load")
 
@@ -573,6 +581,16 @@ class RouteState:
         # bills thinking tokens that were never in the request at all.
         self.tokens_per_char: Optional[float] = None
         self.token_samples = 0
+
+        # Learned capacity. A successful request proves the dispatch rate at
+        # that instant was safe, so the largest such observation is a lower
+        # bound on the route's capacity. It only grows and is persisted by the
+        # tracker. A throttle below that bound exposes concurrent traffic from
+        # other users: safe_qps - our_qps.
+        self.safe_qps = 0.0
+        self.other_qps = 0.0
+        self.qps_samples = 0
+        self.last_dispatch_qps = 0.0
 
         # What everyone ELSE is estimated to be taking from this deployment, as
         # a fraction of its ceiling. Only ever learned at the moment of a
@@ -645,7 +663,52 @@ class QuotaTracker:
 
     def __init__(self, config: Config):
         self.cfg = config
+        self.qps_window = max(0.1, float(getattr(config, "qps_window", 1.0)))
+        self.capacity_state_file = getattr(config, "capacity_state_file", None)
         self.states: Dict[str, RouteState] = {}
+        self._saved_capacity = self._load_capacity()
+
+    def _load_capacity(self) -> Dict[str, float]:
+        """Load monotonic safe-QPS observations from the previous process."""
+        if not self.capacity_state_file:
+            return {}
+        try:
+            with open(self.capacity_state_file) as f:
+                doc = json.load(f)
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return {}
+        values = doc.get("routes") if isinstance(doc, dict) else None
+        if not isinstance(values, dict):
+            return {}
+        out = {}
+        for key, value in values.items():
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                out[str(key)] = value
+        return out
+
+    def _save_capacity(self) -> None:
+        """Atomically save every learned maximum as soon as one increases."""
+        path = self.capacity_state_file
+        if not path:
+            return
+        directory = os.path.dirname(path)
+        try:
+            os.makedirs(directory, exist_ok=True)
+            temporary = "{}.{}.tmp".format(path, os.getpid())
+            with open(temporary, "w") as f:
+                json.dump({"updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                       time.gmtime()),
+                           "qps_window_seconds": self.qps_window,
+                           "routes": dict(sorted(self._saved_capacity.items()))},
+                          f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(temporary, path)
+        except OSError as e:
+            log.warning("could not save learned capacity to %s: %s", path, e)
 
     # -- state ------------------------------------------------------------
     def state(self, route: Route) -> RouteState:
@@ -661,6 +724,7 @@ class QuotaTracker:
         st = self.states.get(key)
         if st is None:
             st = self.states[key] = RouteState(key)
+            st.safe_qps = self._saved_capacity.get(key, 0.0)
         return st
 
     def observed(self, route: Route, status: int, headers) -> None:
@@ -712,10 +776,53 @@ class QuotaTracker:
         """Record a dispatch. Returns the ledger entry, for `settle`."""
         now = time.time()
         st = self.state(route)
-        st.prune(now, self.cfg.load_window)
-        entry = [now, float(tokens), face]
+        st.prune(now, max(self.cfg.load_window, self.qps_window))
+        cutoff = now - self.qps_window
+        recent = sum(1 for item in st.sent if item[0] >= cutoff)
+        dispatch_qps = (recent + 1) / self.qps_window
+        entry = [now, float(tokens), face, dispatch_qps]
         st.sent.append(entry)
+        st.last_dispatch_qps = dispatch_qps
         return entry
+
+    def qps(self, st: RouteState, now: float) -> float:
+        """Requests dispatched during the short QPS observation window."""
+        cutoff = now - self.qps_window
+        return sum(1 for item in st.sent if item[0] >= cutoff) \
+            / self.qps_window
+
+    def qps_by_face(self, st: RouteState, now: float) -> Dict[str, float]:
+        cutoff = now - self.qps_window
+        counts = [0] * len(FACES)
+        for item in st.sent:
+            if item[0] >= cutoff:
+                counts[item[2] if len(item) > 2 else 0] += 1
+        return {name: count / self.qps_window
+                for name, count in zip(FACES, counts)}
+
+    def note_success(self, route: Route,
+                     entry: Optional[List[float]]) -> None:
+        """Raise the saved capacity to the largest proven-safe dispatch QPS."""
+        st = self.state(route)
+        observed = (float(entry[3]) if entry is not None and len(entry) > 3
+                    else self.qps(st, time.time()))
+        if observed <= 0:
+            return
+        st.qps_samples += 1
+        if observed > st.safe_qps:
+            before = st.safe_qps
+            st.safe_qps = observed
+            self._saved_capacity[st.key] = observed
+            self._save_capacity()
+            _ev("capacity", "info",
+                "%s raised learned capacity from %.2f to %.2f QPS",
+                route, before, observed, route=route,
+                capacity_before=round(before, 4),
+                capacity_after=round(observed, 4))
+        # A success at this rate proves a previous `others` observation can no
+        # longer make the route exceed its learned capacity.
+        st.other_qps = min(st.other_qps,
+                           max(0.0, st.safe_qps - observed))
 
     def settle(self, route: Route, entry: Optional[List[float]],
                request_bytes: int, total_tokens: Optional[int]) -> None:
@@ -874,13 +981,14 @@ class QuotaTracker:
         """The current estimate of what other tenants are taking.
 
         Reclaimed linearly since the last throttle, after that throttle's
-        Retry-After has passed.
+        Retry-After has passed. This remains an internal routing signal; the
+        dashboard reports the separate safe-QPS observation.
         """
         if not self.cfg.foreign_enabled or st.foreign <= 0.0:
             return 0.0
-        rate = self.cfg.foreign_reclaim        # per minute
+        rate = self.cfg.foreign_reclaim
         if rate <= 0:
-            return st.foreign                  # 0 disables reclaim entirely
+            return st.foreign
         start = max(st.foreign_at, st.foreign_hold_until)
         if now <= start:
             return st.foreign
@@ -898,53 +1006,46 @@ class QuotaTracker:
             return None
         return ours + self.foreign_load(st, now)
 
-    def note_foreign(self, route: Route, retry_after=None) -> Optional[dict]:
-        """Fold one throttle into the estimate of other tenants' share.
-
-        The multiplicative-decrease half of AIMD: the estimate only ever jumps
-        UP here. Taking max() with what is already held matters because our own
-        load fluctuates — a throttle that arrives while we happen to be at 0.9
-        would otherwise wipe out an earlier throttle's finding that someone else
-        holds 0.8, and we would spend the next several minutes relearning it.
-
-        Returns what moved, or None if nothing did — the caller folds it into
-        its own event, because "we backed off" and "we revised our estimate of
-        who else is here" are separately worth knowing and only this function
-        can tell the second one from the first.
-        """
-        if not self.cfg.foreign_enabled:
-            return None
+    def note_foreign(self, route: Route, retry_after=None,
+                     observed_qps: Optional[float] = None) -> Optional[dict]:
+        """At a throttle, capacity minus our QPS is concurrent outside QPS."""
         now = time.time()
         st = self.state(route)
+        our_qps = (observed_qps if observed_qps is not None
+                   else st.last_dispatch_qps or self.qps(st, now))
+        before_qps = st.other_qps
+        outside_qps = max(0.0, st.safe_qps - our_qps)
+        st.other_qps = outside_qps
+
         ours = self.load(st, now)
-        if ours is None:
-            return None         # no ceiling known: cannot express a share
-        observed = min(1.0, max(0.0, 1.0 - ours))
         held = self.foreign_load(st, now)
-        st.foreign = max(held, observed)
+        if self.cfg.foreign_enabled and ours is not None:
+            observed = min(1.0, max(0.0, 1.0 - ours))
+            st.foreign = max(held, observed)
         st.foreign_at = now
-        # Reclaim is paused until Azure says the congestion should be over.
         park = _as_number(retry_after)
         st.foreign_hold_until = now + max(0.0, park or 0.0)
         st.foreign_samples += 1
         st.foreign_our_load = ours
-        moved = {"our_load": round(ours, 4),
+        moved = {"our_load": (round(ours, 4) if ours is not None else None),
+                 "our_qps": round(our_qps, 4),
+                 "capacity_qps": (round(st.safe_qps, 4)
+                                  if st.safe_qps > 0 else None),
+                 "other_qps": round(outside_qps, 4),
                  "foreign_before": round(held, 4),
                  "foreign_after": round(st.foreign, 4),
                  "foreign_samples": st.foreign_samples,
                  "foreign_hold_seconds": round(max(0.0, park or 0.0), 1)}
-        if observed > 0.15 and observed > held + 0.1:
-            # Worth a line: this is the proxy asserting that someone else is on
-            # the deployment, which is a claim about the world outside it and
-            # the only place that claim is ever made.
+        if outside_qps > 0:
             _ev("foreign", "info",
-                "%s throttled at our load %.2f: estimating %.0f%% foreign "
-                "load on this deployment", route, ours, observed * 100,
+                "%s throttled at %.2f QPS below its %.2f QPS learned maximum; "
+                "the %.2f QPS difference is others",
+                route, our_qps, st.safe_qps, outside_qps,
                 route=route, **moved)
-        return moved
+        return moved if ours is not None or st.safe_qps > 0 else None
 
-    def demote(self, route: Route, reason: str,
-               retry_after=None) -> None:
+    def demote(self, route: Route, reason: str, retry_after=None,
+               observed_qps: Optional[float] = None) -> None:
         """Temporarily send less traffic here.
 
         Not just "skip it for this one request" — a 429 says the deployment is
@@ -978,7 +1079,7 @@ class QuotaTracker:
             # connection reset means the endpoint is unwell, not that its quota
             # is spoken for, and inferring a foreign share from one would
             # permanently shrink a route for being briefly broken.
-            moved = self.note_foreign(route, retry_after)
+            moved = self.note_foreign(route, retry_after, observed_qps)
         else:
             st.errors += 1
         st.last_status = reason
@@ -1033,6 +1134,9 @@ class QuotaTracker:
         RPM one, so a request-count weight would be tracking the limit that is
         not the limit. The two are not reliably proportional across deployments,
         so which one is used has to be decided rather than assumed.
+
+        This value remains the routing signal. The dashboard uses the separate,
+        persisted safe-QPS maximum learned from successful traffic.
         """
         return st.limit_tokens or st.limit_requests or None
 
@@ -1266,6 +1370,8 @@ class QuotaTracker:
                 requests, tokens = st.in_window(now, self.cfg.load_window)
                 by_face = st.in_window_by_face(now, self.cfg.load_window)
                 load_by_face = self.load_by_face(st, now)
+                current_qps = self.qps(st, now)
+                qps_by_face = self.qps_by_face(st, now)
                 seen[st.key] = {
                     "endpoint": r.endpoint,
                     "deployment": r.deployment,
@@ -1278,6 +1384,18 @@ class QuotaTracker:
                     # means the quota moved since the last probe.
                     "capacity_requests": r.capacity_requests,
                     "capacity_tokens": r.capacity_tokens,
+                    # Runtime capacity is learned from traffic. The largest QPS
+                    # that completed without a limit is monotonic and persisted;
+                    # a later throttle below it exposes the difference as other
+                    # users' concurrent QPS.
+                    "current_qps": round(current_qps, 4),
+                    "capacity_qps": (round(st.safe_qps, 4)
+                                     if st.safe_qps > 0 else None),
+                    "other_qps": round(st.other_qps, 4),
+                    "qps_window_seconds": self.qps_window,
+                    "qps_samples": st.qps_samples,
+                    "qps_by_face": {k: round(v, 4)
+                                    for k, v in qps_by_face.items()},
                     "limit_requests": st.limit_requests,
                     "limit_tokens": st.limit_tokens,
                     # What THIS proxy has sent inside the load window, which is
@@ -1357,6 +1475,7 @@ class QuotaTracker:
                 }
         return {"balance": self.cfg.balance,
                 "load_window_seconds": self.cfg.load_window,
+                "qps_window_seconds": self.qps_window,
                 # The canonical order of the four faces, so a reader stacking
                 # them does not have to hard-code it and drift.
                 "faces": list(FACES),
@@ -1558,6 +1677,21 @@ class SessionAffinity:
 
         return False
 
+    def session_type(self, body: dict) -> str:
+        """A compact operator-facing classification of a sticky session."""
+        items = body.get("input")
+        if isinstance(items, list) and any(
+                isinstance(item, dict) and item.get("type") == "agent_message"
+                for item in items):
+            return "subagent"
+        metadata = body.get("client_metadata")
+        cli = metadata.get("cli") if isinstance(metadata, dict) else None
+        if isinstance(cli, str) and cli.strip():
+            return cli.strip().lower()
+        if body.get("previous_response_id") or body.get("store") is True:
+            return "stateful"
+        return "reasoning"
+
     def _conversation(self, request: Request, body: dict) -> Optional[str]:
         """The conversation id this request belongs to, whatever carries it."""
         for spec in self.cfg.affinity_keys:
@@ -1706,7 +1840,8 @@ class SessionAffinity:
         return None
 
     def pin(self, key: Optional[str], route: Route,
-            family: Optional[str] = None) -> None:
+            family: Optional[str] = None,
+            session_type: str = "reasoning") -> None:
         """Record where this conversation's state now lives.
 
         Both books are written on every successful sticky response. A move is
@@ -1720,7 +1855,7 @@ class SessionAffinity:
             if entry is None:
                 _ev("pin", "info", "session pinned to %s (%d live)", route,
                     len(self._pins) + 1, route=route, live=len(self._pins) + 1)
-                self._pins[key] = [str(route), now]
+                self._pins[key] = [str(route), now, session_type]
             else:
                 if entry[0] != str(route):
                     _ev("pin", "warning",
@@ -1728,6 +1863,10 @@ class SessionAffinity:
                         "one is no longer readable", entry[0], route,
                         route=route, from_route=entry[0], moved=True)
                 entry[0], entry[1] = str(route), now
+                if len(entry) < 3:
+                    entry.append(session_type)
+                else:
+                    entry[2] = session_type
             self._pins.move_to_end(key)
 
         if family:
@@ -1754,10 +1893,20 @@ class SessionAffinity:
         # route breakdown is what says which deployment is carrying it.
         routes: Dict[str, int] = {}
         counts: Dict[str, int] = {}
-        for route, _ts in self._pins.values():
+        models: Dict[str, dict] = {}
+        for key, entry in self._pins.items():
+            route, _ts = entry[:2]
+            session_type = entry[2] if len(entry) > 2 else "reasoning"
             routes[route] = routes.get(route, 0) + 1
             endpoint = route.split("/", 1)[0]
             counts[endpoint] = counts.get(endpoint, 0) + 1
+            marker = "\0model="
+            model = key.rpartition(marker)[2] if marker in key else ""
+            if model:
+                bucket = models.setdefault(model, {"total": 0, "types": {}})
+                bucket["total"] += 1
+                types = bucket["types"]
+                types[session_type] = types.get(session_type, 0) + 1
         return {"enabled": self.cfg.affinity_enabled,
                 "on_conflict": self.cfg.affinity_on_conflict,
                 "off_route": self.cfg.affinity_off_route,
@@ -1774,7 +1923,8 @@ class SessionAffinity:
                 "live_sessions": len(self._pins),
                 "live_families": len(self._family),
                 "sessions_per_route": routes,
-                "sessions_per_endpoint": counts}
+                "sessions_per_endpoint": counts,
+                "sessions_per_model": models}
 
 
 class TokenUnavailable(Exception):
@@ -2250,6 +2400,7 @@ def _relay(resp: httpx.Response, route: Route, request_bytes: int = 0,
            entry: Optional[List[float]] = None,
            counted: bool = False) -> Response:
     body = resp.content
+    limited = counted
     if resp.status_code == 200 and not counted:
         reason = _inband_error(body)
         if reason:
@@ -2261,8 +2412,13 @@ def _relay(resp: httpx.Response, route: Route, request_bytes: int = 0,
             _ev("throttle", "warning",
                 "!! %s returned 200 carrying %s; demoting", route, reason,
                 route=route, inband=True, reason=reason, buffered=True)
-            quota.demote(route, "429", resp.headers.get("retry-after"))
+            quota.demote(route, "429", resp.headers.get("retry-after"),
+                         entry[3] if entry is not None and len(entry) > 3
+                         else None)
+            limited = True
     quota.settle(route, entry, request_bytes, _read_total_tokens(body))
+    if resp.status_code < 400 and not limited:
+        quota.note_success(route, entry)
     return Response(content=body, status_code=resp.status_code,
                     headers=_relay_headers(resp, route),
                     media_type=resp.headers.get("content-type"))
@@ -2694,7 +2850,9 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                     route, INBAND_RATE_LIMIT.decode(), sent,
                     route=route, face=face, model=model, inband=True,
                     too_late=True, bytes=sent)
-                quota.demote(route, "429", resp.headers.get("retry-after"))
+                quota.demote(route, "429", resp.headers.get("retry-after"),
+                             entry[3] if entry is not None and len(entry) > 3
+                             else None)
 
         try:
             for chunk in head.chunks:
@@ -2731,6 +2889,9 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
         finally:
             await resp.aclose()
             quota.settle(route, entry, request_bytes, watch.total_tokens)
+            if drained and not watch.rate_limited and not watch.upstream_error() \
+                    and (watch.completed or face != RESPONSES_FACE):
+                quota.note_success(route, entry)
             if keep:
                 _capture_stream(route, resp, bytes(seen))
             _note_upstream_error(watch.upstream_error(), route, face, model,
@@ -3052,6 +3213,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     session = affinity.key(request, body) if cfg.affinity_enabled else None
     family = affinity.family(request, body) if cfg.affinity_enabled else None
     sticky = bool(session) and not is_image and affinity.sticky(body)
+    session_type = affinity.session_type(body) if sticky else ""
     pinned = affinity.pinned(session, routes) if sticky else None
     # This family has been found carrying ciphertext that could not be placed,
     # so it goes out stripped wherever it goes — the client resends the same
@@ -3285,7 +3447,8 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                         route=route, face=face, model=requested, inband=True,
                         header=resp.headers.get(THROTTLE_HEADER))
                 quota.demote(route, "429" if throttled else str(resp.status_code),
-                             resp.headers.get("retry-after"))
+                             resp.headers.get("retry-after"),
+                             entry[3] if len(entry) > 3 else None)
 
             if retryable and not is_last:
                 await resp.aread()
@@ -3324,7 +3487,8 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                     if not throttled:
                         quota.demote(route,
                                      "429" if head.retry_reason else reason,
-                                     resp.headers.get("retry-after"))
+                                     resp.headers.get("retry-after"),
+                                     entry[3] if len(entry) > 3 else None)
                     if not is_last:
                         await resp.aclose()
                         last_error = "in-stream {} from {}".format(reason, route)
@@ -3356,7 +3520,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                         reason=reason, in_stream=True, last_route=True)
 
                 if sticky:
-                    affinity.pin(session, route, family)
+                    affinity.pin(session, route, family, session_type)
                 return _relay_stream(resp, route, face, started, head,
                                      request_bytes, entry,
                                      counted=bool(head.retry_reason) or throttled,
@@ -3392,7 +3556,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                         status=resp.status_code)
                     affinity.note_rejected(family)
                 if sticky and resp.status_code < 400:
-                    affinity.pin(session, route, family)
+                    affinity.pin(session, route, family, session_type)
                 return _relay(resp, route, request_bytes, entry,
                               counted=retryable)
 
