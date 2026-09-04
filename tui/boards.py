@@ -121,9 +121,9 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
         row.add_column(justify="right", width=4, no_wrap=True)
         row.add_row(Text(truncate(label, label_width),
                          style=theme.TEXT if route.busy else theme.LABEL),
-                    capacity_bar(bar_width, route.qps_load_by_face,
-                                 route.qps_other_load),
-                    percent(route.qps_load))
+                    capacity_bar(bar_width, route.qpm_load_by_face,
+                                 route.qpm_other_load),
+                    percent(route.qpm_load))
         lines.append(row)
         if detail:
             # Indented to start where the bar starts, so the numbers sit under
@@ -133,7 +133,7 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
 
 
 def _detail(route: RouteView, width: int, indent: int) -> Text:
-    """Current, outside and learned-safe QPS for one route."""
+    """Current, outside and learned-safe QPM for one route."""
     indent = max(0, min(indent, width - 12))
     out = Text(" " * indent, style=theme.DIM, no_wrap=True)
     budget = width - indent
@@ -144,15 +144,15 @@ def _detail(route: RouteView, width: int, indent: int) -> Text:
         # line run a clause past the edge of the card.
         return cell_len(out.plain) - indent + cell_len(text) <= budget
 
-    if route.capacity_qps is None:
-        out.append("尚未测得安全 QPS", style=theme.DIM)
+    if route.capacity_qpm is None:
+        out.append("尚未测得安全 QPM", style=theme.DIM)
         return out
 
     out.append("当前 ", style=theme.DIM)
-    out.append("{:.1f}".format(route.current_qps), style=theme.OURS)
+    out.append("{:.1f}".format(route.current_qpm), style=theme.OURS)
     out.append(" · others ", style=theme.DIM)
-    out.append("{:.1f}".format(route.other_qps), style=theme.FOREIGN)
-    clause = " · 最大安全 {:.1f} QPS".format(route.capacity_qps or 0.0)
+    out.append("{:.1f}".format(route.other_qpm), style=theme.FOREIGN)
+    clause = " · 最大安全 {:.1f} QPM".format(route.capacity_qpm or 0.0)
     if room(clause):
         out.append(clause, style=theme.DIM)
 
@@ -173,8 +173,8 @@ def _source_card(group: Group, width: int, detail: bool, pinned: int,
     subtitle = Text()
     subtitle.append("{}/{} 在用".format(group.active, len(group.routes)),
                     style=theme.LABEL if group.active else theme.DIM)
-    if group.capacity_qps:
-        subtitle.append(" · 最大安全 {:.1f} QPS".format(group.capacity_qps),
+    if group.capacity_qpm:
+        subtitle.append(" · 最大安全 {:.1f} QPM".format(group.capacity_qpm),
                         style=theme.DIM)
     if pinned:
         # Sessions carrying encrypted reasoning cannot be moved off the endpoint
@@ -195,7 +195,7 @@ def _source_card(group: Group, width: int, detail: bool, pinned: int,
                        {}, detail)
     return Panel(RichGroup(subtitle, body), title=title, width=width,
                  border_style=theme.severity(
-                     _load_or_none(group.peak_qps_load)),
+                     _load_or_none(group.peak_qpm_load)),
                  padding=(0, 1))
 
 
@@ -217,8 +217,8 @@ def _model_card(group: Group, width: int, detail: bool,
     subtitle.append(" · {} 个源".format(len(group.routes)), style=theme.LABEL)
     if group.faces:
         subtitle.append(" · {}".format("+".join(group.faces)), style=theme.DIM)
-    if group.capacity_qps:
-        subtitle.append(" · 最大安全 {:.1f} QPS".format(group.capacity_qps),
+    if group.capacity_qpm:
+        subtitle.append(" · 最大安全 {:.1f} QPM".format(group.capacity_qpm),
                         style=theme.DIM)
     if group.released:
         subtitle.append(" · {}".format(group.released), style=theme.DIM)
@@ -230,7 +230,7 @@ def _model_card(group: Group, width: int, detail: bool,
                        {}, detail)
     return Panel(RichGroup(subtitle, body), title=title, width=width,
                  border_style=theme.severity(
-                     _load_or_none(group.peak_qps_load)),
+                     _load_or_none(group.peak_qpm_load)),
                  padding=(0, 1))
 
 
@@ -395,12 +395,12 @@ def _event_change(event: dict, width: int) -> Text:
         return out
 
     if event.get("foreign_updated") or event.get("kind") == "foreign":
-        other_qps = event.get("other_qps")
-        capacity_qps = event.get("capacity_qps")
-        if other_qps is not None and capacity_qps:
+        other_qpm = event.get("other_qpm")
+        capacity_qpm = event.get("capacity_qpm")
+        if other_qpm is not None and capacity_qpm:
             out.append("others ", style=theme.DIM)
-            out.append("{:.1f} QPS".format(other_qps), style=theme.FOREIGN)
-            out.append(" / max {:.1f}".format(capacity_qps), style=theme.DIM)
+            out.append("{:.1f} QPM".format(other_qpm), style=theme.FOREIGN)
+            out.append(" / max {:.1f}".format(capacity_qpm), style=theme.DIM)
             return out
         before, after = event.get("foreign_before"), event.get("foreign_after")
         if before is not None and after is not None:

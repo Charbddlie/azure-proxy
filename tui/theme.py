@@ -32,9 +32,9 @@ LABEL = "#7c8894"           # field names, units
 DIM = "#4e565f"             # things present but not currently interesting
 TEXT = "#c3cad2"            # ordinary values
 
-OURS = "#7fa08a"            # sage: this proxy's current QPS
-FOREIGN = "#b39a72"         # tan: outside QPS observed at the last throttle
-FREE = "#3b4149"            # the rest of the learned safe QPS
+OURS = "#7fa08a"            # sage: this proxy's current QPM
+FOREIGN = "#b39a72"         # tan: outside QPM observed at the last throttle
+FREE = "#3b4149"            # the rest of the learned safe QPM
 
 OK = "#86a98e"
 WARN = "#c2a06a"            # muted amber

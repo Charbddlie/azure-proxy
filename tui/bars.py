@@ -1,12 +1,12 @@
-"""The capacity bar: learned safe QPS and who is spending it.
+"""The capacity bar: learned safe QPM and who is spending it.
 
     ███▓▓▒▒▚░░░░····················
     └── ours ──┘└frn┘└──── free ────┘
 
-The ceiling is the largest QPS this proxy has completed without a rate limit.
+The ceiling is the largest QPM this proxy has completed without a rate limit.
 It only grows and survives restarts. If a later limit arrives below that value,
-the difference is concurrent traffic from others. The bar shows current QPS,
-that observed outside QPS, and the remaining part of the learned maximum.
+the difference is concurrent traffic from others. The bar shows current QPM,
+that observed outside QPM, and the remaining part of the learned maximum.
 
 The `ours` part is subdivided by face — chat and Responses, streamed or not,
 and the images face — in the same colour, because they are slices of one number
@@ -33,7 +33,7 @@ def capacity_bar(width: int, by_face: Optional[Dict[str, float]],
                  foreign: float = 0.0) -> Text:
     """A stacked bar `width` cells wide. Segments sum to exactly `width`.
 
-    `by_face` is /routes' `our_load_by_face`, or None when no safe QPS has been
+    `by_face` is /routes' `our_load_by_face`, or None when no safe QPM has been
     learned. `foreign` is `foreign_load`. The total this proxy is using is not a
     separate argument: it is the sum of the faces, which /routes builds to
     equal `our_load` exactly. Passing both would be passing the same number
@@ -94,7 +94,7 @@ def legend() -> Text:
     out.append(theme.FREE_GLYPH, style=theme.FREE)
     out.append("available ", style=theme.DIM)
     out.append(theme.UNKNOWN_GLYPH, style=theme.DIM)
-    out.append("no safe QPS yet", style=theme.DIM)
+    out.append("no safe QPM yet", style=theme.DIM)
     return out
 
 

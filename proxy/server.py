@@ -286,7 +286,7 @@ class Config:
             b.get("demote_recovery_halflife_seconds", 30))
         self.spill_threshold = float(b.get("spill_threshold", 0.70))
         self.load_window = float(b.get("load_window_seconds", 60))
-        self.qps_window = max(0.1, float(b.get("qps_window_seconds", 1.0)))
+        self.qpm_window = max(1.0, float(b.get("qpm_window_seconds", 60.0)))
         capacity_file = b.get("capacity_state_file", "runtime/capacity.json")
         self.capacity_state_file = os.path.expanduser(str(capacity_file))
         if not os.path.isabs(self.capacity_state_file):
@@ -545,8 +545,8 @@ class RouteState:
                  "penalty", "penalty_until", "penalty_at", "attempts", "ok",
                  "rate_limited", "errors", "last_status", "sent",
                  "tokens_per_char", "token_samples",
-                 "safe_qps", "other_qps", "qps_samples",
-                 "last_dispatch_qps",
+                 "safe_qpm", "other_qpm", "qpm_samples",
+                 "last_dispatch_qpm",
                  "foreign", "foreign_at", "foreign_hold_until",
                  "foreign_samples", "foreign_our_load")
 
@@ -586,11 +586,11 @@ class RouteState:
         # that instant was safe, so the largest such observation is a lower
         # bound on the route's capacity. It only grows and is persisted by the
         # tracker. A throttle below that bound exposes concurrent traffic from
-        # other users: safe_qps - our_qps.
-        self.safe_qps = 0.0
-        self.other_qps = 0.0
-        self.qps_samples = 0
-        self.last_dispatch_qps = 0.0
+        # other users: safe_qpm - our_qpm.
+        self.safe_qpm = 0.0
+        self.other_qpm = 0.0
+        self.qpm_samples = 0
+        self.last_dispatch_qpm = 0.0
 
         # What everyone ELSE is estimated to be taking from this deployment, as
         # a fraction of its ceiling. Only ever learned at the moment of a
@@ -663,13 +663,16 @@ class QuotaTracker:
 
     def __init__(self, config: Config):
         self.cfg = config
-        self.qps_window = max(0.1, float(getattr(config, "qps_window", 1.0)))
+        self.qpm_window = max(1.0, float(getattr(config, "qpm_window", 60.0)))
         self.capacity_state_file = getattr(config, "capacity_state_file", None)
         self.states: Dict[str, RouteState] = {}
+        self._legacy_qps_capacity = False
         self._saved_capacity = self._load_capacity()
+        if self._legacy_qps_capacity:
+            self._save_capacity()
 
     def _load_capacity(self) -> Dict[str, float]:
-        """Load monotonic safe-QPS observations from the previous process."""
+        """Load monotonic safe-QPM observations from the previous process."""
         if not self.capacity_state_file:
             return {}
         try:
@@ -680,6 +683,12 @@ class QuotaTracker:
         values = doc.get("routes") if isinstance(doc, dict) else None
         if not isinstance(values, dict):
             return {}
+        # b8af145 stored QPS in the same file. Convert that one published
+        # format once so restarting after this upgrade preserves the learned
+        # capacity in the new unit.
+        self._legacy_qps_capacity = (
+            "qps_window_seconds" in doc and "qpm_window_seconds" not in doc)
+        scale = 60.0 if self._legacy_qps_capacity else 1.0
         out = {}
         for key, value in values.items():
             try:
@@ -687,7 +696,7 @@ class QuotaTracker:
             except (TypeError, ValueError):
                 continue
             if value > 0:
-                out[str(key)] = value
+                out[str(key)] = value * scale
         return out
 
     def _save_capacity(self) -> None:
@@ -702,7 +711,7 @@ class QuotaTracker:
             with open(temporary, "w") as f:
                 json.dump({"updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                        time.gmtime()),
-                           "qps_window_seconds": self.qps_window,
+                           "qpm_window_seconds": self.qpm_window,
                            "routes": dict(sorted(self._saved_capacity.items()))},
                           f, indent=2, sort_keys=True)
                 f.write("\n")
@@ -724,7 +733,7 @@ class QuotaTracker:
         st = self.states.get(key)
         if st is None:
             st = self.states[key] = RouteState(key)
-            st.safe_qps = self._saved_capacity.get(key, 0.0)
+            st.safe_qpm = self._saved_capacity.get(key, 0.0)
         return st
 
     def observed(self, route: Route, status: int, headers) -> None:
@@ -776,53 +785,53 @@ class QuotaTracker:
         """Record a dispatch. Returns the ledger entry, for `settle`."""
         now = time.time()
         st = self.state(route)
-        st.prune(now, max(self.cfg.load_window, self.qps_window))
-        cutoff = now - self.qps_window
+        st.prune(now, max(self.cfg.load_window, self.qpm_window))
+        cutoff = now - self.qpm_window
         recent = sum(1 for item in st.sent if item[0] >= cutoff)
-        dispatch_qps = (recent + 1) / self.qps_window
-        entry = [now, float(tokens), face, dispatch_qps]
+        dispatch_qpm = (recent + 1) * 60.0 / self.qpm_window
+        entry = [now, float(tokens), face, dispatch_qpm]
         st.sent.append(entry)
-        st.last_dispatch_qps = dispatch_qps
+        st.last_dispatch_qpm = dispatch_qpm
         return entry
 
-    def qps(self, st: RouteState, now: float) -> float:
-        """Requests dispatched during the short QPS observation window."""
-        cutoff = now - self.qps_window
+    def qpm(self, st: RouteState, now: float) -> float:
+        """Requests per minute over the configured rolling window."""
+        cutoff = now - self.qpm_window
         return sum(1 for item in st.sent if item[0] >= cutoff) \
-            / self.qps_window
+            * 60.0 / self.qpm_window
 
-    def qps_by_face(self, st: RouteState, now: float) -> Dict[str, float]:
-        cutoff = now - self.qps_window
+    def qpm_by_face(self, st: RouteState, now: float) -> Dict[str, float]:
+        cutoff = now - self.qpm_window
         counts = [0] * len(FACES)
         for item in st.sent:
             if item[0] >= cutoff:
                 counts[item[2] if len(item) > 2 else 0] += 1
-        return {name: count / self.qps_window
+        return {name: count * 60.0 / self.qpm_window
                 for name, count in zip(FACES, counts)}
 
     def note_success(self, route: Route,
                      entry: Optional[List[float]]) -> None:
-        """Raise the saved capacity to the largest proven-safe dispatch QPS."""
+        """Raise the saved capacity to the largest proven-safe dispatch QPM."""
         st = self.state(route)
         observed = (float(entry[3]) if entry is not None and len(entry) > 3
-                    else self.qps(st, time.time()))
+                    else self.qpm(st, time.time()))
         if observed <= 0:
             return
-        st.qps_samples += 1
-        if observed > st.safe_qps:
-            before = st.safe_qps
-            st.safe_qps = observed
+        st.qpm_samples += 1
+        if observed > st.safe_qpm:
+            before = st.safe_qpm
+            st.safe_qpm = observed
             self._saved_capacity[st.key] = observed
             self._save_capacity()
             _ev("capacity", "info",
-                "%s raised learned capacity from %.2f to %.2f QPS",
+                "%s raised learned capacity from %.2f to %.2f QPM",
                 route, before, observed, route=route,
                 capacity_before=round(before, 4),
                 capacity_after=round(observed, 4))
         # A success at this rate proves a previous `others` observation can no
         # longer make the route exceed its learned capacity.
-        st.other_qps = min(st.other_qps,
-                           max(0.0, st.safe_qps - observed))
+        st.other_qpm = min(st.other_qpm,
+                           max(0.0, st.safe_qpm - observed))
 
     def settle(self, route: Route, entry: Optional[List[float]],
                request_bytes: int, total_tokens: Optional[int]) -> None:
@@ -982,7 +991,7 @@ class QuotaTracker:
 
         Reclaimed linearly since the last throttle, after that throttle's
         Retry-After has passed. This remains an internal routing signal; the
-        dashboard reports the separate safe-QPS observation.
+        dashboard reports the separate safe-QPM observation.
         """
         if not self.cfg.foreign_enabled or st.foreign <= 0.0:
             return 0.0
@@ -1007,15 +1016,15 @@ class QuotaTracker:
         return ours + self.foreign_load(st, now)
 
     def note_foreign(self, route: Route, retry_after=None,
-                     observed_qps: Optional[float] = None) -> Optional[dict]:
-        """At a throttle, capacity minus our QPS is concurrent outside QPS."""
+                     observed_qpm: Optional[float] = None) -> Optional[dict]:
+        """At a throttle, capacity minus our QPM is concurrent outside QPM."""
         now = time.time()
         st = self.state(route)
-        our_qps = (observed_qps if observed_qps is not None
-                   else st.last_dispatch_qps or self.qps(st, now))
-        before_qps = st.other_qps
-        outside_qps = max(0.0, st.safe_qps - our_qps)
-        st.other_qps = outside_qps
+        our_qpm = (observed_qpm if observed_qpm is not None
+                   else st.last_dispatch_qpm or self.qpm(st, now))
+        before_qpm = st.other_qpm
+        outside_qpm = max(0.0, st.safe_qpm - our_qpm)
+        st.other_qpm = outside_qpm
 
         ours = self.load(st, now)
         held = self.foreign_load(st, now)
@@ -1028,24 +1037,24 @@ class QuotaTracker:
         st.foreign_samples += 1
         st.foreign_our_load = ours
         moved = {"our_load": (round(ours, 4) if ours is not None else None),
-                 "our_qps": round(our_qps, 4),
-                 "capacity_qps": (round(st.safe_qps, 4)
-                                  if st.safe_qps > 0 else None),
-                 "other_qps": round(outside_qps, 4),
+                 "our_qpm": round(our_qpm, 4),
+                 "capacity_qpm": (round(st.safe_qpm, 4)
+                                  if st.safe_qpm > 0 else None),
+                 "other_qpm": round(outside_qpm, 4),
                  "foreign_before": round(held, 4),
                  "foreign_after": round(st.foreign, 4),
                  "foreign_samples": st.foreign_samples,
                  "foreign_hold_seconds": round(max(0.0, park or 0.0), 1)}
-        if outside_qps > 0:
+        if outside_qpm > 0:
             _ev("foreign", "info",
-                "%s throttled at %.2f QPS below its %.2f QPS learned maximum; "
-                "the %.2f QPS difference is others",
-                route, our_qps, st.safe_qps, outside_qps,
+                "%s throttled at %.2f QPM below its %.2f QPM learned maximum; "
+                "the %.2f QPM difference is others",
+                route, our_qpm, st.safe_qpm, outside_qpm,
                 route=route, **moved)
-        return moved if ours is not None or st.safe_qps > 0 else None
+        return moved if ours is not None or st.safe_qpm > 0 else None
 
     def demote(self, route: Route, reason: str, retry_after=None,
-               observed_qps: Optional[float] = None) -> None:
+               observed_qpm: Optional[float] = None) -> None:
         """Temporarily send less traffic here.
 
         Not just "skip it for this one request" — a 429 says the deployment is
@@ -1079,7 +1088,7 @@ class QuotaTracker:
             # connection reset means the endpoint is unwell, not that its quota
             # is spoken for, and inferring a foreign share from one would
             # permanently shrink a route for being briefly broken.
-            moved = self.note_foreign(route, retry_after, observed_qps)
+            moved = self.note_foreign(route, retry_after, observed_qpm)
         else:
             st.errors += 1
         st.last_status = reason
@@ -1136,7 +1145,7 @@ class QuotaTracker:
         so which one is used has to be decided rather than assumed.
 
         This value remains the routing signal. The dashboard uses the separate,
-        persisted safe-QPS maximum learned from successful traffic.
+        persisted safe-QPM maximum learned from successful traffic.
         """
         return st.limit_tokens or st.limit_requests or None
 
@@ -1370,8 +1379,8 @@ class QuotaTracker:
                 requests, tokens = st.in_window(now, self.cfg.load_window)
                 by_face = st.in_window_by_face(now, self.cfg.load_window)
                 load_by_face = self.load_by_face(st, now)
-                current_qps = self.qps(st, now)
-                qps_by_face = self.qps_by_face(st, now)
+                current_qpm = self.qpm(st, now)
+                qpm_by_face = self.qpm_by_face(st, now)
                 seen[st.key] = {
                     "endpoint": r.endpoint,
                     "deployment": r.deployment,
@@ -1384,18 +1393,18 @@ class QuotaTracker:
                     # means the quota moved since the last probe.
                     "capacity_requests": r.capacity_requests,
                     "capacity_tokens": r.capacity_tokens,
-                    # Runtime capacity is learned from traffic. The largest QPS
+                    # Runtime capacity is learned from traffic. The largest QPM
                     # that completed without a limit is monotonic and persisted;
                     # a later throttle below it exposes the difference as other
-                    # users' concurrent QPS.
-                    "current_qps": round(current_qps, 4),
-                    "capacity_qps": (round(st.safe_qps, 4)
-                                     if st.safe_qps > 0 else None),
-                    "other_qps": round(st.other_qps, 4),
-                    "qps_window_seconds": self.qps_window,
-                    "qps_samples": st.qps_samples,
-                    "qps_by_face": {k: round(v, 4)
-                                    for k, v in qps_by_face.items()},
+                    # users' concurrent QPM.
+                    "current_qpm": round(current_qpm, 4),
+                    "capacity_qpm": (round(st.safe_qpm, 4)
+                                     if st.safe_qpm > 0 else None),
+                    "other_qpm": round(st.other_qpm, 4),
+                    "qpm_window_seconds": self.qpm_window,
+                    "qpm_samples": st.qpm_samples,
+                    "qpm_by_face": {k: round(v, 4)
+                                    for k, v in qpm_by_face.items()},
                     "limit_requests": st.limit_requests,
                     "limit_tokens": st.limit_tokens,
                     # What THIS proxy has sent inside the load window, which is
@@ -1475,7 +1484,7 @@ class QuotaTracker:
                 }
         return {"balance": self.cfg.balance,
                 "load_window_seconds": self.cfg.load_window,
-                "qps_window_seconds": self.qps_window,
+                "qpm_window_seconds": self.qpm_window,
                 # The canonical order of the four faces, so a reader stacking
                 # them does not have to hard-code it and drift.
                 "faces": list(FACES),

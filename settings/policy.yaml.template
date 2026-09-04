@@ -154,11 +154,11 @@ routing:
     # ceiling it is divided by are quoted over the same period.
     load_window_seconds: 60
 
-    # Capacity is learned from real traffic in a short rolling window. Each
-    # successful request proves the dispatch QPS at that instant was safe; the
+    # Capacity is learned from real traffic in a rolling one-minute window. Each
+    # successful request proves the dispatch QPM at that instant was safe; the
     # largest safe observation only increases and is saved immediately. A
-    # throttle below that maximum attributes the QPS difference to others.
-    qps_window_seconds: 1.0
+    # throttle below that maximum attributes the QPM difference to others.
+    qpm_window_seconds: 60
     capacity_state_file: runtime/capacity.json
 
     # A request's token cost is charged when it is dispatched, because that is

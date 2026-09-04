@@ -68,35 +68,35 @@ class RouteView:
         return self.data.get("foreign_load") or 0.0
 
     @property
-    def current_qps(self) -> float:
-        return self.data.get("current_qps") or 0.0
+    def current_qpm(self) -> float:
+        return self.data.get("current_qpm") or 0.0
 
     @property
-    def capacity_qps(self) -> Optional[float]:
-        return self.data.get("capacity_qps")
+    def capacity_qpm(self) -> Optional[float]:
+        return self.data.get("capacity_qpm")
 
     @property
-    def other_qps(self) -> float:
-        return self.data.get("other_qps") or 0.0
+    def other_qpm(self) -> float:
+        return self.data.get("other_qpm") or 0.0
 
     @property
-    def qps_load(self) -> Optional[float]:
-        if not self.capacity_qps:
+    def qpm_load(self) -> Optional[float]:
+        if not self.capacity_qpm:
             return None
-        return (self.current_qps + self.other_qps) / self.capacity_qps
+        return (self.current_qpm + self.other_qpm) / self.capacity_qpm
 
     @property
-    def qps_other_load(self) -> float:
-        if not self.capacity_qps:
+    def qpm_other_load(self) -> float:
+        if not self.capacity_qpm:
             return 0.0
-        return self.other_qps / self.capacity_qps
+        return self.other_qpm / self.capacity_qpm
 
     @property
-    def qps_load_by_face(self) -> Optional[Dict[str, float]]:
-        if not self.capacity_qps:
+    def qpm_load_by_face(self) -> Optional[Dict[str, float]]:
+        if not self.capacity_qpm:
             return None
-        values = self.data.get("qps_by_face") or {}
-        return {name: (values.get(name) or 0.0) / self.capacity_qps
+        values = self.data.get("qpm_by_face") or {}
+        return {name: (values.get(name) or 0.0) / self.capacity_qpm
                 for name in values}
 
     @property
@@ -126,8 +126,8 @@ class RouteView:
 
     @property
     def busy_load(self) -> float:
-        """Current QPS for activity ordering."""
-        return self.current_qps
+        """Current QPM for activity ordering."""
+        return self.current_qpm
 
     @property
     def released(self) -> Optional[str]:
@@ -175,8 +175,8 @@ class Group:
         return sum(r.data.get("capacity_requests") or 0.0 for r in self.routes)
 
     @property
-    def capacity_qps(self) -> float:
-        return sum(r.capacity_qps or 0.0 for r in self.routes)
+    def capacity_qpm(self) -> float:
+        return sum(r.capacity_qpm or 0.0 for r in self.routes)
 
     @property
     def sent_requests(self) -> int:
@@ -210,8 +210,8 @@ class Group:
         return max([r.busy_load for r in self.routes] or [0.0])
 
     @property
-    def peak_qps_load(self) -> float:
-        values = [r.qps_load for r in self.routes if r.qps_load is not None]
+    def peak_qpm_load(self) -> float:
+        values = [r.qpm_load for r in self.routes if r.qpm_load is not None]
         return max(values or [-1.0])
 
     @property
@@ -325,7 +325,7 @@ class Snapshot:
 
         self.balance = routes_doc.get("balance") or self.health.get("balance")
         self.load_window = routes_doc.get("load_window_seconds")
-        self.qps_window = routes_doc.get("qps_window_seconds")
+        self.qpm_window = routes_doc.get("qpm_window_seconds")
         self.affinity = (routes_doc.get("session_affinity")
                          or self.health.get("session_affinity") or {})
         self.faces = routes_doc.get("faces") or []
@@ -438,7 +438,7 @@ class Snapshot:
             return sorted(groups, key=lambda g: g.name)
         if mode == "capacity":
             return sorted(groups,
-                          key=lambda g: (-g.capacity_qps, g.name))
+                          key=lambda g: (-g.capacity_qpm, g.name))
         # Activity first — this is a dashboard, and the thing that is moving is
         # the thing to look at. `recency_key` settles everything below that:
         # newest release, then strongest variant, then name. Which matters more

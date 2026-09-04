@@ -1709,7 +1709,7 @@ def route_state(proxy, name="alpha"):
     return report["routes"][name + "/" + DEPLOYMENT]
 
 
-def test_safe_qps_capacity_only_grows_and_survives_restart():
+def test_safe_qpm_capacity_only_grows_and_survives_restart():
     """Successful dispatch rates raise a monotonic, atomically saved maximum."""
     sys.path.insert(0, ROOT)
     import logging
@@ -1720,7 +1720,7 @@ def test_safe_qps_capacity_only_grows_and_survives_restart():
     try:
         class Cfg:
             capacity_state_file = os.path.join(directory, "capacity.json")
-            qps_window = 1.0
+            qpm_window = 60.0
             load_window = 60
             chars_per_token = 4
             foreign_enabled = False
@@ -1732,14 +1732,14 @@ def test_safe_qps_capacity_only_grows_and_survives_restart():
         first = tracker.charge(route, 1)
         second = tracker.charge(route, 1)
         tracker.note_success(route, second)
-        assert tracker.state(route).safe_qps == 2.0
+        assert tracker.state(route).safe_qpm == 2.0
 
         # A later, lower successful observation cannot lower the maximum.
         tracker.note_success(route, first)
-        assert tracker.state(route).safe_qps == 2.0
+        assert tracker.state(route).safe_qpm == 2.0
 
         restored = QuotaTracker(Cfg())
-        assert restored.state(route).safe_qps == 2.0
+        assert restored.state(route).safe_qpm == 2.0
         with open(Cfg.capacity_state_file) as f:
             saved = json.load(f)
         assert saved["routes"][str(route)] == 2.0, saved
@@ -1747,7 +1747,7 @@ def test_safe_qps_capacity_only_grows_and_survives_restart():
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def test_throttle_below_safe_qps_attributes_the_difference_to_others():
+def test_throttle_below_safe_qpm_attributes_the_difference_to_others():
     sys.path.insert(0, ROOT)
     import logging
     from proxy.server import QuotaTracker, Route
@@ -1755,7 +1755,7 @@ def test_throttle_below_safe_qps_attributes_the_difference_to_others():
 
     class Cfg:
         capacity_state_file = None
-        qps_window = 1.0
+        qpm_window = 60.0
         load_window = 60
         chars_per_token = 4
         foreign_enabled = False
@@ -1764,10 +1764,43 @@ def test_throttle_below_safe_qps_attributes_the_difference_to_others():
     route = Route("alpha", "http://x/", "v", "deployment",
                   "max_completion_tokens", 0)
     tracker = QuotaTracker(Cfg())
-    tracker.state(route).safe_qps = 7.0
-    moved = tracker.note_foreign(route, observed_qps=3.0)
-    assert tracker.state(route).other_qps == 4.0
-    assert moved["other_qps"] == 4.0, moved
+    tracker.state(route).safe_qpm = 7.0
+    moved = tracker.note_foreign(route, observed_qpm=3.0)
+    assert tracker.state(route).other_qpm == 4.0
+    assert moved["other_qpm"] == 4.0, moved
+
+
+def test_legacy_qps_capacity_is_converted_to_qpm():
+    sys.path.insert(0, ROOT)
+    import logging
+    from proxy.server import QuotaTracker, Route
+    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
+
+    directory = tempfile.mkdtemp(prefix="azure-proxy-capacity-migrate-")
+    try:
+        path = os.path.join(directory, "capacity.json")
+        _dump(path, {"qps_window_seconds": 1.0,
+                     "routes": {"alpha/deployment": 2.0}})
+
+        class Cfg:
+            capacity_state_file = path
+            qpm_window = 60.0
+            load_window = 60
+            chars_per_token = 4
+            foreign_enabled = False
+            foreign_reclaim = 0.0
+
+        route = Route("alpha", "http://x/", "v", "deployment",
+                      "max_completion_tokens", 0)
+        tracker = QuotaTracker(Cfg())
+        assert tracker.state(route).safe_qpm == 120.0
+        with open(path) as f:
+            saved = json.load(f)
+        assert "qps_window_seconds" not in saved, saved
+        assert saved["qpm_window_seconds"] == 60.0, saved
+        assert saved["routes"][str(route)] == 120.0, saved
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def test_foreign_load_is_estimated_from_a_throttle_at_low_load():
