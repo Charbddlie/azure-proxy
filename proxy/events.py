@@ -76,6 +76,51 @@ PROBLEM_KINDS = frozenset(
      "unpinned", "upstream_error"})
 
 LEVELS = ("debug", "info", "warning", "error")
+LEVEL_RANK = {name: index for index, name in enumerate(LEVELS)}
+EVENT_LEVELS = {
+    "request": "debug",
+    "boot": "info", "response": "info", "capacity": "info", "foreign": "info",
+    "held": "info", "pin": "info", "inherited": "info", "image_tool": "info", "token": "info",
+    "throttle": "warning", "demote": "warning", "failover": "warning",
+    "stripped": "warning", "unpinned": "warning",
+    "timeout": "error", "exhausted": "error", "upstream_error": "error",
+}
+
+
+def event_level(kind: str, level: str = "info", fields=None) -> str:
+    """Canonical severity for new observations and older dashboard snapshots.
+
+    Rate limiting is a recoverable upstream refusal. A timeout means an I/O
+    deadline expired, so its severity is ERROR independently of quota state.
+    Explicit warnings/errors on otherwise routine events remain visible.
+    """
+    fields = fields or {}
+    level = str(level or "info").lower()
+    level = {"warn": "warning", "critical": "error", "fatal": "error"}.get(level, level)
+    level = level if level in LEVEL_RANK else "info"
+    base = EVENT_LEVELS.get(kind, level)
+    if kind == "request" and LEVEL_RANK[level] < LEVEL_RANK["warning"]:
+        return "debug"
+    if kind == "upstream_error" and fields.get("error_code") in (
+            "rate_limit_exceeded", "too_many_requests"):
+        return "warning"
+    if kind == "response":
+        try:
+            status = int(fields.get("status", 0))
+        except (TypeError, ValueError):
+            status = 0
+        if fields.get("broke") or status >= 500:
+            base = "error"
+        elif status >= 400:
+            base = "warning"
+    if kind == "token" and fields.get("ok") is False:
+        remaining = fields.get("expires_in_seconds", 0)
+        base = "warning" if isinstance(remaining, (int, float)) and remaining > 0 else "error"
+    return max((base, level), key=LEVEL_RANK.__getitem__)
+
+
+def normalized_event(event: dict) -> dict:
+    return dict(event, level=event_level(event.get("kind", ""), event.get("level", "info"), event))
 
 
 class EventLog:
@@ -120,7 +165,7 @@ class EventLog:
                     fields.setdefault("endpoint", endpoint)
                     fields.setdefault("deployment", deployment)
             event = {"seq": next(self._seq), "at": time.time(),
-                     "kind": kind, "level": level, "message": message}
+                     "kind": kind, "level": event_level(kind, level, fields), "message": message}
             event.update(fields)
             with self._lock:
                 self._events.append(event)

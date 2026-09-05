@@ -7,6 +7,7 @@ import uuid
 
 from proxy.bridge import SNAPSHOT_FIELDS, decode_snapshot, route_record
 from proxy.config import Config, Route, TABLES
+from proxy.events import event_level, normalized_event
 from proxy.state import SCHEMA_VERSION, Store
 from .quota import QuotaTracker, RouteState
 
@@ -35,6 +36,7 @@ class Engine:
         self.published_at = 0.0
 
     def event(self, kind, level, message, *args, **fields):
+        level = event_level(kind, level, fields)
         self.event_seq += 1
         route = fields.get("route")
         if route is not None:
@@ -51,7 +53,7 @@ class Engine:
             raise ValueError("incompatible routing checkpoint")
         self.cursor = saved["cursor"]
         self.sessions = saved["sessions"]
-        self.events.extend(saved["events"])
+        self.events.extend(normalized_event(event) for event in saved["events"])
         self.event_seq = saved["event_seq"]
         self.catalog = saved.get("catalog", {})
         self.quota._saved_capacity = saved["capacity"]

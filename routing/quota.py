@@ -10,11 +10,13 @@ import time
 from typing import Deque, Dict, List, Optional, Tuple
 
 from proxy.config import Config, Route, FACES, _as_number
+from proxy.events import event_level
 
 log = logging.getLogger("azure-proxy.routing")
 
 
 def _ev(kind, level, msg, *args, **fields):
+    level = event_level(kind, level, fields)
     log.log(getattr(logging, level.upper(), logging.INFO), msg, *args)
 
 

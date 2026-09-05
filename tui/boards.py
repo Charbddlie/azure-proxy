@@ -22,6 +22,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from proxy.events import LEVELS, LEVEL_RANK, PROBLEM_KINDS, event_level
+
 from . import theme
 from .bars import capacity_bar, rpm_capacity
 from .layout import column_widths, rows, truncate
@@ -310,21 +312,18 @@ def render_groups(groups: List[Group], width: int, height: int, offset: int,
 # events
 # --------------------------------------------------------------------------
 
-EVENT_FILTERS = ("全部", "问题", "他人流量")
-# Kept in step with proxy/events.py::PROBLEM_KINDS by hand, because the
-# dashboard talks to the proxy over HTTP and imports nothing from it. It had
-# already drifted once: `unpinned` and `upstream_error` were added on the
-# server and the filter here went on hiding exactly the two kinds that say a
-# turn was refused for state it was carrying.
-PROBLEM_KINDS = frozenset(
-    {"throttle", "demote", "failover", "timeout", "exhausted", "stripped",
-     "unpinned", "upstream_error"})
+EVENT_FILTERS = ("DEBUG+", "INFO+", "WARNING+", "ERROR")
+DEFAULT_EVENT_FILTER = LEVEL_RANK["warning"]
+EVENT_KIND_FILTERS = ("全部类型", "问题类型", "他人流量")
 
 
-def filter_events(events: List[dict], mode: int) -> List[dict]:
-    if mode == 1:
+def filter_events(events: List[dict], mode: int, kind_mode: int = 0) -> List[dict]:
+    threshold = LEVEL_RANK[LEVELS[mode]]
+    events = [e for e in events if LEVEL_RANK[event_level(
+        e.get("kind", ""), e.get("level", "info"), e)] >= threshold]
+    if kind_mode == 1:
         return [e for e in events if e.get("kind") in PROBLEM_KINDS]
-    if mode == 2:
+    if kind_mode == 2:
         # The only events that carry a revised estimate of what other tenants
         # hold. `foreign` events always do; a throttle does when it moved one.
         return [e for e in events
@@ -333,7 +332,7 @@ def filter_events(events: List[dict], mode: int) -> List[dict]:
 
 
 def render_events(events: List[dict], width: int, height: int, offset: int,
-                  filter_mode: int, dropped: bool):
+                  filter_mode: int, dropped: bool, kind_mode: int = 0):
     """Newest first. Returns (renderable, total lines available).
 
     Newest first rather than a tailing log, because this is read to answer
@@ -347,14 +346,19 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
     it is the most important thing on the line: the message says what happened,
     this says what the proxy now believes differently.
     """
-    shown = list(reversed(filter_events(events, filter_mode)))
+    shown = list(reversed(filter_events(events, filter_mode, kind_mode)))
+
+    if not shown and not dropped:
+        return Text("没有匹配事件（f 切换等级，t 切换类型）", style=theme.DIM), 0
 
     change_width = 26 if width >= 100 else 0
     where_width = min(34, max(12, width // 4))
+    level_width = 5 if width >= 90 else 1
 
     table = Table.grid(padding=(0, 1), expand=True)
     table.add_column(width=8, no_wrap=True)              # time
     table.add_column(width=1, no_wrap=True)              # mark
+    table.add_column(width=level_width, no_wrap=True)    # severity
     table.add_column(width=9, no_wrap=True)              # kind
     table.add_column(width=where_width, no_wrap=True)    # where
     table.add_column(ratio=1, no_wrap=True)              # what happened
@@ -362,17 +366,21 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
         table.add_column(width=change_width, no_wrap=True)   # what changed
 
     def row(*cells):
-        table.add_row(*(cells if change_width else cells[:5]))
+        table.add_row(*(cells if change_width else cells[:6]))
 
     if dropped:
         row(Text(""), Text("!", style=theme.WARN),
+            Text("WARN" if level_width == 5 else "W", style=theme.WARN),
             Text("gap", style=theme.WARN), Text(""),
             Text("events were dropped: the ring turned over faster than this "
                  "reader read it", style=theme.WARN), Text(""))
 
     for event in shown[offset:offset + max(1, height)]:
         kind = event.get("kind", "?")
-        mark, colour = theme.EVENT_STYLE.get(kind, ("·", theme.DIM))
+        mark, _ = theme.EVENT_STYLE.get(kind, ("·", theme.DIM))
+        level = event_level(kind, event.get("level", "info"), event)
+        colour = _level_style(level)
+        label = "WARN" if level == "warning" else level.upper()
         stamp = time.strftime("%H:%M:%S", time.localtime(event.get("at", 0)))
         where = event.get("route") or event.get("endpoint") or ""
         model = event.get("model")
@@ -380,6 +388,7 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
             where = "{} {}".format(where, model).strip()
         row(Text(stamp, style=theme.DIM),
             Text(mark, style=colour),
+            Text(label if level_width == 5 else label[0], style=colour),
             Text(kind, style=colour),
             Text(truncate(where, where_width), style=theme.TEXT),
             _event_message(event),
@@ -387,11 +396,15 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
     return table, len(shown)
 
 
+def _level_style(level: str) -> str:
+    return {"debug": theme.DIM, "info": theme.LABEL,
+            "warning": theme.WARN, "error": theme.CRIT}[level]
+
+
 def _event_message(event: dict) -> Text:
     """What happened, in the proxy's own words."""
-    level = event.get("level", "info")
-    style = (theme.CRIT if level == "error"
-             else theme.WARN if level == "warning" else theme.LABEL)
+    level = event_level(event.get("kind", ""), event.get("level", "info"), event)
+    style = _level_style(level)
     return Text(event.get("message", ""), style=style,
                 overflow="ellipsis", no_wrap=True)
 

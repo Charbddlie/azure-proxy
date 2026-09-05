@@ -24,7 +24,7 @@ from azure.identity import AzureCliCredential
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .events import PROBLEM_KINDS, EventLog
+from .events import PROBLEM_KINDS, EventLog, event_level
 from .config import Config, Route, _as_number
 from .bridge import (Attempt, ConfigView, ServingBridge, SnapshotMiddleware,
                      Telemetry)
@@ -59,6 +59,7 @@ def _ev(kind: str, level: str, msg: str, *args, **fields) -> None:
     record that only exists at debug level is a dashboard that goes blank when
     someone quietens the log.
     """
+    level = event_level(kind, level, fields)
     log.log(_EV_LEVELS.get(level, logging.INFO), msg, *args)
     try:
         message = msg % args if args else msg
@@ -1568,6 +1569,10 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                 sent += len(chunk)
                 yield chunk
             drained = True
+        except httpx.TimeoutException as e:
+            _record_timeout(route, entry, face, model, e, started,
+                            in_stream=True, status=resp.status_code, sent=sent)
+            raise
         except httpx.HTTPError as e:
             # No failover once the client has bytes: a second attempt would
             # splice two streams together in its parser. The break is passed on
@@ -1645,6 +1650,20 @@ def _error(status: int, message: str, code: str) -> JSONResponse:
         status_code=status,
         content={"error": {"message": message, "type": "azure_proxy_error",
                            "code": code}})
+
+
+def _record_timeout(route, entry, face, model, error, started,
+                    in_stream=False, status=504, sent=0):
+    """Record the I/O failure separately from a quota refusal."""
+    telemetry.note_timeout(route, entry)
+    limit = 15.0 if isinstance(error, httpx.ConnectTimeout) else cfg.timeout
+    elapsed = time.monotonic() - started
+    _ev("timeout", "error", "%s model=%s %s on %s after %.1fs (I/O limit %ss)",
+        face, model, type(error).__name__, route, elapsed, limit,
+        route=route, face=face, model=model, timeout_type=type(error).__name__,
+        seconds=round(elapsed, 3), timeout_seconds=limit, status=status,
+        in_stream=in_stream, bytes=sent)
+    return limit
 
 
 # --------------------------------------------------------------------------
@@ -2058,6 +2077,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                     route=route, face=face, model=requested, stripped=dropped)
         payload["model"] = route.deployment
         entry = telemetry.charge(route, request_bytes, ledger_face, model=requested)
+        resp = None
         try:
             log.debug("%s model=%s attempt %d/%d on %s",
                       face, requested, i + 1, len(attempts), route)
@@ -2092,21 +2112,16 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                     "POST", target_of(route), headers=attempt_headers,
                     **({"content": raw} if raw is not None else {"json": payload}))
                 resp = await client.send(upstream, stream=True)
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as e:
                 # A slow reasoning call and a hung one are indistinguishable here.
                 # Retrying would pay twice for the same prompt while the original
                 # may still be running, so the caller decides instead. For the same
                 # reason this does not demote the route: slow is not broken, and a
                 # long reasoning turn must not cost an endpoint its share.
-                telemetry.note_timeout(route, entry)
+                timeout_limit = _record_timeout(route, entry, face, requested, e, started)
                 if not cfg.retry_on_timeout:
-                    _ev("timeout", "warning",
-                        "<- 504 %s model=%s timed out after %ss on %s",
-                        face, requested, cfg.timeout, route,
-                        route=route, face=face, model=requested,
-                        seconds=cfg.timeout, status=504)
                     return _error(504, "upstream timed out after {}s on {}".format(
-                        cfg.timeout, route), "upstream_timeout")
+                        timeout_limit, route), "upstream_timeout")
                 last_error = "timeout on {}".format(route)
             except httpx.HTTPError as e:
                 telemetry.failed(route, "transport", entry)
@@ -2161,13 +2176,8 @@ async def _forward(request: Request, body: dict, routes: List[Route],
 
                     if head.timed_out:
                         await resp.aclose()
-                        telemetry.note_timeout(
-                            route, entry)
-                        _ev("timeout", "warning",
-                            "<- 504 %s model=%s timed out on %s",
-                            face, requested, route,
-                            route=route, face=face, model=requested,
-                            status=504, in_stream=True)
+                        _record_timeout(route, entry, face, requested, head.error,
+                                        started, in_stream=True)
                         return _error(504, "upstream timed out after {}s on {}".format(
                             cfg.timeout, route), "upstream_timeout")
 
@@ -2266,6 +2276,19 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                 wait_seconds=round(wait, 2))
             await asyncio.sleep(wait)
             delay *= cfg.backoff_multiplier
+        except httpx.TimeoutException as e:
+            # Response-body reads can time out after headers arrived. At this
+            # point forwarding has not begun, so return a proper timeout reply.
+            _record_timeout(route, entry, face, requested, e, started)
+            if resp is not None:
+                await resp.aclose()
+            if cfg.retry_on_timeout and not is_last:
+                wait, _ = pause(attempts[i + 1], retry_after_hint)
+                await asyncio.sleep(wait)
+                delay *= cfg.backoff_multiplier
+                continue
+            return _error(504, "upstream response body timed out on {}".format(route),
+                          "upstream_timeout")
         finally:
             if not entry.streaming:
                 telemetry.finish(entry)

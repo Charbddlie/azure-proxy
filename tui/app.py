@@ -28,8 +28,8 @@ from rich.text import Text
 
 from . import theme
 from .bars import legend
-from .boards import (BOARD_TITLES, BOARDS, EVENT_FILTERS, render_events,
-                     render_groups)
+from .boards import (BOARD_TITLES, BOARDS, DEFAULT_EVENT_FILTER, EVENT_FILTERS,
+                     EVENT_KIND_FILTERS, filter_events, render_events, render_groups)
 from .client import Poller
 from .snapshot import SORTS, Snapshot
 
@@ -44,7 +44,8 @@ class Dashboard:
         self.board = 0
         self.offset = [0, 0, 0]         # one scroll position per board
         self.sort = 0
-        self.filter = 0
+        self.filter = DEFAULT_EVENT_FILTER
+        self.kind_filter = 0
         self.show_all = False
         self.quit = False
         self._extent = [0, 0, 0]        # scrollable rows, from the last render
@@ -74,6 +75,9 @@ class Dashboard:
         elif seq == "f":
             self.filter = (self.filter + 1) % len(EVENT_FILTERS)
             self.offset[2] = 0
+        elif seq == "t":
+            self.kind_filter = (self.kind_filter + 1) % len(EVENT_KIND_FILTERS)
+            self.offset[2] = 0
         elif seq == "a":
             self.show_all = not self.show_all
             # The list just got longer or shorter under the cursor. Keeping the
@@ -98,7 +102,7 @@ class Dashboard:
         if self.board == 2:
             body, extent = render_events(
                 snapshot.events, width, body_height, self.offset[2],
-                self.filter, snapshot.dropped)
+                self.filter, snapshot.dropped, self.kind_filter)
         elif self.board == 1:
             body, extent = render_groups(
                 snapshot.models, width, body_height, self.offset[1],
@@ -110,7 +114,8 @@ class Dashboard:
         self._extent[self.board] = extent
 
         return RichGroup(_header(snapshot), _tabs(self.board, snapshot,
-                                                  self.show_all),
+                                                  self.show_all, self.filter,
+                                                  self.kind_filter),
                          Rule(style=theme.BORDER), body,
                          _footer(self, snapshot, extent))
 
@@ -178,7 +183,8 @@ def _header(snapshot: Snapshot) -> Table:
     return table
 
 
-def _tabs(active: int, snapshot: Snapshot, show_all: bool) -> Text:
+def _tabs(active: int, snapshot: Snapshot, show_all: bool,
+          filter_mode: int = DEFAULT_EVENT_FILTER, kind_mode: int = 0) -> Text:
     out = Text()
     # Shown-of-total where they differ, so the tab does not promise twenty
     # models and then display nine.
@@ -188,7 +194,8 @@ def _tabs(active: int, snapshot: Snapshot, show_all: bool) -> Text:
                          if visible_models == len(snapshot.models)
                          else "{}/{}".format(visible_models,
                                              len(snapshot.models))),
-              "events": str(len(snapshot.events))}
+              "events": "{}/{}".format(len(filter_events(snapshot.events, filter_mode, kind_mode)),
+                                         len(snapshot.events))}
     for index, name in enumerate(BOARDS):
         label = " {} {} ".format(BOARD_TITLES[name], counts[name])
         if index == active:
@@ -215,6 +222,8 @@ def _footer(dash: "Dashboard", snapshot: Snapshot, extent: int) -> Table:
     if dash.board == 2:
         keys.append("f", style=theme.ACCENT)
         keys.append(" {}  ".format(EVENT_FILTERS[dash.filter]), style=theme.DIM)
+        keys.append("t", style=theme.ACCENT)
+        keys.append(" {}  ".format(EVENT_KIND_FILTERS[dash.kind_filter]), style=theme.DIM)
     else:
         keys.append("s", style=theme.ACCENT)
         keys.append(" {}  ".format(SORTS[dash.sort]), style=theme.DIM)
