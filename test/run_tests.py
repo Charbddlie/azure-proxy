@@ -245,11 +245,56 @@ class Proxy:
         env = dict(os.environ,
                    AZURE_PROXY_HOME=self.home,
                    AZURE_PROXY_STATIC_TOKEN="test-token-abc",
+                   AZURE_PROXY_SYNC_INTERVAL="0.01",
                    PYTHONPATH=ROOT)
+        self.env = env
+        self.routing_log = open(os.path.join(self.home, "routing.log"), "w+")
+        self.routing_proc = None
+        self.start_routing()
         self.log = open(os.path.join(self.home, "proxy.log"), "w+")
         self.proc = subprocess.Popen([PYTHON, "-m", "proxy"], env=env,
                                      stdout=self.log, stderr=subprocess.STDOUT)
         self._await_health()
+
+    def start_routing(self):
+        import sqlite3
+        self.routing_proc = subprocess.Popen([PYTHON, "-m", "routing"], env=self.env,
+                                             stdout=self.routing_log,
+                                             stderr=subprocess.STDOUT)
+        for _ in range(200):
+            if self.routing_proc.poll() is not None:
+                self.routing_log.seek(0)
+                raise RuntimeError("routing exited:\n" + self.routing_log.read())
+            try:
+                db = sqlite3.connect("file:" + os.path.join(
+                    self.home, "runtime", "control.sqlite3") + "?mode=ro", uri=True)
+                try:
+                    row = db.execute("SELECT payload FROM state WHERE name='snapshot'").fetchone()
+                finally:
+                    db.close()
+                if row and json.loads(row[0])["routing"]["pid"] == self.routing_proc.pid:
+                    return
+            except sqlite3.Error:
+                pass
+            time.sleep(0.025)
+        raise RuntimeError("routing did not publish")
+
+    def stop_routing(self, kill=False):
+        if self.routing_proc and self.routing_proc.poll() is None:
+            (self.routing_proc.kill if kill else self.routing_proc.terminate)()
+            self.routing_proc.wait(timeout=10)
+
+    def sync(self):
+        """Only test assertions wait for asynchronous statistics publication."""
+        if self.routing_proc.poll() is not None:
+            return
+        for _ in range(500):
+            _status, health = self.get_raw("/healthz")
+            state = health["routing"]
+            if not state["telemetry_pending"] and state["processed_seq"] >= state["last_event_seq"]:
+                return
+            time.sleep(0.01)
+        raise AssertionError("routing did not consume observations: {}".format(state))
 
     def _await_health(self):
         for _ in range(80):
@@ -275,13 +320,16 @@ class Proxy:
             method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, json.loads(r.read()), dict(r.headers)
+                result = r.status, json.loads(r.read()), dict(r.headers)
+                self.sync()
+                return result
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
                 parsed = json.loads(raw)
             except Exception:
                 parsed = {"_raw": raw.decode("utf-8", "replace")}
+            self.sync()
             return e.code, parsed, dict(e.headers)
 
     def post_raw(self, path, blob, content_type, timeout=60, headers=None):
@@ -292,16 +340,23 @@ class Proxy:
             method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, json.loads(r.read()), dict(r.headers)
+                result = r.status, json.loads(r.read()), dict(r.headers)
+                self.sync()
+                return result
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
                 parsed = json.loads(raw)
             except Exception:
                 parsed = {"_raw": raw.decode("utf-8", "replace")}
+            self.sync()
             return e.code, parsed, dict(e.headers)
 
     def get(self, path):
+        self.sync()
+        return self.get_raw(path)
+
+    def get_raw(self, path):
         with urllib.request.urlopen(self.url(path), timeout=10) as r:
             return r.status, json.loads(r.read())
 
@@ -311,7 +366,10 @@ class Proxy:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+            self.proc.wait(timeout=10)
+        self.stop_routing()
         self.log.close()
+        self.routing_log.close()
         shutil.rmtree(self.home, ignore_errors=True)
 
 
@@ -1727,7 +1785,8 @@ def test_safe_rpm_capacity_only_grows_and_survives_restart():
     """Successful dispatch rates raise a monotonic, atomically saved maximum."""
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import QuotaTracker, Route
+    from routing.quota import QuotaTracker
+    from proxy.config import Route
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
     directory = tempfile.mkdtemp(prefix="azure-proxy-capacity-")
@@ -1766,7 +1825,8 @@ def test_safe_rpm_capacity_only_grows_and_survives_restart():
 def test_throttle_below_safe_rpm_attributes_the_difference_to_others():
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import QuotaTracker, Route
+    from routing.quota import QuotaTracker
+    from proxy.config import Route
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
     class Cfg:
@@ -1786,6 +1846,25 @@ def test_throttle_below_safe_rpm_attributes_the_difference_to_others():
     assert moved["other_rpm"] == 4.0, moved
 
 
+def _inline_telemetry(config):
+    """Replay serving observations synchronously for stream boundary unit tests."""
+    from routing.engine import Engine
+    from routing.quota import QuotaTracker
+    from proxy.bridge import Telemetry
+
+    config.chars_per_token = 4
+    engine = Engine.__new__(Engine)
+    engine.pending, engine.catalog = {}, {}
+    engine.now = time.time()
+    engine.quota = QuotaTracker(config, clock=lambda: engine.now)
+
+    class Sink:
+        def record(self, kind, **data):
+            engine.consume(dict(data, kind=kind, at=time.time()))
+
+    return Telemetry(Sink()), engine
+
+
 def test_completed_stream_updates_safe_rpm_before_eof_or_client_disconnect():
     """A terminal SSE event confirms success before HTTP cleanup can cancel."""
     sys.path.insert(0, ROOT)
@@ -1800,12 +1879,13 @@ def test_completed_stream_updates_safe_rpm_before_eof_or_client_disconnect():
             capacity_state_file=os.path.join(directory, "capacity.json"),
             rpm_window=60.0, load_window=60, capture_dir=None,
             stream_retry_markers=[server.INBAND_RATE_LIMIT])
-        tracker = server.QuotaTracker(config)
+        observer, engine = _inline_telemetry(config)
+        tracker = engine.quota
         route = server.Route("alpha", "http://x/", "v", DEPLOYMENT,
                              "max_completion_tokens", 0)
-        first = tracker.charge(route, 1)
-        tracker.note_success(route, first)
-        entry = tracker.charge(route, 1)
+        first = observer.charge(route, 1)
+        observer.note_success(route, first)
+        entry = observer.charge(route, 1)
         chunk = (b'event: response.completed\ndata: {"type":"response.completed",'
                  b'"response":{"usage":{"total_tokens":123}}}\n\n')
 
@@ -1820,7 +1900,7 @@ def test_completed_stream_updates_safe_rpm_before_eof_or_client_disconnect():
         head = server._StreamHead(upstream())
         if buffered:
             head.chunks.append(chunk)
-        with patch.multiple(server, cfg=config, quota=tracker):
+        with patch.multiple(server, cfg=config, telemetry=observer):
             reply = server._relay_stream(resp, route, server.RESPONSES_FACE,
                                          time.monotonic(), head, 10, entry)
             try:
@@ -1829,8 +1909,8 @@ def test_completed_stream_updates_safe_rpm_before_eof_or_client_disconnect():
                 assert state.safe_rpm == 2.0, state.safe_rpm
                 assert state.rpm_samples == 2, state.rpm_samples
                 assert state.ok == 2, state.ok
-                assert entry[1] == 123, entry
-                restored = server.QuotaTracker(config)
+                assert engine.pending[entry.id]["entry"][1] == 123
+                restored = type(tracker)(config)
                 assert restored.state(route).safe_rpm == 2.0
             finally:
                 try:
@@ -1867,17 +1947,18 @@ def test_incomplete_or_failed_stream_does_not_raise_safe_rpm():
         config = SimpleNamespace(capacity_state_file=None, rpm_window=60.0,
                                  load_window=60, capture_dir=None,
                                  stream_retry_markers=[server.INBAND_RATE_LIMIT])
-        tracker = server.QuotaTracker(config)
+        observer, engine = _inline_telemetry(config)
+        tracker = engine.quota
         route = server.Route("alpha", "http://x/", "v", DEPLOYMENT,
                              "max_completion_tokens", 0)
-        entry = tracker.charge(route, 1)
+        entry = observer.charge(route, 1)
 
         async def upstream():
             yield chunk
 
         resp = httpx.Response(200, headers={"content-type": "text/event-stream"})
         head = server._StreamHead(upstream())
-        with patch.multiple(server, cfg=config, quota=tracker):
+        with patch.multiple(server, cfg=config, telemetry=observer):
             reply = server._relay_stream(
                 resp, route, server.RESPONSES_FACE, time.monotonic(),
                 head, 10, entry, counted=counted)
@@ -1951,7 +2032,8 @@ def test_tui_explains_a_throttle_before_the_first_completed_sample():
 def test_legacy_qps_capacity_is_converted_to_rpm():
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import QuotaTracker, Route
+    from routing.quota import QuotaTracker
+    from proxy.config import Route
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
     directory = tempfile.mkdtemp(prefix="azure-proxy-capacity-migrate-")
@@ -1983,7 +2065,8 @@ def test_legacy_qps_capacity_is_converted_to_rpm():
 
 def test_legacy_qpm_capacity_keeps_its_value_and_saves_as_rpm():
     sys.path.insert(0, ROOT)
-    from proxy.server import QuotaTracker, Route
+    from routing.quota import QuotaTracker
+    from proxy.config import Route
 
     with tempfile.TemporaryDirectory(prefix="azure-proxy-rpm-migrate-") as directory:
         path = os.path.join(directory, "capacity.json")
@@ -2015,6 +2098,7 @@ def test_legacy_qpm_capacity_keeps_its_value_and_saves_as_rpm():
 
 
 def test_rpm_window_config_accepts_legacy_name_and_prefers_new_name():
+    from routing.quota import QuotaTracker
     sys.path.insert(0, ROOT)
     from unittest.mock import patch
     from proxy import server
@@ -2037,10 +2121,10 @@ def test_rpm_window_config_accepts_legacy_name_and_prefers_new_name():
                                    "qpm_window_seconds": 30}, 15.0)):
             policy["routing"]["balancing"] = fields
             _dump(os.path.join(directory, "policy.yaml"), policy)
-            with patch.multiple(server, SETTINGS=directory, RUNTIME=directory):
+            with patch.multiple("proxy.config", SETTINGS=directory, RUNTIME=directory):
                 config = server.Config()
             config.capacity_state_file = None
-            tracker = server.QuotaTracker(config)
+            tracker = QuotaTracker(config)
             assert tracker.rpm_window == expected
             route = server.Route("alpha", "http://x/", "v", "deployment",
                                  "max_completion_tokens", 0)
@@ -2462,7 +2546,8 @@ def test_foreign_load_is_per_deployment_not_per_endpoint():
     """
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import QuotaTracker, Route
+    from routing.quota import QuotaTracker
+    from proxy.config import Route
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
     class Cfg:
@@ -2793,21 +2878,8 @@ def test_session_id_falls_back_to_the_body_when_there_is_no_header():
         a.stop(); b.stop()
 
 
-def test_a_pin_to_a_vanished_endpoint_is_not_honoured_or_destroyed():
-    """A pin must not strand a session, and reading it must not erase it.
-
-    If a re-probe drops the pinned endpoint, the encrypted state is lost
-    whatever happens — so refusing to route at all would turn one broken turn
-    into a broken run. The pin is not honoured and the request goes somewhere
-    that works.
-
-    It is not deleted, though. A lookup that declines to use an entry has no
-    business destroying it: the next successful response overwrites the slot
-    anyway, and deleting on read is how one unusable lookup becomes a session
-    that has silently lost its binding and gets balanced onto a deployment that
-    cannot decrypt what it carries. Driven against the map directly; a pin that
-    corresponds to no route is awkward to stage over HTTP.
-    """
+def test_a_removed_deployment_drains_with_its_existing_pin():
+    """A published model table can retire a deployment while its sessions live."""
     sys.path.insert(0, ROOT)
     import logging
     from proxy.server import Route, SessionAffinity
@@ -2832,8 +2904,8 @@ def test_a_pin_to_a_vanished_endpoint_is_not_honoured_or_destroyed():
     aff.pin("s1", gone)
     assert aff.pinned("s1", [gone, live]) is gone
     # The endpoint disappears from the model's route list.
-    assert aff.pinned("s1", [live]) is None, "a dead pin must not be honoured"
-    # The entry survives being declined, so nothing else can be unpinned by it.
+    assert aff.pinned("s1", [live]) is gone, "retirement must preserve the binding"
+    # Both the binding and its full route descriptor survive the update.
     assert aff.report()["live_sessions"] == 1, aff.report()
     # And it is still the binding if the endpoint comes back.
     assert aff.pinned("s1", [gone, live]) is gone

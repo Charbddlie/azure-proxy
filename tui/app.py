@@ -156,6 +156,9 @@ def _header(snapshot: Snapshot) -> Table:
         # the numbers below are still the last true ones, and their age is in
         # the footer.
         right.append("unreachable", style=theme.CRIT)
+    elif health.get("routing") and (not health["routing"].get("ok")
+                                   or health["routing"].get("telemetry_dropped")):
+        right.append("routing/statistics stale", style=theme.WARN)
     elif token.get("have_token"):
         seconds = token.get("expires_in_seconds") or 0
         right.append("token ", style=theme.DIM)

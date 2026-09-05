@@ -1,0 +1,128 @@
+"""Local, versioned exchange between serving and routing.
+
+SQLite connections are used by background workers. Forwarding uses memory.
+The producer watermark makes retries safe even after acknowledged rows are
+compacted; the routing checkpoint and publication commit in one transaction.
+"""
+
+import fcntl
+import json
+import os
+import sqlite3
+
+SCHEMA_VERSION = 1
+
+
+def encode(value):
+    return json.dumps(value, separators=(",", ":"), allow_nan=False)
+
+
+class InstanceLock:
+    def __init__(self, root, role):
+        os.makedirs(os.path.join(root, "runtime"), exist_ok=True)
+        self.file = open(os.path.join(root, "runtime", role + ".lock"), "a+")
+        try:
+            fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.file.close()
+            raise RuntimeError("{} is already running for {}".format(role, root))
+
+    def close(self):
+        self.file.close()
+
+
+class Store:
+    def __init__(self, root):
+        directory = os.path.join(root, "runtime")
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, "control.sqlite3")
+        # The database contains deployment metadata, never access tokens.
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        self.db = sqlite3.connect(path, timeout=1, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, SCHEMA_VERSION):
+            self.db.close()
+            raise ValueError("unsupported control database version {}".format(version))
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS telemetry (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                producer TEXT NOT NULL,
+                local_seq INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(producer, local_seq)
+            );
+            CREATE TABLE IF NOT EXISTS producers (
+                id TEXT PRIMARY KEY, local_seq INTEGER NOT NULL,
+                global_seq INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS state (
+                name TEXT PRIMARY KEY, payload TEXT NOT NULL
+            );
+            PRAGMA user_version=1;
+        """)
+        self._checkpoint_cursor = None
+        self._event_seq = None
+
+    def get(self, name):
+        if name in ("snapshot", "checkpoint"):
+            rows = dict(self.db.execute("SELECT name,payload FROM state WHERE name IN (?, 'events')",
+                                        (name,)))
+            if name not in rows:
+                return None
+            value = json.loads(rows[name])
+            feed = json.loads(rows["events"]) if "events" in rows else None
+            if feed is not None:
+                value["events"] = feed if name == "snapshot" else feed["events"]
+            return value
+        row = self.db.execute("SELECT payload FROM state WHERE name=?", (name,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def append(self, producer, batch):
+        with self.db:
+            row = self.db.execute(
+                "SELECT local_seq, global_seq FROM producers WHERE id=?",
+                (producer,)).fetchone()
+            local, global_seq = row or (0, 0)
+            for event in batch:
+                if event["local_seq"] <= local:
+                    continue
+                cursor = self.db.execute(
+                    "INSERT INTO telemetry(producer,local_seq,payload) VALUES(?,?,?)",
+                    (producer, event["local_seq"], encode(event)))
+                local, global_seq = event["local_seq"], cursor.lastrowid
+            self.db.execute("INSERT OR REPLACE INTO producers VALUES(?,?,?)",
+                            (producer, local, global_seq))
+        return local, global_seq
+
+    def highwater(self):
+        return self.db.execute(
+            "SELECT COALESCE(MAX(global_seq),0) FROM producers").fetchone()[0]
+
+    def read_events(self, after, limit=2000):
+        return [(seq, json.loads(payload)) for seq, payload in self.db.execute(
+            "SELECT seq,payload FROM telemetry WHERE seq>? ORDER BY seq LIMIT ?",
+            (after, limit))]
+
+    def publish(self, checkpoint, snapshot):
+        # Event history is shared by snapshot/checkpoint. An idle heartbeat
+        # writes only the compact publication, rather than rewriting the ring.
+        publication = {key: value for key, value in snapshot.items() if key != "events"}
+        records = [("snapshot", encode(publication))]
+        if (self._checkpoint_cursor != checkpoint["cursor"]
+                or self._event_seq != snapshot["events"]["next"]):
+            saved = {key: value for key, value in checkpoint.items() if key != "events"}
+            records.append(("checkpoint", encode(saved)))
+        if self._event_seq != snapshot["events"]["next"]:
+            records.append(("events", encode(snapshot["events"])))
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO state VALUES(?,?)", records)
+            self.db.execute("DELETE FROM telemetry WHERE seq<=?",
+                            (checkpoint["cursor"],))
+        self._checkpoint_cursor = checkpoint["cursor"]
+        self._event_seq = snapshot["events"]["next"]
+
+    def close(self):
+        self.db.close()

@@ -1,0 +1,190 @@
+"""Replay observations, calculate targets, and atomically publish a generation."""
+
+import collections
+import os
+import time
+import uuid
+
+from proxy.bridge import SNAPSHOT_FIELDS, decode_snapshot, route_record
+from proxy.config import Config, Route, TABLES
+from proxy.state import SCHEMA_VERSION, Store
+from .quota import QuotaTracker, RouteState
+
+
+class Engine:
+    def __init__(self, root, config=None):
+        self.config = config or Config()
+        self.store = Store(root)
+        self.instance = uuid.uuid4().hex
+        self.now = time.time()
+        self.cursor = 0
+        self.pending = {}
+        self.catalog = {}
+        self.sessions = {}
+        self.events = collections.deque(maxlen=2000)
+        self.event_seq = 0
+        self.quota = QuotaTracker(self.config, clock=lambda: self.now,
+                                 emit=self.event, persist_capacity=False)
+        snapshot = self.store.get("snapshot")
+        self.revision = snapshot["revision"] if snapshot else 0
+        saved = self.store.get("checkpoint")
+        if saved:
+            self.restore(saved)
+        self.mirrored_capacity = None
+        self.last_publication = None
+        self.published_at = 0.0
+
+    def event(self, kind, level, message, *args, **fields):
+        self.event_seq += 1
+        route = fields.get("route")
+        if route is not None:
+            fields["route"] = str(route)
+            endpoint, _, deployment = str(route).partition("/")
+            fields.setdefault("endpoint", endpoint)
+            fields.setdefault("deployment", deployment)
+        self.events.append(dict(fields, seq=self.event_seq, at=self.now,
+                                kind=kind, level=level,
+                                message=message % args if args else message))
+
+    def restore(self, saved):
+        if saved.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("incompatible routing checkpoint")
+        self.cursor = saved["cursor"]
+        self.sessions = saved["sessions"]
+        self.events.extend(saved["events"])
+        self.event_seq = saved["event_seq"]
+        self.catalog = saved.get("catalog", {})
+        self.quota._saved_capacity = saved["capacity"]
+        entries = {}
+        for key, record in saved["states"].items():
+            state = RouteState(key)
+            for name, value in record.items():
+                setattr(state, name, collections.deque(value) if name == "sent" else value)
+            self.quota.states[key] = state
+            entries.update((item[4], item) for item in state.sent if len(item) > 4)
+        self.pending = saved["pending"]
+        for key, record in self.pending.items():
+            record["entry"] = entries.get(key, record["entry"])
+
+    def checkpoint(self):
+        return dict(schema_version=SCHEMA_VERSION, cursor=self.cursor,
+                    capacity=dict(self.quota._saved_capacity), pending=self.pending,
+                    catalog=self.catalog, sessions=self.sessions,
+                    events=list(self.events), event_seq=self.event_seq,
+                    states={key: {name: list(value) if isinstance(value, collections.deque)
+                                  else value for name in RouteState.__slots__
+                                  for value in [getattr(state, name)]}
+                            for key, state in self.quota.states.items()})
+
+    def consume(self, event):
+        self.now = event["at"]
+        kind = event["kind"]
+        if kind == "event":
+            self.event(event["event_kind"], event["level"], event["message"],
+                       **event.get("fields", {}))
+            return
+        if kind == "sessions":
+            self.sessions = event["summary"]
+            return
+        if kind in ("producer_started", "producer_stopped"):
+            # A single serving owner emits lifecycle records after all its
+            # final observations. An abrupt serving exit leaves unknown
+            # completions; a new owner retires those entries without claiming
+            # upstream success or timeout.
+            self.pending.clear()
+            self.sessions = {}
+            return
+        attempt = event.get("attempt")
+        if kind == "finish":
+            self.pending.pop(attempt, None)
+            return
+        route = Route(**event["route"])
+        record = self.pending.get(attempt)
+        entry = record["entry"] if record else None
+        if kind == "dispatch":
+            if attempt in self.pending:
+                return
+            self.quota.note_attempt(route)
+            entry = self.quota.charge(
+                route, self.quota.estimate_tokens(route, event["request_bytes"]), event["face"])
+            entry.append(attempt)
+            self.pending[attempt] = dict(entry=entry, route=event["route"])
+            self.catalog[str(route)] = dict(route=event["route"], model=event.get("model", ""))
+        elif kind == "observed":
+            self.quota.observed(route, event["status"], event["headers"])
+        elif kind == "demote":
+            self.quota.demote(route, event["reason"], event.get("retry_after"),
+                              entry[3] if entry else None)
+        elif kind == "timeout":
+            self.quota.note_timeout(route, entry[3] if entry else None)
+        elif kind == "usage":
+            self.quota.settle(route, entry, event["request_bytes"], event["total_tokens"])
+        elif kind == "success" and record and not record.get("success"):
+            self.quota.note_success(route, entry)
+            record["success"] = True
+
+    def snapshot(self, ready=True):
+        cfg = self.config
+        tables = {name: {model: [route_record(route) for route in self.quota.order(routes)]
+                         for model, routes in getattr(cfg, name).items()} for name in TABLES}
+        merged = {}
+        for name in TABLES:
+            for model, routes in getattr(cfg, name).items():
+                current = merged.setdefault(model, [])
+                seen = {str(route) for route in current}
+                current.extend(route for route in routes if str(route) not in seen)
+        for item in self.catalog.values():
+            model = item["model"]
+            route = Route(**item["route"])
+            if model and str(route) not in {str(r) for r in merged.get(model, [])}:
+                merged.setdefault(model, []).append(route)
+        report = self.quota.report(merged)
+        report.update(session_affinity=self.sessions,
+                      model_faces={model: [face for face, name in zip(
+                          ("chat", "responses", "image", "image_edits"), TABLES)
+                          if model in getattr(cfg, name)] for model in merged},
+                      endpoints=[dict(name=name, chat=chat, responses=responses, image=image)
+                                 for name, chat, responses, image in cfg.endpoints],
+                      image_deployments=cfg.image_deployments,
+                      updated_at=self.now)
+        config = {name: sorted(value) if isinstance(value, set) else value
+                  for name in SNAPSHOT_FIELDS for value in [getattr(cfg, name)]}
+        return dict(schema_version=SCHEMA_VERSION, revision=self.revision + 1,
+                    config=config, tables=tables, report=report,
+                    routing=dict(pid=os.getpid(), instance_id=self.instance,
+                                 heartbeat=self.now, processed_seq=self.cursor, ready=ready),
+                    events=dict(events=list(self.events), next=self.event_seq,
+                                counts=dict(collections.Counter(e["kind"] for e in self.events))))
+
+    def step(self, ready=True):
+        # Catch up to a fixed waterline before publishing; concurrent arrivals
+        # belong to the next generation and cannot starve publication.
+        waterline = self.store.highwater()
+        if (ready and self.last_publication is not None and self.cursor == waterline
+                and time.monotonic() - self.published_at < 1.0):
+            return self.last_publication
+        while self.cursor < waterline:
+            batch = self.store.read_events(self.cursor)
+            if not batch:
+                raise RuntimeError("telemetry gap before routing waterline")
+            for seq, event in batch:
+                self.consume(event)
+                self.cursor = seq
+        self.now = time.time()
+        snapshot = self.snapshot(ready)
+        decode_snapshot(snapshot, self.config)
+        self.store.publish(self.checkpoint(), snapshot)
+        self.revision = snapshot["revision"]
+        self.last_publication = snapshot
+        self.published_at = time.monotonic()
+        if self.mirrored_capacity != self.quota._saved_capacity:
+            self.quota.persist_capacity = True
+            try:
+                self.quota._save_capacity()
+            finally:
+                self.quota.persist_capacity = False
+            self.mirrored_capacity = dict(self.quota._saved_capacity)
+        return snapshot
+
+    def close(self):
+        self.store.close()

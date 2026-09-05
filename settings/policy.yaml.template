@@ -10,6 +10,10 @@
 #
 # Operating policy — the knobs you are meant to turn. Facts about Azure live in
 # runtime/, are written by the probe, and should not be hand-edited.
+#
+# ./restart.sh reloads routing.balance, routing.balancing and probed deployments.
+# Serving owns server/auth/request, retry execution and session_affinity settings;
+# changing those requires an explicit ./restart.sh serving maintenance window.
 
 server:
   # Loopback only. Callers send no credentials, so anything that can reach this

@@ -1,27 +1,10 @@
-"""Local OpenAI-compatible proxy over Azure OpenAI.
+"""Serving process: execute cached mappings and preserve live conversations.
 
-Exposes four unauthenticated faces on loopback: /v1/chat/completions,
-/v1/responses, /v1/images/generations and /v1/images/edits. Picks an endpoint
-for the requested model, attaches Azure credentials, rewrites `model` to that
-endpoint's deployment name, and forwards everything else untouched. Retries on
-429/5xx/transport errors by moving to the next endpoint that serves the model.
-
-Which endpoint goes first is `routing.balance`, in three flavours:
-`strict_priority` walks the probe's order, `priority_threshold` walks it until
-the head route is carrying more than its share and then moves down, and
-`capacity` ignores priority entirely and samples in proportion to quota. All
-three walk the same chain on failure — balancing reorders the attempts, it does
-not change what counts as a failure or how many are allowed.
-
-The faces are routed separately, because they are separate sets of deployments.
-Azure gates the Responses API behind its own data action and does not serve it
-on older api-versions, so a model reachable through chat/completions may have no
-responses route at all; the image models are a third set again, on whichever
-resources happen to hold a gpt-image-* deployment. The probe decides which is
-which.
+Routing publishes the target and fallback order independently. This process
+owns HTTP/SSE connections, Azure credentials, session bindings and protocol
+compatibility. It emits raw observations to a background journal writer.
 
     python -m proxy
-    uvicorn proxy.server:app --host 127.0.0.1 --port 8787
 """
 
 import asyncio
@@ -34,15 +17,19 @@ import re
 import subprocess
 import sys
 import time
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import httpx
-import yaml
 from azure.identity import AzureCliCredential
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .events import PROBLEM_KINDS, EventLog
+from .config import Config, Route, _as_number
+from .bridge import (Attempt, ConfigView, ServingBridge, SnapshotMiddleware,
+                     Telemetry)
+from .config import TABLES
+from .process import ProcessClaim
 
 ROOT = os.environ.get(
     "AZURE_PROXY_HOME",
@@ -78,6 +65,11 @@ def _ev(kind: str, level: str, msg: str, *args, **fields) -> None:
     except Exception:           # pragma: no cover - defensive
         message = msg
     events.record(kind, message, level=level, **fields)
+    if "bridge" in globals():
+        fields = {key: str(value) if isinstance(value, Route) else value
+                  for key, value in fields.items()}
+        bridge.record("event", event_kind=kind, message=message,
+                      level=level, fields=fields)
 
 # This box is a shared account with a single ~/.azure, so the proxy keeps its
 # own credential directory and every operator action has to go through the
@@ -152,1365 +144,6 @@ def face_code(face: str, stream: bool) -> int:
         return 4
     base = 2 if face.endswith("responses") else 0
     return base + (1 if stream else 0)
-
-
-def _route_sort_key(route: "Route"):
-    """Failover order for one model's routes: priority, then size, then name."""
-    capacity = route.capacity_tokens or route.capacity_requests or 0
-    return (route.priority, -capacity, route.deployment)
-
-
-class Route:
-    """One (endpoint, deployment) pair that can serve a model.
-
-    A model can have more than one of these on the SAME endpoint: a second
-    deployment of the same model, bought under a different SKU, is a second
-    quota and a genuinely separate destination. Everything downstream keys on
-    the pair, never on the endpoint alone.
-    """
-
-    __slots__ = ("endpoint", "url", "api_version", "deployment",
-                 "limit_param", "priority", "responses_path",
-                 "model_version", "capacity_requests", "capacity_tokens",
-                 "image_edits", "scope")
-
-    def __init__(self, endpoint, url, api_version, deployment, limit_param,
-                 priority, responses_path=None, model_version=None,
-                 capacity_requests=None, capacity_tokens=None,
-                 image_edits=False, scope=None):
-        self.endpoint = endpoint
-        self.url = url
-        self.api_version = api_version
-        self.deployment = deployment
-        self.limit_param = limit_param
-        self.priority = priority
-        # None when this endpoint does not serve the Responses API. Which of
-        # the two URL shapes it wants is settled by the probe.
-        self.responses_path = responses_path
-        # Which vintage of the model this deployment serves. Carried for
-        # reporting; the proxy does not route on it.
-        self.model_version = model_version
-        # The quota ARM says this deployment holds, in the units the runtime
-        # later reads off x-ratelimit-limit-*. None when the probe could not ask
-        # ARM — an older runtime/, or an endpoint discovered by guesswork.
-        # Image deployments carry a request ceiling and no token one, which the
-        # load calculation already handles: it takes whichever ceiling it has.
-        self.capacity_requests = capacity_requests
-        self.capacity_tokens = capacity_tokens
-        # Whether this image deployment also serves /images/edits. From ARM's
-        # capability flag, never measured — an edits probe would have to carry a
-        # real image.
-        # The data-plane audience this endpoint's token must be minted for.
-        # None means the default scope (cognitiveservices.azure.com); the
-        # AI-Foundry project endpoint sets ai.azure.com, and the same resource
-        # returns 401 for a token minted for the other one. See TOKENS registry.
-        self.image_edits = image_edits
-        self.scope = scope
-
-    def chat_target(self) -> str:
-        return "{}openai/deployments/{}/chat/completions?api-version={}".format(
-            self.url, self.deployment, self.api_version)
-
-    def responses_target(self) -> str:
-        # No deployment in the path here: the Responses API takes it from the
-        # body's `model`, which _forward has already rewritten.
-        return self.url + self.responses_path
-
-    def image_target(self, kind: str) -> str:
-        """generations or edits.
-
-        Azure endpoints put the deployment in the path; an AI-Foundry project
-        endpoint (openai/v1, deployment in the body) has no api-version segment
-        and takes the deployment from `model`, exactly as its Responses face
-        does. `responses_path` being an openai/v1 shape is what tells them
-        apart — the same signal the probe settled the endpoint on.
-        """
-        if "/api/projects/" in self.url or \
-                (self.scope or "").startswith("https://ai.azure.com"):
-            return "{}openai/v1/images/{}".format(self.url, kind)
-        return "{}openai/deployments/{}/images/{}?api-version={}".format(
-            self.url, self.deployment, kind, self.api_version)
-
-    def __repr__(self):
-        return "{}/{}".format(self.endpoint, self.deployment)
-
-
-class Config:
-    def __init__(self):
-        with open(os.path.join(SETTINGS, "policy.yaml")) as f:
-            policy = yaml.safe_load(f)
-        with open(os.path.join(RUNTIME, "sources.json")) as f:
-            sources = json.load(f)
-        with open(os.path.join(RUNTIME, "models.json")) as f:
-            models = json.load(f)
-
-        self.policy = policy
-        self.host = policy["server"]["host"]
-        self.port = policy["server"]["port"]
-        self.log_level = policy["server"].get("log_level", "info")
-
-        # Diagnostics. Off unless a directory is named, and it has to stay that
-        # way: these files contain prompts. See _capture_stream.
-        self.capture_dir = policy["server"].get("capture_dir") or None
-        self.capture_mode = policy["server"].get("capture_mode", "suspicious")
-        self.capture_limit = int(policy["server"].get("capture_limit", 40))
-
-        r = policy["routing"]
-        self.retry_on_status = set(r["retry_on_status"])
-        self.retry_on_transport_error = r["retry_on_transport_error"]
-        self.retry_on_timeout = r["retry_on_timeout"]
-        self.timeout = r["request_timeout_seconds"]
-        self.max_attempts = r["max_attempts_per_request"]
-        self.backoff_initial = r["backoff_initial_seconds"]
-        self.backoff_multiplier = r["backoff_multiplier"]
-        self.backoff_jitter = r["backoff_jitter_seconds"]
-
-        # How the attempt order is chosen. Unknown values fall back to the
-        # conservative one rather than refusing to boot: a typo here should not
-        # take the proxy down, and strict priority is what it did before any of
-        # this existed.
-        self.balance_configured = r.get("balance", "priority_threshold")
-        self.balance = BALANCE_ALIASES.get(self.balance_configured,
-                                           self.balance_configured)
-        if self.balance not in BALANCE_MODES:
-            self.balance = "strict_priority"
-
-        b = r.get("balancing") or {}
-        self.static_weights = b.get("static_weights") or {}
-        self.headroom_high_water = float(b.get("headroom_high_water", 0.5))
-        self.weight_floor = float(b.get("weight_floor", 0.05))
-        self.observation_ttl = float(b.get("observation_ttl_seconds", 120))
-        self.demote_multiplier = float(b.get("demote_multiplier", 0.25))
-        self.demote_seconds = float(b.get("demote_seconds", 30))
-        self.demote_halflife = float(
-            b.get("demote_recovery_halflife_seconds", 30))
-        self.spill_threshold = float(b.get("spill_threshold", 0.70))
-        self.load_window = float(b.get("load_window_seconds", 60))
-        self.rpm_window = max(1.0, float(b.get(
-            "rpm_window_seconds", b.get("qpm_window_seconds", 60.0))))
-        capacity_file = b.get("capacity_state_file", "runtime/capacity.json")
-        self.capacity_state_file = os.path.expanduser(str(capacity_file))
-        if not os.path.isabs(self.capacity_state_file):
-            self.capacity_state_file = os.path.join(ROOT,
-                                                    self.capacity_state_file)
-        self.chars_per_token = float(b.get("assumed_chars_per_token", 4)) or 4.0
-
-        f = b.get("foreign_load") or {}
-        self.foreign_enabled = bool(f.get("enabled", True))
-        self.foreign_reclaim = float(f.get("reclaim_per_minute", 0.1))
-
-        s = r.get("stream_probe") or {}
-        self.probe_seconds = float(s.get("hold_seconds", 0.5))
-        self.probe_bytes = int(s.get("hold_bytes", 16384))
-        # Encoded once, at boot: this list is consulted per chunk of every
-        # stream, and str.encode() on the hot path for a constant is waste.
-        self.stream_retry_markers = [
-            str(code).encode() for code in
-            (s.get("retry_on_codes") or ["rate_limit_exceeded"])]
-
-        # The image face retries differently, because it fails differently.
-        # Image quota is granted in requests per minute and granted meanly —
-        # 2 RPM for gpt-image-2, 30 for gpt-image-1.5 — while one call takes
-        # 10-25 seconds, so a 429 is the ordinary case rather than the sign of a
-        # storm. Two consequences, both of them settings rather than code:
-        #
-        #   * `max_attempts` here is a number of ATTEMPTS, not of routes. Most
-        #     image models have exactly one deployment, so the text faces' rule
-        #     — one attempt per route, never the same route twice — would hand
-        #     the first 429 straight back to the caller. Here the attempt list
-        #     cycles through the routes instead.
-        #   * the wait between them is Azure's own Retry-After rather than a
-        #     blind exponential, because a per-minute ceiling refills on a
-        #     schedule Azure knows and the proxy does not.
-        #
-        # Clients are the reason this belongs here rather than in them: the
-        # OpenAI SDK's image calls are routinely made with maxRetries: 0, and
-        # one 429 is then a failed page rather than a slow one.
-        i = r.get("image") or {}
-        self.image_attempts = int(i.get("max_attempts", 3))
-        self.image_max_wait = float(i.get("max_wait_seconds", 30))
-
-        a = r.get("session_affinity") or {}
-        self.affinity_enabled = bool(a.get("enabled", True))
-        self.affinity_keys = list(a.get("keys") or [
-            "header:session-id", "body:prompt_cache_key",
-            "body:client_metadata.session_id", "header:x-session-id"])
-        self.affinity_markers = list(a.get("sticky_include") or
-                                     ["reasoning.encrypted_content"])
-        self.affinity_ttl = float(a.get("ttl_seconds", 3600))
-        self.affinity_max = int(a.get("max_sessions", 4096))
-        self.affinity_on_conflict = a.get("on_conflict", "wait")
-        if self.affinity_on_conflict not in ("wait", "switch"):
-            self.affinity_on_conflict = "wait"
-        self.affinity_attempts = int(a.get("wait_attempts", 4))
-        self.affinity_max_wait = float(a.get("max_wait_seconds", 30))
-        self.affinity_off_route = a.get("off_route", "strip")
-        if self.affinity_off_route not in ("strip", "send"):
-            self.affinity_off_route = "strip"
-
-        self.forward_headers = policy["request"]["forward_headers"]
-        self.responses_compat = policy["request"].get("responses_compat", True)
-        self.scope = policy["auth"]["scope"]
-        self.refresh_margin = policy["auth"]["refresh_margin_seconds"]
-        self.expected_account = policy["auth"].get("expected_account")
-
-        # Every distinct data-plane scope in play. The default from policy is
-        # always present; an endpoint may pin its own (the AI-Foundry project
-        # path uses ai.azure.com). The token layer holds one cache per scope.
-        self.scopes = {self.scope} | {
-            e["scope"] for e in sources["endpoints"] if e.get("scope")}
-
-        # Give the Azure CLI its own directory before anything shells out to it.
-        # AzureCliCredential spawns `az` with a copy of os.environ, so setting
-        # it here is enough for the credential, the background refresher and the
-        # startup account check alike.
-        self.az_config_dir = policy["auth"].get("az_config_dir")
-        if self.az_config_dir:
-            self.az_config_dir = os.path.expanduser(self.az_config_dir)
-            # A relative path is relative to the repo, not to whatever directory
-            # the proxy happened to be started from. That is what lets the
-            # credential directory travel with the checkout: the whole tree can
-            # be moved to another path, or handed to another account, without a
-            # setting that points back at where it used to live.
-            if not os.path.isabs(self.az_config_dir):
-                self.az_config_dir = os.path.join(ROOT, self.az_config_dir)
-            os.environ["AZURE_CONFIG_DIR"] = self.az_config_dir
-
-        # An endpoint counts as usable if any face is up. They are gated
-        # separately by Azure and they fail separately: a resource whose chat
-        # face is refused can still serve the Responses API, and dropping it
-        # entirely would take working routes down with the broken one.
-        meta = {e["name"]: e for e in sources["endpoints"]
-                if "ok" in (e["status"], e.get("responses_status"),
-                            e.get("image_status"))}
-        self.endpoints = [(e["name"], e["status"], e.get("responses_status", "?"),
-                           e.get("image_status", "?"))
-                          for e in sources["endpoints"]]
-        self.routes: Dict[str, List[Route]] = {}
-        self.responses_routes: Dict[str, List[Route]] = {}
-        self.image_routes: Dict[str, List[Route]] = {}
-        # The subset that also serves /images/edits. Separate rather than
-        # filtered at request time so the 404 for an edits call against a
-        # generations-only model can name what is available.
-        self.image_edit_routes: Dict[str, List[Route]] = {}
-        for name, spec in models["models"].items():
-            built, responses, images = [], [], []
-            for hop in spec["routes"]:
-                ep = meta.get(hop["endpoint"])
-                if ep is None:
-                    continue        # endpoint went unhealthy since the last probe
-                route = Route(
-                    endpoint=hop["endpoint"],
-                    url=ep["url"],
-                    api_version=ep["api_version"],
-                    deployment=hop["deployment"],
-                    limit_param=hop["limit_param"],
-                    priority=hop.get("priority", ep.get("priority", 0)),
-                    responses_path=ep.get("responses_path"),
-                    model_version=hop.get("model_version"),
-                    capacity_requests=hop.get("capacity_requests"),
-                    capacity_tokens=hop.get("capacity_tokens"),
-                    image_edits=bool(hop.get("image_edits")),
-                    scope=ep.get("scope"),
-                )
-                # Absent `faces` means a runtime/ written before the Responses
-                # API existed here. Default it to chat only, so a stale probe
-                # leaves the old face working and merely reports no routes on
-                # the new one.
-                faces = hop.get("faces", ["chat"])
-                # Not every deployment has a chat face. gpt-5-pro and the codex
-                # models answer chat/completions with a flat 400 and serve the
-                # Responses API only, so listing them as chat routes would offer
-                # a destination that cannot work. gpt-image-* have neither.
-                if "chat" in faces:
-                    built.append(route)
-                if "responses" in faces and route.responses_path:
-                    responses.append(route)
-                if "image" in faces:
-                    images.append(route)
-            # Candidate order in endpoints.yaml is failover priority, and
-            # capacity breaks ties within one endpoint — a model served twice by
-            # the same resource should be reached for at its larger deployment
-            # first. Sorted here rather than trusted from the file, which is the
-            # same key probe/probe.py:route_sort_key writes it in.
-            built.sort(key=_route_sort_key)
-            responses.sort(key=_route_sort_key)
-            images.sort(key=_route_sort_key)
-            if built:
-                self.routes[name] = built
-            if responses:
-                self.responses_routes[name] = responses
-            if images:
-                self.image_routes[name] = images
-                edits = [r for r in images if r.image_edits]
-                if edits:
-                    self.image_edit_routes[name] = edits
-
-        # Which image deployment to name on an endpoint, for the Responses
-        # API's built-in image_generation tool: Azure will not pick one itself
-        # and refuses the call without the header. Largest ceiling first, so the
-        # default is the one with room rather than whichever sorted first.
-        best: Dict[str, Tuple[float, str]] = {}
-        for routes in self.image_routes.values():
-            for route in routes:
-                size = route.capacity_requests or 0.0
-                if size > best.get(route.endpoint, (-1.0, ""))[0]:
-                    best[route.endpoint] = (size, route.deployment)
-        self.image_deployments: Dict[str, str] = {
-            endpoint: deployment for endpoint, (_size, deployment) in best.items()}
-
-        self.generated_at = models.get("_generated_at")
-
-
-# --------------------------------------------------------------------------
-# Quota tracking and route selection
-# --------------------------------------------------------------------------
-#
-# Azure returns its rate limit state on every response:
-#
-#   x-ratelimit-limit-requests / -tokens          the ceiling
-#   x-ratelimit-remaining-requests / -tokens      "what is left in the window"
-#   x-ratelimit-renewalperiod-requests / -tokens  window length, seconds — 60
-#   x-ratelimit-reset-requests / -tokens          always 0 in every sample taken
-#
-# The ceiling is the useful part. It is a stable property of the deployment, it
-# arrives on traffic the proxy is already carrying, and it is what both the
-# weights and the load fractions are built from. Measured 2026-08-20 for
-# gpt-5.6-sol: 333 RPM / 333k TPM on endpoint-a, 1000 / 1M on endpoint-b, 499 /
-# 499k on endpoint-c — so the ratio TPM:RPM is 1000:1 on all
-# three, and the ceilings differ by 3x between endpoints.
-#
-# `remaining` is NOT a minute's worth of budget, whatever renewalperiod=60
-# implies, and this matters enough to record how it was established. Measured
-# against an idle endpoint-b/gpt-4.1-mini (2000 RPM / 2M TPM) on 2026-08-20:
-#
-#   * 16 requests fired concurrently — an instantaneous rate of ~960 RPM, i.e.
-#     ~48% of the stated ceiling — moved remaining-requests from 2000 to 1989.
-#     A 60-second window would have had to read 1984 and stay there.
-#   * Three seconds later it was back at 1999, and it stayed there for the next
-#     35 seconds of sampling. Nothing decayed over a minute; it refilled almost
-#     immediately.
-#   * remaining-tokens behaved the same way and is charged actual usage, not the
-#     max_completion_tokens reservation: 16 requests with a 4000-token ceiling
-#     each moved it by 27 tokens total, matching the ~19 tokens each actually
-#     used.
-#   * Responses within one burst disagree with each other (1999, 1996, 1995,
-#     1990, 1989 ...), so it is not even a consistent snapshot.
-#
-# So `1 - remaining/limit` understates real load by close to two orders of
-# magnitude: it read 0.55% at a moment when the true minute-equivalent load was
-# ~48%. It is a sub-second bucket quoted against a per-minute ceiling. It cannot
-# carry a threshold, and it is left where it was — a brake that may only
-# *reduce* a weight, and only below half, which the measurement says will
-# essentially never fire. It is kept because it costs nothing and the one time
-# it does fire it is telling the truth about an instantaneous burst.
-#
-# What carries the threshold instead is the proxy's own ledger: every request it
-# dispatches is recorded against the (endpoint, deployment) it went to, with a
-# timestamp and a token cost, and load is what is still inside the window
-# divided by the measured ceiling. The trade is explicit and worth stating:
-#
-#   + it is exact for our own traffic, it needs no response to update, and it
-#     is available at dispatch — which matters, because at concurrency 30 with
-#     minute-long reasoning turns a signal that only updates on completion lags
-#     by an entire request.
-#   + "no traffic" reads as zero load rather than as unknown, so a route that
-#     has been quiet is preferred rather than starved.
-#   - it is blind to anyone else spending the same deployment's quota. Nothing
-#     can fix that from here; what covers it is the reactive half of the system,
-#     which is the 429 (and in-band 429) demotion below.
-#
-# State is per (endpoint, deployment), not per endpoint: quota on Azure is
-# granted to a deployment — x-ratelimit-key comes back as the deployment name —
-# and one endpoint serving two models has two separate buckets that have nothing
-# to do with each other.
-
-
-def _as_number(value) -> Optional[float]:
-    """Header value -> float, or None. Azure has been consistent about sending
-    plain integers here, but a weight calculation is not the place to find out
-    what happens the day it is not."""
-    if value is None:
-        return None
-    try:
-        return float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
-class RouteState:
-    """Observed quota and recent failures for one (endpoint, deployment)."""
-
-    __slots__ = ("key", "limit_requests", "limit_tokens", "remaining_requests",
-                 "remaining_tokens", "renewal_seconds", "observed_at",
-                 "penalty", "penalty_until", "penalty_at", "attempts", "ok",
-                 "rate_limited", "errors", "last_status", "sent",
-                 "tokens_per_char", "token_samples",
-                 "safe_rpm", "other_rpm", "rpm_samples",
-                 "last_dispatch_rpm", "last_throttle_rpm",
-                 "timeouts", "last_timeout_rpm",
-                 "foreign", "foreign_at", "foreign_hold_until",
-                 "foreign_samples", "foreign_our_load")
-
-    def __init__(self, key: str):
-        self.key = key
-        self.limit_requests: Optional[float] = None
-        self.limit_tokens: Optional[float] = None
-        self.remaining_requests: Optional[float] = None
-        self.remaining_tokens: Optional[float] = None
-        self.renewal_seconds: Optional[float] = None
-        self.observed_at: Optional[float] = None
-        # 1.0 is "no penalty". A failure knocks it down; time brings it back.
-        self.penalty = 1.0
-        self.penalty_until = 0.0        # parked until here (Retry-After)
-        self.penalty_at = 0.0           # when the penalty was last recomputed
-        self.attempts = 0
-        self.ok = 0
-        self.rate_limited = 0
-        self.errors = 0
-        self.last_status: Optional[str] = None
-
-        # The proxy's own ledger: one [dispatched_at, tokens, face] entry per
-        # request sent here, oldest first, pruned to the load window. A list
-        # rather than a tuple because the token cost starts as an estimate and
-        # is overwritten with the real figure if the response turns out to state
-        # one. `face` is an index into FACES and is carried for reporting only —
-        # nothing routes on it, because one ceiling serves all four faces.
-        self.sent: Deque[List[float]] = collections.deque()
-        # Tokens per byte of request body, learned from responses that report
-        # usage. Seeded from policy.yaml and then corrected, because the true
-        # ratio depends on the model as much as on the prompt: a reasoning turn
-        # bills thinking tokens that were never in the request at all.
-        self.tokens_per_char: Optional[float] = None
-        self.token_samples = 0
-
-        # Learned capacity. A successful request proves the dispatch rate at
-        # that instant was safe, so the largest such observation is a lower
-        # bound on the route's capacity. It only grows and is persisted by the
-        # tracker. A throttle below that bound exposes concurrent traffic from
-        # other users: safe_rpm - our_rpm.
-        self.safe_rpm = 0.0
-        self.other_rpm = 0.0
-        self.rpm_samples = 0
-        self.last_dispatch_rpm = 0.0
-        self.last_throttle_rpm: Optional[float] = None
-        self.timeouts = 0
-        self.last_timeout_rpm: Optional[float] = None
-
-        # What everyone ELSE is estimated to be taking from this deployment, as
-        # a fraction of its ceiling. Only ever learned at the moment of a
-        # throttle — see QuotaTracker.note_foreign — and decayed away in
-        # between, because nothing reports it and silence is not evidence that
-        # it is still there.
-        self.foreign = 0.0
-        self.foreign_at = 0.0
-        self.foreign_hold_until = 0.0   # reclaim paused until Retry-After ends
-        self.foreign_samples = 0
-        self.foreign_our_load: Optional[float] = None   # our share last time
-
-    # -- ledger -----------------------------------------------------------
-    def prune(self, now: float, window: float) -> None:
-        sent = self.sent
-        cutoff = now - window
-        while sent and sent[0][0] < cutoff:
-            sent.popleft()
-
-    def in_window(self, now: float, window: float) -> Tuple[int, float]:
-        """(requests, tokens) dispatched here inside the window."""
-        self.prune(now, window)
-        return len(self.sent), sum(e[1] for e in self.sent)
-
-    def in_window_by_face(self, now: float,
-                          window: float) -> List[Tuple[int, float]]:
-        """The same pair, split four ways by FACES. Same order as FACES.
-
-        Only ever used for reporting: routing acts on the totals, because a
-        deployment's quota is not divided by face — one ceiling serves all four,
-        and spending it through /v1/responses leaves exactly as little for
-        /v1/chat/completions as spending it the other way round.
-        """
-        self.prune(now, window)
-        out = [[0, 0.0] for _ in FACES]
-        for entry in self.sent:
-            slot = out[entry[2] if len(entry) > 2 else 0]
-            slot[0] += 1
-            slot[1] += entry[1]
-        return [(int(r), t) for r, t in out]
-
-
-class QuotaTracker:
-    """Chooses the attempt order, and remembers why.
-
-    Three modes, all of which produce a full permutation of the model's routes
-    so the failover chain stays intact and no endpoint can be tried twice:
-
-    `strict_priority` returns the probe's order untouched.
-
-    `capacity` samples the list without replacement in proportion to weight.
-    Sampling rather than "send to whoever has the most headroom left": every
-    in-flight request would compute the same answer from the same shared state
-    and pile onto the same endpoint, and the correction only arrives after the
-    responses do. Sampling has no such feedback delay — it needs no in-flight
-    accounting, and over a run the split converges on the weights.
-
-    `priority_threshold` walks the priority order and heads for the first route
-    that is not already carrying more than `spill_threshold` of its own quota.
-    The equilibrium is worth being explicit about, because it is the whole
-    design: load is measured over a sliding window, so once the top route is
-    pinned at the threshold each individual request tips it over, goes to the
-    next route instead, and lets the top route fall back under. The split is
-    therefore per-request rather than in blocks, the top route stabilises at
-    exactly the threshold, and the overflow — and only the overflow — moves
-    down the chain. If every route is over its threshold there is no overflow
-    destination left, so it falls back to `capacity`: spreading the excess in
-    proportion to size is better than putting all of it back on route one.
-    """
-
-    def __init__(self, config: Config):
-        self.cfg = config
-        self.rpm_window = max(1.0, float(getattr(config, "rpm_window", 60.0)))
-        self.capacity_state_file = getattr(config, "capacity_state_file", None)
-        self.states: Dict[str, RouteState] = {}
-        self._legacy_qps_capacity = False
-        self._saved_capacity = self._load_capacity()
-        if self._legacy_qps_capacity:
-            self._save_capacity()
-
-    def _load_capacity(self) -> Dict[str, float]:
-        """Load monotonic safe-RPM observations from the previous process."""
-        if not self.capacity_state_file:
-            return {}
-        try:
-            with open(self.capacity_state_file) as f:
-                doc = json.load(f)
-        except (FileNotFoundError, OSError, ValueError, TypeError):
-            return {}
-        values = doc.get("routes") if isinstance(doc, dict) else None
-        if not isinstance(values, dict):
-            return {}
-        # Older files used QPM for the same per-minute unit; their values
-        # carry over unchanged. Only the earlier QPS format needs scaling.
-        self._legacy_qps_capacity = (
-            "qps_window_seconds" in doc
-            and "rpm_window_seconds" not in doc
-            and "qpm_window_seconds" not in doc)
-        scale = 60.0 if self._legacy_qps_capacity else 1.0
-        out = {}
-        for key, value in values.items():
-            try:
-                value = float(value)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                out[str(key)] = value * scale
-        return out
-
-    def _save_capacity(self) -> None:
-        """Atomically save every learned maximum as soon as one increases."""
-        path = self.capacity_state_file
-        if not path:
-            return
-        directory = os.path.dirname(path)
-        try:
-            os.makedirs(directory, exist_ok=True)
-            temporary = "{}.{}.tmp".format(path, os.getpid())
-            with open(temporary, "w") as f:
-                json.dump({"updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                                       time.gmtime()),
-                           "rpm_window_seconds": self.rpm_window,
-                           "routes": dict(sorted(self._saved_capacity.items()))},
-                          f, indent=2, sort_keys=True)
-                f.write("\n")
-            os.replace(temporary, path)
-        except OSError as e:
-            log.warning("could not save learned capacity to %s: %s", path, e)
-
-    # -- state ------------------------------------------------------------
-    def state(self, route: Route) -> RouteState:
-        """The quota bucket for this route, keyed by endpoint AND deployment.
-
-        Not by endpoint. Azure grants quota to a deployment — x-ratelimit-key
-        comes back as the deployment name — so two deployments of the same model
-        on one resource have two ceilings, two loads and two throttles. Folding
-        them together would have one route's 429 park the other, and would spend
-        one ceiling's worth of budget against the sum of two.
-        """
-        key = str(route)
-        st = self.states.get(key)
-        if st is None:
-            st = self.states[key] = RouteState(key)
-            st.safe_rpm = self._saved_capacity.get(key, 0.0)
-        return st
-
-    def observed(self, route: Route, status: int, headers) -> None:
-        """Fold one upstream response into the route's state."""
-        st = self.state(route)
-        st.last_status = str(status)
-
-        limit_r = _as_number(headers.get("x-ratelimit-limit-requests"))
-        limit_t = _as_number(headers.get("x-ratelimit-limit-tokens"))
-        if limit_r:
-            st.limit_requests = limit_r
-        if limit_t:
-            st.limit_tokens = limit_t
-        remaining_r = _as_number(headers.get("x-ratelimit-remaining-requests"))
-        remaining_t = _as_number(headers.get("x-ratelimit-remaining-tokens"))
-        if remaining_r is not None or remaining_t is not None:
-            st.remaining_requests = remaining_r
-            st.remaining_tokens = remaining_t
-            st.renewal_seconds = _as_number(
-                headers.get("x-ratelimit-renewalperiod-requests")
-                or headers.get("x-ratelimit-renewalperiod-tokens"))
-            st.observed_at = time.time()
-
-    # -- the proxy's own ledger -------------------------------------------
-    def estimate_tokens(self, route: Route, request_bytes: int) -> float:
-        """What this request is expected to cost the deployment.
-
-        Charged at dispatch, because that is when Azure charges it and because
-        waiting for the answer would make the load signal lag by the length of
-        a request — which, for a reasoning turn, is most of the window.
-
-        The request's own size is the only thing available at that moment, so
-        the estimate is bytes x a learned tokens-per-byte ratio. The seed value
-        is a plain characters-per-token guess; every response that states its
-        usage corrects it (see `settle`). Being wrong here is survivable: the
-        ratio is per-route and converges within a handful of requests, and the
-        threshold it feeds is a soft one.
-        """
-        st = self.state(route)
-        ratio = st.tokens_per_char
-        if ratio is None:
-            ratio = 1.0 / self.cfg.chars_per_token
-        return max(1.0, request_bytes * ratio)
-
-    def charge(self, route: Route, tokens: float,
-               face: int = 0) -> List[float]:
-        """Record a dispatch. Returns the ledger entry, for `settle`."""
-        now = time.time()
-        st = self.state(route)
-        st.prune(now, max(self.cfg.load_window, self.rpm_window))
-        cutoff = now - self.rpm_window
-        recent = sum(1 for item in st.sent if item[0] >= cutoff)
-        dispatch_rpm = (recent + 1) * 60.0 / self.rpm_window
-        entry = [now, float(tokens), face, dispatch_rpm]
-        st.sent.append(entry)
-        st.last_dispatch_rpm = dispatch_rpm
-        return entry
-
-    def rpm(self, st: RouteState, now: float) -> float:
-        """Requests per minute over the configured rolling window."""
-        cutoff = now - self.rpm_window
-        return sum(1 for item in st.sent if item[0] >= cutoff) \
-            * 60.0 / self.rpm_window
-
-    def rpm_by_face(self, st: RouteState, now: float) -> Dict[str, float]:
-        cutoff = now - self.rpm_window
-        counts = [0] * len(FACES)
-        for item in st.sent:
-            if item[0] >= cutoff:
-                counts[item[2] if len(item) > 2 else 0] += 1
-        return {name: count * 60.0 / self.rpm_window
-                for name, count in zip(FACES, counts)}
-
-    def note_success(self, route: Route,
-                     entry: Optional[List[float]]) -> None:
-        """Raise the saved capacity to the largest proven-safe dispatch RPM."""
-        st = self.state(route)
-        observed = (float(entry[3]) if entry is not None and len(entry) > 3
-                    else self.rpm(st, time.time()))
-        if observed <= 0:
-            return
-        st.ok += 1
-        st.rpm_samples += 1
-        if observed > st.safe_rpm:
-            before = st.safe_rpm
-            st.safe_rpm = observed
-            self._saved_capacity[st.key] = observed
-            self._save_capacity()
-            _ev("capacity", "info",
-                "%s raised learned capacity from %.2f to %.2f RPM",
-                route, before, observed, route=route,
-                capacity_before=round(before, 4),
-                capacity_after=round(observed, 4))
-        # A success at this rate proves a previous `others` observation can no
-        # longer make the route exceed its learned capacity.
-        st.other_rpm = min(st.other_rpm,
-                           max(0.0, st.safe_rpm - observed))
-
-    def note_timeout(self, route: Route,
-                     observed_rpm: Optional[float] = None) -> None:
-        """Record a request that produced no complete upstream response."""
-        st = self.state(route)
-        st.timeouts += 1
-        st.last_status = "timeout"
-        st.last_timeout_rpm = (observed_rpm if observed_rpm is not None
-                               else st.last_dispatch_rpm or None)
-
-    def settle(self, route: Route, entry: Optional[List[float]],
-               request_bytes: int, total_tokens: Optional[int]) -> None:
-        """Replace an estimate with what the response said it actually cost.
-
-        Two things come out of this. The ledger entry is corrected, which only
-        matters if the request was short enough to still be inside the window.
-        The tokens-per-byte ratio is updated, which is the part that pays: it is
-        what every *subsequent* estimate on this route is built from, and it is
-        how a reasoning model's thinking tokens — invisible in the request —
-        get accounted for at all.
-        """
-        if not total_tokens or total_tokens <= 0:
-            return
-        st = self.state(route)
-        if entry is not None:
-            entry[1] = float(total_tokens)
-        if request_bytes <= 0:
-            return
-        sample = total_tokens / float(request_bytes)
-        if st.tokens_per_char is None:
-            st.tokens_per_char = sample
-        else:
-            # Exponential, alpha 0.3: fast enough to follow a change of model or
-            # of prompt shape within a few requests, slow enough that one
-            # unusually long reasoning turn does not redefine the route.
-            st.tokens_per_char = 0.7 * st.tokens_per_char + 0.3 * sample
-        st.token_samples += 1
-
-    def load(self, st: RouteState, now: float) -> Optional[float]:
-        """How much of this route's own quota the proxy is currently using.
-
-        A fraction of *its own* ceiling, never an absolute figure: the three
-        endpoints in service differ by 3x in quota, so a shared number would
-        mean "spill at 70% of the smallest one" for two of them.
-
-        Both dimensions are computed and the larger wins — whichever ceiling is
-        reached first is the one that will produce the 429. In practice that is
-        tokens: the live run on 2026-08-20 sat at ~27% of endpoint-a's TPM while
-        using ~8% of its RPM, so TPM binds about 3x sooner.
-
-        Returns None when nothing is known about the ceiling, and None means
-        *unknown*, not *full*. The caller treats it as "not busy" on purpose: a
-        route that has never answered has to be tried before it can report a
-        ceiling, and a rule that read silence as saturation would make sure it
-        never got the chance.
-        """
-        requests, tokens = st.in_window(now, self.cfg.load_window)
-        fractions = []
-        if st.limit_requests:
-            fractions.append(requests / st.limit_requests)
-        if st.limit_tokens:
-            fractions.append(tokens / st.limit_tokens)
-        if not fractions:
-            return None
-        return max(fractions)
-
-    def load_dimension(self, st: RouteState, now: float) -> Optional[str]:
-        """Which ceiling `load` is currently measuring against.
-
-        Reported so that a reader knows what the load figure IS. "38% of RPM"
-        and "38% of TPM" are the same number about two different walls, and
-        which wall it is decides what to do about it — an RPM-bound route wants
-        fewer, larger requests, a TPM-bound one wants the opposite.
-        """
-        requests, tokens = st.in_window(now, self.cfg.load_window)
-        by_requests = (requests / st.limit_requests) if st.limit_requests else None
-        by_tokens = (tokens / st.limit_tokens) if st.limit_tokens else None
-        if by_requests is None and by_tokens is None:
-            return None
-        if by_tokens is None:
-            return "requests"
-        if by_requests is None:
-            return "tokens"
-        return "tokens" if by_tokens >= by_requests else "requests"
-
-    def load_by_face(self, st: RouteState,
-                     now: float) -> Optional[Dict[str, float]]:
-        """`load`, split into the four FACES. The four sum to `load` exactly.
-
-        Split along whichever dimension `load` itself used, not along a fixed
-        one. Splitting tokens while `load` reported requests would produce four
-        segments that add up to a different number than the total beside them,
-        which in a stacked bar is not a rounding quibble — it is a bar whose
-        segments do not fill it.
-        """
-        dimension = self.load_dimension(st, now)
-        if dimension is None:
-            return None
-        index = 0 if dimension == "requests" else 1
-        ceiling = (st.limit_requests if dimension == "requests"
-                   else st.limit_tokens)
-        per_face = st.in_window_by_face(now, self.cfg.load_window)
-        return {name: pair[index] / ceiling
-                for name, pair in zip(FACES, per_face)}
-
-    # -- everyone else ----------------------------------------------------
-    #
-    # The ledger above counts only what this proxy sent. Quota is granted per
-    # deployment and shared with whoever else holds credentials for it — on this
-    # box alone there are eight other proxies under a different account pointed
-    # at the same endpoints, and two of them could not be read to find out which
-    # deployments they use. A model that assumes the proxy is alone will keep
-    # walking into a wall it cannot see.
-    #
-    # There is exactly one moment when the other tenants become observable: the
-    # instant Azure refuses. A throttle means total consumption reached the
-    # ceiling, and our own share of that total is a number we already have, so
-    #
-    #     foreign = clamp(1 - our_load_at_throttle, 0, 1)
-    #
-    # A throttle at our_load 0.9 says almost all of it was us; a throttle at 0.05
-    # says someone else is using 95% of the deployment and we were merely the
-    # request that arrived last. Nothing else in the response carries this:
-    # x-ratelimit-remaining-* is measured to be a sub-second bucket quoted
-    # against a per-minute ceiling (it read 0.55% consumed at ~48% true load),
-    # so it cannot size a foreign share either. Deliberately not used — a signal
-    # already proven wrong by 90x does not deserve a second try.
-    #
-    # SYNTHETIC PROBES ARE USELESS HERE and the reason is worth writing down,
-    # because "just send a test request" is the obvious idea. Throttling fires on
-    # AGGREGATE consumption, so a single small request succeeds whether the other
-    # tenant is using 90% or 0%. A probe can only distinguish the two by being
-    # large enough to hit the ceiling, which spends real quota and disturbs the
-    # traffic it is trying to measure. The only informative probe is real
-    # traffic. This is TCP's problem exactly: available capacity is discoverable
-    # only by using it.
-    #
-    # So the control law is AIMD, for the same reason TCP uses it:
-    #
-    #   Multiplicative decrease — on a throttle, jump the estimate straight up
-    #     to the observation (and never down: max() with what is already held,
-    #     so a throttle that happens to catch us at high load cannot erase what
-    #     an earlier one revealed).
-    #   Additive increase — between throttles, give the capacity back LINEARLY,
-    #     at foreign_reclaim_per_minute.
-    #
-    # Linear, not an exponential halflife, and this is not a stylistic
-    # preference. An exponential gives back capacity fastest in the moments just
-    # after a throttle — precisely when the deployment is known to be contended
-    # and caution is worth most — and then trails off slowly for a long time
-    # afterwards, when the estimate is stale and worth the least. It is backwards
-    # in both halves. Linear reclaim is constant and gentle throughout.
-    #
-    # AIMD is also the only increase/decrease pairing that converges to a fair
-    # split between independent controllers that cannot see each other (AIAD and
-    # MIMD do not). That is not theoretical tidiness here: several of the other
-    # proxies on this box are plausibly doing something adaptive too, and this is
-    # what keeps two of them from settling into a permanently unfair share.
-    #
-    # Reclaim does not start until Retry-After has elapsed. Azure states how long
-    # this particular congestion is expected to last, so there is no reason to
-    # guess at that timescale.
-
-    def foreign_load(self, st: RouteState, now: float) -> float:
-        """The current estimate of what other tenants are taking.
-
-        Reclaimed linearly since the last throttle, after that throttle's
-        Retry-After has passed. This remains an internal routing signal; the
-        dashboard reports the separate safe-RPM observation.
-        """
-        if not self.cfg.foreign_enabled or st.foreign <= 0.0:
-            return 0.0
-        rate = self.cfg.foreign_reclaim
-        if rate <= 0:
-            return st.foreign
-        start = max(st.foreign_at, st.foreign_hold_until)
-        if now <= start:
-            return st.foreign
-        return max(0.0, st.foreign - (now - start) / 60.0 * rate)
-
-    def total_load(self, st: RouteState, now: float) -> Optional[float]:
-        """Our load plus everyone else's. None only if the ceiling is unknown.
-
-        This — not `load` — is what both routing modes act on. A route that is
-        60% consumed by someone else has 40% left to offer, whatever our own
-        ledger says about it.
-        """
-        ours = self.load(st, now)
-        if ours is None:
-            return None
-        return ours + self.foreign_load(st, now)
-
-    def note_foreign(self, route: Route, retry_after=None,
-                     observed_rpm: Optional[float] = None) -> Optional[dict]:
-        """At a throttle, capacity minus our RPM is concurrent outside RPM."""
-        now = time.time()
-        st = self.state(route)
-        our_rpm = (observed_rpm if observed_rpm is not None
-                   else st.last_dispatch_rpm or self.rpm(st, now))
-        st.last_throttle_rpm = our_rpm
-        before_rpm = st.other_rpm
-        outside_rpm = max(0.0, st.safe_rpm - our_rpm)
-        st.other_rpm = outside_rpm
-
-        ours = self.load(st, now)
-        held = self.foreign_load(st, now)
-        if self.cfg.foreign_enabled and ours is not None:
-            observed = min(1.0, max(0.0, 1.0 - ours))
-            st.foreign = max(held, observed)
-        st.foreign_at = now
-        park = _as_number(retry_after)
-        st.foreign_hold_until = now + max(0.0, park or 0.0)
-        st.foreign_samples += 1
-        st.foreign_our_load = ours
-        moved = {"our_load": (round(ours, 4) if ours is not None else None),
-                 "our_rpm": round(our_rpm, 4),
-                 "capacity_rpm": (round(st.safe_rpm, 4)
-                                  if st.safe_rpm > 0 else None),
-                 "other_rpm": round(outside_rpm, 4),
-                 "foreign_before": round(held, 4),
-                 "foreign_after": round(st.foreign, 4),
-                 "foreign_samples": st.foreign_samples,
-                 "foreign_hold_seconds": round(max(0.0, park or 0.0), 1)}
-        if outside_rpm > 0:
-            _ev("foreign", "info",
-                "%s throttled at %.2f RPM below its %.2f RPM learned maximum; "
-                "the %.2f RPM difference is others",
-                route, our_rpm, st.safe_rpm, outside_rpm,
-                route=route, **moved)
-        return moved if ours is not None or st.safe_rpm > 0 else None
-
-    def demote(self, route: Route, reason: str, retry_after=None,
-               observed_rpm: Optional[float] = None) -> None:
-        """Temporarily send less traffic here.
-
-        Not just "skip it for this one request" — a 429 says the deployment is
-        at its ceiling right now, which is a fact about the next few seconds,
-        not about one caller. Retry-After, when Azure sends it, is a better
-        answer than any constant, so it wins.
-
-        This coexists with the foreign-load estimate rather than being replaced
-        by it, and the two are deliberately NOT the same mechanism:
-
-          * the penalty and parking window here are an evasive manoeuvre on the
-            scale of seconds — get off this deployment until Retry-After has
-            passed. It applies to 5xx and transport errors too, which say
-            nothing at all about quota.
-          * foreign load is a standing estimate of how much of the deployment
-            is not ours to use, on the scale of minutes. It changes the size the
-            route is believed to be, not whether it is currently answering.
-
-        Stacking them is correct: a throttled route should be both avoided right
-        now (parking) and treated as smaller from now on (foreign). Folding
-        either into the other would lose one of the two timescales — and it is
-        the slow one that keeps the proxy from re-learning the same wall every
-        thirty seconds.
-        """
-        now = time.time()
-        st = self.state(route)
-        moved = None
-        if reason == "429":
-            st.rate_limited += 1
-            # Only rate limits carry information about other tenants. A 500 or a
-            # connection reset means the endpoint is unwell, not that its quota
-            # is spoken for, and inferring a foreign share from one would
-            # permanently shrink a route for being briefly broken.
-            moved = self.note_foreign(route, retry_after, observed_rpm)
-        else:
-            st.errors += 1
-        st.last_status = reason
-
-        self._decay(st, now)
-        st.penalty = max(self.cfg.weight_floor,
-                         st.penalty * self.cfg.demote_multiplier)
-        park = _as_number(retry_after)
-        if park is None or park <= 0:
-            park = self.cfg.demote_seconds
-        st.penalty_until = max(st.penalty_until, now + park)
-        st.penalty_at = now
-        # Two kinds, because they are two different claims. A throttle says the
-        # deployment is at ITS ceiling, which is partly a statement about
-        # everyone else on it; anything else says this endpoint is unwell, which
-        # is a statement about nobody but itself.
-        _ev("throttle" if reason == "429" else "demote", "info",
-            "demoted %s on %s: weight x%.2f for %.0fs",
-            route, reason, st.penalty, park,
-            route=route, reason=reason, penalty=round(st.penalty, 4),
-            park_seconds=round(park, 1),
-            foreign_updated=moved is not None, **(moved or {}))
-
-    def failed(self, route: Route, reason: str) -> None:
-        self.demote(route, reason)
-
-    def _decay(self, st: RouteState, now: float) -> None:
-        """Walk a penalty back towards 1.0 as time passes.
-
-        Recovery starts only once the Retry-After window is over, so a route
-        Azure has explicitly asked us to leave alone is left alone for exactly
-        as long as it asked.
-        """
-        if st.penalty >= 1.0:
-            return
-        start = max(st.penalty_until, st.penalty_at)
-        if now <= start:
-            return
-        halflife = self.cfg.demote_halflife
-        if halflife <= 0:
-            st.penalty = 1.0
-        else:
-            st.penalty = min(1.0, st.penalty * 2 ** ((now - start) / halflife))
-        st.penalty_at = now
-
-    # -- weights ----------------------------------------------------------
-    def measured_capacity(self, st: RouteState) -> Optional[float]:
-        """What Azure said this deployment's ceiling is, or None.
-
-        Tokens first: TPM is the constraint that binds. The live run on
-        2026-08-20 sat at ~27% of endpoint-a's TPM ceiling while using ~8% of its
-        RPM one, so a request-count weight would be tracking the limit that is
-        not the limit. The two are not reliably proportional across deployments,
-        so which one is used has to be decided rather than assumed.
-
-        This value remains the routing signal. The dashboard uses the separate,
-        persisted safe-RPM maximum learned from successful traffic.
-        """
-        return st.limit_tokens or st.limit_requests or None
-
-    def static_prior(self, route: Route) -> float:
-        """The cold-start guess for a route Azure has not described yet.
-
-        The probe's ARM figure first, and it is barely a guess: `rateLimits` is
-        quoted in the same units as x-ratelimit-limit-*, per deployment, so a
-        route starts out knowing its real ceiling and the first response merely
-        confirms it. Tokens before requests, matching measured_capacity, so the
-        prior and the measurement are on one scale and the conversion in
-        weights() is an identity for these routes.
-
-        The per-endpoint table in policy.yaml is what is left for a route ARM
-        could not describe: an endpoint with no coordinates, no ARM permission,
-        or a runtime/ written before any of this. It is a worse answer by
-        construction — quota is granted per deployment, and one endpoint's
-        deployments do not share a number.
-        """
-        capacity = route.capacity_tokens or route.capacity_requests
-        if capacity:
-            return float(capacity)
-        static = self.cfg.static_weights.get(route.endpoint)
-        try:
-            static = float(static)
-        except (TypeError, ValueError):
-            return 1.0
-        return static if static > 0 else 1.0
-
-    def headroom(self, st: RouteState, now: float) -> Optional[float]:
-        """Fraction of the window still unspent, or None if we cannot say.
-
-        None and 1.0 are different answers and the caller treats them the same
-        on purpose: an observation older than the TTL means *unknown*, not
-        *empty*, and a route must not be starved for having gone quiet.
-        """
-        if st.observed_at is None:
-            return None
-        if now - st.observed_at > self.cfg.observation_ttl:
-            return None
-        fractions = []
-        if st.limit_tokens and st.remaining_tokens is not None:
-            fractions.append(st.remaining_tokens / st.limit_tokens)
-        if st.limit_requests and st.remaining_requests is not None:
-            fractions.append(st.remaining_requests / st.limit_requests)
-        if not fractions:
-            return None
-        return max(0.0, min(1.0, min(fractions)))
-
-    def effective_penalty(self, st: RouteState, now: float) -> float:
-        """The multiplier a route's weight actually gets right now.
-
-        Inside the parking window it is the floor, not the accumulated penalty:
-        Retry-After is Azure saying how long this deployment will keep refusing,
-        and there is nothing to be gained by arguing with it. The floor rather
-        than zero so the route stays reachable — it is the last route on some
-        model's chain, and it has to be able to report a fresh quota header to
-        climb back out.
-        """
-        if now < st.penalty_until:
-            return self.cfg.weight_floor
-        return max(self.cfg.weight_floor, min(1.0, st.penalty))
-
-    def weights(self, routes: List[Route],
-                now: Optional[float] = None) -> List[float]:
-        """Weights for one model's routes, on one scale.
-
-        The whole set has to be computed together, because a measured route and
-        an unmeasured one are not quoted in the same units. Azure reports TPM in
-        the hundreds of thousands; the static table in policy.yaml is a handful
-        of RPM figures someone typed. Scoring them against each other directly
-        is a trap that closes immediately: the first response to arrive gives
-        one route a ceiling of 333000 while every route still unmeasured sits at
-        333, the sampler never picks any of them again, and they never get a
-        chance to report a ceiling of their own. Strict priority with extra
-        steps — which is exactly what this was supposed to replace.
-
-        So the priors are converted into measured units first, using the routes
-        where both numbers are known. When nothing has been measured yet the
-        priors are already mutually consistent and are used as they are; when
-        the priors are equal or absent, an unmeasured route inherits the mean
-        measured capacity. That last case is the important one, because it is
-        the default: a route nobody has numbers for is assumed average, tried,
-        and thereby measured.
-        """
-        now = time.time() if now is None else now
-        states = [self.state(r) for r in routes]
-        for st in states:
-            self._decay(st, now)
-
-        measured = [self.measured_capacity(st) for st in states]
-        priors = [self.static_prior(r) for r in routes]
-
-        both = [(m, p) for m, p in zip(measured, priors) if m]
-        if both:
-            scale = (sum(m for m, _ in both) / len(both)
-                     / (sum(p for _, p in both) / len(both)))
-        else:
-            scale = 1.0
-
-        out = []
-        for st, cap, prior in zip(states, measured, priors):
-            capacity = cap if cap else prior * scale
-
-            # Everything below only ever REDUCES a route, and the reductions are
-            # collected into one factor rather than applied one at a time. That
-            # matters because they stack: a route that is fully loaded AND
-            # parked AND low on headroom would otherwise be floored three times
-            # over and end up at 0.05^3 of its size — 1 request in 8000, which
-            # is starvation with extra steps.
-            #
-            # Flooring the PRODUCT is what makes weight_floor mean what
-            # policy.yaml says it means, and it is what keeps the control loop
-            # closed. A route believed to be full still receives 5% of its
-            # capacity in real traffic, and those requests are the probe: they
-            # cost nothing extra, they are indistinguishable from ordinary work,
-            # and if the other tenant has gone away they simply succeed and the
-            # reclaim above starts giving the route back. Without a floor here
-            # the estimate could only ever go up, because the only thing that
-            # can lower it is traffic we would no longer be sending.
-            reduction = 1.0
-
-            # Sample by what is actually LEFT, not by how big the deployment is
-            # on paper. A route 60% consumed by other tenants has 40% to offer,
-            # and weighting it at its full ceiling is how the proxy used to keep
-            # pushing into a wall it could not see.
-            #
-            # Our own load is in here too, which makes this a closed loop rather
-            # than a static split: sending to a route lowers its weight, so
-            # traffic settles where every route carries the same FRACTION of its
-            # own ceiling. That is the fixed point of weight_i = L_i(1 - f_i)
-            # under proportional sampling, and it is the right definition of
-            # balanced. It does not oscillate: the load it reads is a 60s
-            # sliding average and the sampler is stochastic, so there is no
-            # synchronised herd to swing.
-            total = self.total_load(st, now)
-            if total is not None:
-                reduction *= max(0.0, 1.0 - total)
-
-            head = self.headroom(st, now)
-            high = self.cfg.headroom_high_water
-            if head is not None and high > 0 and head < high:
-                # Flat above the high-water mark, linear below it. Anything
-                # smoother would be reacting to noise: `remaining` reads
-                # near-full nearly always, so the only part of its range that
-                # carries information is the bottom.
-                reduction *= head / high
-
-            reduction *= self.effective_penalty(st, now)
-            out.append(capacity * max(self.cfg.weight_floor, reduction))
-        return out
-
-    # -- selection --------------------------------------------------------
-    def order(self, routes: List[Route]) -> List[Route]:
-        """The order to try `routes` in. Never drops or duplicates one."""
-        if len(routes) < 2 or self.cfg.balance == "strict_priority":
-            return list(routes)
-        if self.cfg.balance == "capacity":
-            return self._sample(routes)
-        return self._priority_threshold(routes)
-
-    def _priority_threshold(self, routes: List[Route]) -> List[Route]:
-        """Priority order, but step over a route that is already busy."""
-        now = time.time()
-        threshold = self.cfg.spill_threshold
-        for i, route in enumerate(routes):
-            st = self.state(route)
-            self._decay(st, now)
-            if now < st.penalty_until:
-                # Azure asked us to stay off this one. Being under threshold
-                # does not override that — the ledger only knows about our own
-                # traffic, and a Retry-After is the deployment telling us about
-                # everyone's.
-                continue
-            load = self.total_load(st, now)
-            if load is None or load < threshold:
-                # Head is this route; the rest of the chain stays in priority
-                # order, so failover remains the same predictable walk.
-                return [route] + routes[:i] + routes[i + 1:]
-        # Nothing is under its threshold. There is no "next" endpoint left to
-        # overflow into, so spread by capacity rather than handing all of it
-        # back to route one.
-        return self._sample(routes)
-
-    def _sample(self, routes: List[Route]) -> List[Route]:
-        """Draw the whole list without replacement, in proportion to weight.
-
-        Without replacement is what keeps the failover chain intact: the first
-        draw is where the request goes, the rest are the order it falls back
-        through, and no endpoint appears twice.
-        """
-        pool = list(routes)
-        weights = self.weights(pool)
-        chosen: List[Route] = []
-        while pool:
-            total = sum(weights)
-            if total <= 0:
-                # Every candidate is parked. Priority order is as good an answer
-                # as any, and better than none: something has to be tried.
-                chosen.extend(pool)
-                break
-            target = random.random() * total
-            index = len(pool) - 1
-            for i, w in enumerate(weights):
-                target -= w
-                if target <= 0:
-                    index = i
-                    break
-            chosen.append(pool.pop(index))
-            weights.pop(index)
-        return chosen
-
-    def note_attempt(self, route: Route) -> None:
-        self.state(route).attempts += 1
-
-    # -- reporting --------------------------------------------------------
-    def report(self, routes_by_model: Dict[str, List[Route]]) -> dict:
-        now = time.time()
-        seen: Dict[str, dict] = {}
-        models = {}
-        for model, routes in sorted(routes_by_model.items()):
-            weights = self.weights(routes, now)
-            total = sum(weights) or 1.0
-            models[model] = [
-                {"route": str(r), "weight": round(w, 1),
-                 "share": round(w / total, 4)}
-                for r, w in zip(routes, weights)
-            ]
-            for r, weight in zip(routes, weights):
-                st = self.state(r)
-                requests, tokens = st.in_window(now, self.cfg.load_window)
-                by_face = st.in_window_by_face(now, self.cfg.load_window)
-                load_by_face = self.load_by_face(st, now)
-                current_rpm = self.rpm(st, now)
-                rpm_by_face = self.rpm_by_face(st, now)
-                seen[st.key] = {
-                    "endpoint": r.endpoint,
-                    "deployment": r.deployment,
-                    "model_version": r.model_version,
-                    "priority": r.priority,
-                    "weight": round(weight, 1),
-                    # What ARM says this deployment was granted, from the probe.
-                    # Reported next to the measured pair below because the two
-                    # are the same quantity from two sources: a disagreement
-                    # means the quota moved since the last probe.
-                    "capacity_requests": r.capacity_requests,
-                    "capacity_tokens": r.capacity_tokens,
-                    # Runtime capacity is learned from traffic. The largest RPM
-                    # that completed without a limit is monotonic and persisted;
-                    # a later throttle below it exposes the difference as other
-                    # users' concurrent RPM.
-                    "current_rpm": round(current_rpm, 4),
-                    "capacity_rpm": (round(st.safe_rpm, 4)
-                                     if st.safe_rpm > 0 else None),
-                    "other_rpm": round(st.other_rpm, 4),
-                    "rpm_window_seconds": self.rpm_window,
-                    "rpm_samples": st.rpm_samples,
-                    "last_throttle_rpm": (round(st.last_throttle_rpm, 4)
-                                          if st.last_throttle_rpm is not None
-                                          else None),
-                    "timeouts": st.timeouts,
-                    "last_timeout_rpm": (round(st.last_timeout_rpm, 4)
-                                         if st.last_timeout_rpm is not None
-                                         else None),
-                    "rpm_by_face": {k: round(v, 4)
-                                    for k, v in rpm_by_face.items()},
-                    "limit_requests": st.limit_requests,
-                    "limit_tokens": st.limit_tokens,
-                    # What THIS proxy has sent inside the load window, which is
-                    # what the threshold mode acts on. Not the same thing as
-                    # remaining_* below, and deliberately reported next to it:
-                    # when the two disagree, someone else is on this deployment.
-                    "sent_requests_in_window": requests,
-                    "sent_tokens_in_window": round(tokens),
-                    # The same two figures split four ways by FACES, and our
-                    # load split the same way. The split is along whichever
-                    # ceiling `load` is measuring against — named here rather
-                    # than left to be guessed, because the four fractions are
-                    # only meaningful next to the dimension they are fractions
-                    # of, and they are built to sum to `our_load` exactly so a
-                    # stacked bar drawn from them fills to the right place.
-                    "sent_by_face": {
-                        name: {"requests": pair[0], "tokens": round(pair[1])}
-                        for name, pair in zip(FACES, by_face)},
-                    "load_dimension": self.load_dimension(st, now),
-                    # Six places, not four. A handful of requests against
-                    # a 150k RPM ceiling is 2e-5 of it, which rounds to a flat
-                    # zero at four — and a zero here is indistinguishable from
-                    # "nothing was sent", which is the one thing this field
-                    # exists to tell apart. The totals above keep four places:
-                    # they are read as percentages, where the extra digits are
-                    # noise.
-                    "our_load_by_face": (
-                        None if load_by_face is None else
-                        {k: round(v, 6) for k, v in load_by_face.items()}),
-                    # `load` is the old name for `our_load` and is kept so an
-                    # existing dashboard or eyeball does not silently start
-                    # reading nothing.
-                    "load": (lambda l: None if l is None else round(l, 4))(
-                        self.load(st, now)),
-                    # Split out rather than folded together: a high total is
-                    # actionable in completely different ways depending on
-                    # whether it is us or someone else, and the age says whether
-                    # the foreign figure is a fresh observation or one that has
-                    # nearly been reclaimed away.
-                    "our_load": (lambda l: None if l is None else round(l, 4))(
-                        self.load(st, now)),
-                    "foreign_load": round(self.foreign_load(st, now), 4),
-                    "total_load": (lambda l: None if l is None else round(l, 4))(
-                        self.total_load(st, now)),
-                    "foreign_observed_age_seconds": (
-                        None if not st.foreign_samples
-                        else round(now - st.foreign_at, 1)),
-                    "foreign_our_load_at_throttle": st.foreign_our_load,
-                    "foreign_reclaim_per_minute": self.cfg.foreign_reclaim,
-                    "foreign_reclaim_starts_in": max(
-                        0.0, round(st.foreign_hold_until - now, 1)),
-                    "foreign_samples": st.foreign_samples,
-                    "spill_threshold": self.cfg.spill_threshold,
-                    "tokens_per_request_estimate": (
-                        None if st.tokens_per_char is None else
-                        round(st.tokens_per_char, 4)),
-                    "token_samples": st.token_samples,
-                    "remaining_requests": st.remaining_requests,
-                    "remaining_tokens": st.remaining_tokens,
-                    "renewal_seconds": st.renewal_seconds,
-                    "observed_age_seconds": (
-                        None if st.observed_at is None
-                        else round(now - st.observed_at, 1)),
-                    "headroom": (lambda h: None if h is None else round(h, 4))(
-                        self.headroom(st, now)),
-                    # The multiplier actually in force, which inside a parking
-                    # window is the floor rather than the accumulated penalty.
-                    "penalty": round(self.effective_penalty(st, now), 4),
-                    "penalty_recovering_to": round(st.penalty, 4),
-                    "parked_for_seconds": max(
-                        0.0, round(st.penalty_until - now, 1)),
-                    "attempts": st.attempts,
-                    "ok": st.ok,
-                    "rate_limited": st.rate_limited,
-                    "errors": st.errors,
-                    "last_status": st.last_status,
-                }
-        return {"balance": self.cfg.balance,
-                "load_window_seconds": self.cfg.load_window,
-                "rpm_window_seconds": self.rpm_window,
-                # The canonical order of the four faces, so a reader stacking
-                # them does not have to hard-code it and drift.
-                "faces": list(FACES),
-                "routes": seen, "models": models}
 
 
 # --------------------------------------------------------------------------
@@ -1618,6 +251,8 @@ class SessionAffinity:
         # Cumulative, never reset: "did the fallback fire at all during my run"
         # is the question this answers, and it should be one read of /healthz
         # rather than a grep over a log that runs to tens of megabytes.
+        self._bound = {}
+        self._catalog = {}
         self._stripped = 0
         self._inherited = 0
         self._rejected = 0
@@ -1808,6 +443,23 @@ class SessionAffinity:
             while len(book) > self.cfg.affinity_max:
                 book.popitem(last=False)
 
+        for key in list(self._bound):
+            if key not in self._pins:
+                self._bound.pop(key, None)
+        for key in list(self._catalog):
+            if key not in self._family:
+                self._catalog.pop(key, None)
+
+    def candidates(self, request, body, table, active):
+        """Retain the family catalog for bound sessions as deployments drain."""
+        family = self.family(request, body)
+        self._expire(time.time())
+        catalog = self._catalog.get(family, {}).get("tables", {})
+        retained = catalog.get(table, {}).get(body.get("model"), [])
+        # Active order is supplied by routing. Retired routes are only
+        # accessible through this family's retained catalog.
+        return list(active) + [r for r in retained if str(r) not in {str(a) for a in active}]
+
     def home(self, family: Optional[str],
              routes: List[Route]) -> Tuple[Optional[str], List[Route]]:
         """The endpoint this session's state lives on, and the way in.
@@ -1836,22 +488,10 @@ class SessionAffinity:
 
     def pinned(self, key: Optional[str],
                routes: List[Route]) -> Optional[Route]:
-        """The route this session is bound to, if it is still usable.
+        """Use the retained descriptor while a bound deployment drains.
 
-        A pin naming a route that no longer serves the model is not honoured —
-        the sibling deployment on the same endpoint is not the same
-        destination, and neither is another endpoint. The state is lost either
-        way, and refusing to route at all would be worse than routing somewhere
-        it might work.
-
-        It is not deleted either. Reading is not the place to destroy a
-        binding: the entry belongs to whoever pinned it, this request has
-        already decided not to use it, and the next successful response on this
-        slot overwrites it anyway. Deleting here is what turns one unusable
-        lookup into a session that has silently lost its pin and will be
-        balanced onto a deployment that cannot decrypt what it carries — a dead
-        run rather than a degraded turn. A stale entry costs one slot until the
-        TTL or the LRU takes it.
+        Publishing a new model table leaves existing bindings intact. Expiry
+        and explicit successful re-binding still follow the affinity policy.
         """
         if not key:
             return None
@@ -1860,6 +500,11 @@ class SessionAffinity:
         entry = self._pins.get(key)
         if entry is None:
             return None
+        route = self._bound.get(key)
+        if route is not None:
+            entry[1] = now
+            self._pins.move_to_end(key)
+            return route
         for route in routes:
             if str(route) == entry[0]:
                 entry[1] = now
@@ -1882,6 +527,7 @@ class SessionAffinity:
         """
         now = time.time()
         if key:
+            self._bound[key] = route
             entry = self._pins.get(key)
             if entry is None:
                 _ev("pin", "info", "session pinned to %s (%d live)", route,
@@ -1914,6 +560,22 @@ class SessionAffinity:
                 entry[0], entry[1] = route.endpoint, now
             self._family.move_to_end(family)
 
+        if family:
+            catalog = self._catalog.get(family)
+            if not catalog or catalog["endpoint"] != route.endpoint:
+                catalog = self._catalog[family] = {"endpoint": route.endpoint, "tables": {},
+                                                   "images": {}}
+            deployment = getattr(self.cfg, "image_deployments", {}).get(route.endpoint)
+            if deployment:
+                catalog["images"][route.endpoint] = deployment
+            for table in TABLES:
+                retained = catalog["tables"].setdefault(table, {})
+                for model, candidates in getattr(self.cfg, table, {}).items():
+                    local = [r for r in candidates if r.endpoint == route.endpoint]
+                    if local:
+                        previous = retained.get(model, [])
+                        retained[model] = local + [r for r in previous
+                                                 if str(r) not in {str(a) for a in local}]
         self._expire(now)
 
     def report(self) -> dict:
@@ -2015,6 +677,8 @@ class TokenCache:
         return max(0.0, self._expires_at - time.time())
 
     def status(self) -> dict:
+        if self._static:
+            return {"have_token": True, "expires_in_seconds": 3600, "last_error": None}
         return {"have_token": bool(self._token),
                 "expires_in_seconds": round(self.expires_in(), 1),
                 "last_error": self._last_error}
@@ -2079,6 +743,8 @@ class TokenCache:
 
     async def run_background_refresh(self, interval: float = 30.0):
         """Keep the token warm so no request pays for the `az` subprocess."""
+        if self._static:
+            return
         while True:
             try:
                 await asyncio.sleep(interval)
@@ -2110,35 +776,22 @@ def _setup_logging(level: str):
 PIDFILE = os.path.join(ROOT, ".proxy.pid")
 
 
+_claim = None
+
+
 def write_pidfile() -> None:
-    """Claim the pidfile.
-
-    Written by the process itself rather than by start.sh, which used `$!`.
-    The difference that matters is the other end: the process can drop the file
-    on its way out, so a clean shutdown does not leave a pid behind for stop.sh
-    to have to recognise as debris.
-
-    Under ROOT, not under the working directory. A pidfile identifies one
-    INSTALLATION's running proxy, and resolving it against cwd made it identify
-    "whatever directory someone happened to launch from" instead — which the
-    test suite discovered the hard way: it spawns proxies with AZURE_PROXY_HOME
-    pointed at a temporary tree but inherits the caller's cwd, so running the
-    tests from the repo overwrote the live service's pidfile and left it
-    orphaned, answering on its port with nothing able to stop it.
-    """
-    with open(PIDFILE, "w") as f:
-        f.write("{}\n".format(os.getpid()))
+    global _claim
+    _claim = ProcessClaim(ROOT, "serving")
 
 
 def clear_pidfile() -> None:
-    """Drop the claim. Safe to call twice, and on a file someone else removed."""
-    try:
-        os.unlink(PIDFILE)
-    except OSError:
-        pass
+    global _claim
+    if _claim:
+        _claim.close()
+        _claim = None
 
 
-cfg = Config()
+cfg = ConfigView(Config(load_routes=False))
 _setup_logging(cfg.log_level)
 tokens = TokenCache(cfg.scope, cfg.refresh_margin)
 # One token cache per distinct data-plane scope. `tokens` is the default-scope
@@ -2152,15 +805,31 @@ for _scope in cfg.scopes:
 
 def token_cache_for(scope: Optional[str]) -> TokenCache:
     """The cache for a route's scope; the default cache when it names none."""
-    return TOKEN_CACHES.get(scope or cfg.scope, tokens)
+    scope = scope or cfg.scope
+    if scope not in TOKEN_CACHES:
+        cache = TOKEN_CACHES[scope] = TokenCache(scope, cfg.refresh_margin)
+        if client is not None:
+            _refreshers.append(asyncio.create_task(cache.run_background_refresh()))
+    return TOKEN_CACHES[scope]
 
 
-quota = QuotaTracker(cfg)
+bridge = ServingBridge(ROOT, cfg)
+telemetry = Telemetry(bridge)
 affinity = SessionAffinity(cfg)
 app = FastAPI(title="azure-proxy", docs_url=None, redoc_url=None)
 client: Optional[httpx.AsyncClient] = None
 _refreshers: List[asyncio.Task] = []
 STARTED_AT = time.time()
+bridge.sessions = affinity.report
+app.add_middleware(SnapshotMiddleware, config=cfg)
+
+
+def _install_scopes(candidate):
+    for scope in candidate.scopes:
+        token_cache_for(scope)
+
+
+bridge.on_config = _install_scopes
 
 
 def _az_account() -> Optional[str]:
@@ -2245,6 +914,7 @@ def _log_startup():
 @app.on_event("startup")
 async def _startup():
     global client
+    await bridge.start()
     client = httpx.AsyncClient(timeout=httpx.Timeout(cfg.timeout, connect=15.0))
     # Prime every scope's token at boot rather than on the first request, so a
     # bad login fails loudly here. One background refresher per cache.
@@ -2261,6 +931,10 @@ async def _shutdown():
         task.cancel()
     if client:
         await client.aclose()
+    await bridge.stop()
+    # Uvicorn may re-raise SIGTERM after its graceful shutdown has completed.
+    # Release ownership during lifespan shutdown as well as through atexit.
+    clear_pidfile()
 
 
 @app.get("/healthz")
@@ -2273,6 +947,9 @@ async def healthz():
     ok = all(s["have_token"] and s["expires_in_seconds"] > 0
              for s in per_scope.values())
     return {"ok": ok,
+            "role": "serving",
+            "pid": os.getpid(),
+            "routing": bridge.status(),
             "models": len(cfg.routes),
             "responses_models": len(cfg.responses_routes),
             "image_models": len(cfg.image_routes),
@@ -2298,75 +975,31 @@ async def healthz():
 
 @app.get("/routes")
 async def routes_report():
-    """Why each request went where it went.
-
-    Routing is the one thing here whose behaviour cannot be read off the config
-    — it depends on quota headers Azure sent minutes ago, on how much of the
-    window the proxy has already spent, and on 429s that have since decayed
-    away. When the split looks wrong, this is the only place that can say
-    whether the weights, the load fractions, the headroom brake or a demotion is
-    responsible. Numbers only; no request or response content passes through it.
-
-    `sent_*_in_window` next to `remaining_*` is the pairing worth reading: the
-    first is this proxy's own ledger, the second is Azure's. When they tell
-    different stories, someone else is spending the same deployment's quota.
-    """
-    # Every face draws from the same (endpoint, deployment) buckets, so union
-    # them rather than reporting one model twice under two headings.
-    merged: Dict[str, List[Route]] = dict(cfg.routes)
-    for table in (cfg.responses_routes, cfg.image_routes):
-        for name, routes in table.items():
-            merged.setdefault(name, routes)
-    report = quota.report(merged)
-    # Which endpoint a request lands on is no longer decided by the balancer
-    # alone: a pinned session overrides it entirely. Reporting the pins next to
-    # the weights is what makes an "unbalanced" split explainable rather than
-    # mysterious.
+    report = dict((bridge.snapshot or {}).get("report", {}))
     report["session_affinity"] = affinity.report()
-    # Which faces each model can actually be reached on. The dashboard's model
-    # view needs it to explain why a model with three sources shows traffic on
-    # only one of the bar segments — a Responses-only model cannot produce a
-    # chat segment, and that is configuration, not an anomaly.
-    report["model_faces"] = {
-        name: [f for f, table in (("chat", cfg.routes),
-                                  ("responses", cfg.responses_routes),
-                                  ("image", cfg.image_routes),
-                                  ("image_edits", cfg.image_edit_routes))
-               if name in table]
-        for name in merged}
-    report["endpoints"] = [
-        {"name": name, "chat": chat, "responses": responses, "image": image}
-        for name, chat, responses, image in cfg.endpoints]
-    # Which deployment the Responses API's image_generation tool is pointed at
-    # on each endpoint. It is the one routing decision a caller cannot see from
-    # the model name, because it is not made from the model name.
-    report["image_deployments"] = dict(cfg.image_deployments)
+    report["routing"] = bridge.status()
+    report["stats_stale"] = (not report["routing"]["ok"]
+                             or bool(report["routing"]["telemetry_dropped"]))
     return report
 
 
 @app.get("/events")
 async def events_feed(since: int = 0, limit: int = 500,
                       kind: Optional[str] = None):
-    """What the proxy has been doing, as records rather than prose.
-
-    The same events the log narrates — see proxy/events.py for why they are
-    also kept structured. Poll with the `next` cursor from the previous reply;
-    `dropped` is true when the ring turned over faster than the reader read it,
-    so a gap can be labelled instead of silently closed up.
-
-    `kind` is a comma-separated filter, or the word `problems` for the set that
-    means something needs looking at. Numbers, names and statuses only — no
-    request or response content reaches this, the same rule the log follows.
-    """
-    if kind == "problems":
-        kinds = PROBLEM_KINDS
-    elif kind:
-        kinds = frozenset(k.strip() for k in kind.split(",") if k.strip())
-    else:
-        kinds = None
-    found, cursor, dropped = events.since(since, limit=limit, kinds=kinds)
-    return {"events": found, "next": cursor, "dropped": dropped,
-            "counts": events.counts()}
+    feed = (bridge.snapshot or {}).get("events", {})
+    held = feed.get("events", [])
+    fresh = [event for event in held if event["seq"] > since]
+    cursor = feed.get("next", 0)
+    dropped = bool(since > 0 and held and held[0]["seq"] > since + 1)
+    kinds = (PROBLEM_KINDS if kind == "problems" else
+             frozenset(k.strip() for k in kind.split(",")) if kind else None)
+    if kinds is not None:
+        fresh = [event for event in fresh if event["kind"] in kinds]
+    if limit > 0 and len(fresh) > limit:
+        fresh = fresh[-limit:]
+        dropped = True
+    return {"events": fresh, "next": cursor, "dropped": dropped,
+            "counts": feed.get("counts", {}), "stats_stale": not bridge.status()["ok"]}
 
 
 @app.get("/v1/models")
@@ -2428,7 +1061,7 @@ def _relay_headers(resp: httpx.Response, route: Route) -> dict:
 
 
 def _relay(resp: httpx.Response, route: Route, request_bytes: int = 0,
-           entry: Optional[List[float]] = None,
+           entry: Optional[Attempt] = None,
            counted: bool = False) -> Response:
     body = resp.content
     limited = counted
@@ -2443,13 +1076,12 @@ def _relay(resp: httpx.Response, route: Route, request_bytes: int = 0,
             _ev("throttle", "warning",
                 "!! %s returned 200 carrying %s; demoting", route, reason,
                 route=route, inband=True, reason=reason, buffered=True)
-            quota.demote(route, "429", resp.headers.get("retry-after"),
-                         entry[3] if entry is not None and len(entry) > 3
-                         else None)
+            telemetry.demote(route, "429", resp.headers.get("retry-after"),
+                         entry)
             limited = True
-    quota.settle(route, entry, request_bytes, _read_total_tokens(body))
+    telemetry.settle(route, entry, request_bytes, _read_total_tokens(body))
     if resp.status_code < 400 and not limited:
-        quota.note_success(route, entry)
+        telemetry.note_success(route, entry)
     return Response(content=body, status_code=resp.status_code,
                     headers=_relay_headers(resp, route),
                     media_type=resp.headers.get("content-type"))
@@ -2848,7 +1480,7 @@ async def _probe_stream_head(resp: httpx.Response) -> _StreamHead:
 
 def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                   head: _StreamHead, request_bytes: int = 0,
-                  entry: Optional[List[float]] = None,
+                  entry: Optional[Attempt] = None,
                   counted: bool = False,
                   model: Optional[str] = None,
                   family: Optional[str] = None) -> StreamingResponse:
@@ -2872,6 +1504,9 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
     later turn of that session goes out without the ciphertext this one was
     refused for, whatever the routing decides.
     """
+    if entry:
+        entry.streaming = True
+
     async def body():
         sent = 0
         # Whether the upstream iterator ran out, as opposed to this generator
@@ -2891,8 +1526,8 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
             nonlocal success_recorded
             if not success_recorded and not watch.rate_limited \
                     and not watch.upstream_error():
-                quota.settle(route, entry, request_bytes, watch.total_tokens)
-                quota.note_success(route, entry)
+                telemetry.settle(route, entry, request_bytes, watch.total_tokens)
+                telemetry.note_success(route, entry)
                 success_recorded = True
 
         def inspect(chunk: bytes) -> None:
@@ -2905,9 +1540,8 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                     route, INBAND_RATE_LIMIT.decode(), sent,
                     route=route, face=face, model=model, inband=True,
                     too_late=True, bytes=sent)
-                quota.demote(route, "429", resp.headers.get("retry-after"),
-                             entry[3] if entry is not None and len(entry) > 3
-                             else None)
+                telemetry.demote(route, "429", resp.headers.get("retry-after"),
+                             entry)
             if watch.completed:
                 # Clients may close immediately after receiving this event.
                 # Record it before yielding, while cleanup and EOF are pending.
@@ -2949,7 +1583,8 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
             if drained and face != RESPONSES_FACE:
                 record_success()
             if not success_recorded:
-                quota.settle(route, entry, request_bytes, watch.total_tokens)
+                telemetry.settle(route, entry, request_bytes, watch.total_tokens)
+            telemetry.finish(entry)
             await resp.aclose()
             if keep:
                 _capture_stream(route, resp, bytes(seen))
@@ -3241,6 +1876,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     # in the low tens, and calls that take 10-25 seconds. See Config's image
     # block for why that changes the attempt list and the wait between attempts.
     is_image = face.startswith("/v1/images/")
+    image_deployments = _image_deployments(request, body)
     stream = bool(body.get("stream"))
     ledger_face = face_code(face, stream)
     _ev("request", "info", "-> %s model=%s stream=%s", face, requested, stream,
@@ -3292,7 +1928,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     elif pinned is not None:
         # `switch` keeps the old behaviour: try the pin first, then fail over
         # like anything else. Faster, and wrong for codex.
-        attempts = [pinned] + [r for r in routes if r is not pinned]
+        attempts = [pinned] + [r for r in routes if str(r) != str(pinned)]
         attempts = attempts[:cfg.max_attempts]
     elif local:
         # This thread has no pin of its own but its session does. Balance
@@ -3302,7 +1938,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
         # down costs the turn its inherited context rather than the turn.
         affinity.note_inherited()
         rest = [r for r in routes if r.endpoint != home]
-        attempts = (quota.order(local) + quota.order(rest))[:cfg.max_attempts]
+        attempts = (list(local) + list(rest))[:cfg.max_attempts]
         _ev("inherited", "info",
             "%s model=%s has no pin of its own; its session's state is on %s, "
             "so it goes there (%d route(s))",
@@ -3315,13 +1951,13 @@ async def _forward(request: Request, body: dict, routes: List[Route],
         # for the reason repeating it on a text face would be wrong: the refusal
         # is a per-minute request ceiling that refills on a clock, not a sign
         # that this destination is unwell.
-        ordered = quota.order(routes)
+        ordered = list(routes)
         attempts = [ordered[i % len(ordered)]
                     for i in range(max(1, cfg.image_attempts))]
     else:
         # Balancing decides the order; max_attempts still decides the depth, and
         # the list is a permutation of `routes`, so no endpoint is tried twice.
-        attempts = quota.order(routes)[:cfg.max_attempts]
+        attempts = list(routes)[:cfg.max_attempts]
         if sticky and family and _carries_encrypted(body):
             # Nothing knows where this ciphertext came from — a proxy restart,
             # an expired pin, or a client that opened a thread the proxy never
@@ -3421,216 +2057,218 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                     face, requested, dropped, route,
                     route=route, face=face, model=requested, stripped=dropped)
         payload["model"] = route.deployment
-        quota.note_attempt(route)
-        entry = quota.charge(route, quota.estimate_tokens(route, request_bytes),
-                             ledger_face)
-        log.debug("%s model=%s attempt %d/%d on %s",
-                  face, requested, i + 1, len(attempts), route)
-
-        # The Responses API's built-in image_generation tool needs to be told
-        # which deployment to draw with, per attempt, because the answer is a
-        # property of the endpoint the attempt landed on. See the handler for
-        # why the attempt list is already restricted to endpoints that have one.
-        attempt_headers = headers
-        # A route may authenticate against a non-default scope (the AI-Foundry
-        # project endpoint uses ai.azure.com); its token was resolved at the top
-        # of the loop, before this route was charged, so a lapsed scope skips
-        # the route rather than settling a charge it never sent.
-        if route_token is not None:
-            attempt_headers = dict(attempt_headers,
-                                   Authorization="Bearer " + route_token)
-        if image_tool:
-            deployment = cfg.image_deployments.get(route.endpoint)
-            if deployment:
-                attempt_headers = dict(attempt_headers,
-                                       **{IMAGE_TOOL_HEADER: deployment})
-
+        entry = telemetry.charge(route, request_bytes, ledger_face, model=requested)
         try:
-            # stream=True returns as soon as the response headers are in, which
-            # is what makes the retry decision possible before any body has been
-            # handed to the client. A buffered reply just reads it straight back.
-            #
-            # `content=` rather than `json=` when the caller's body must survive
-            # unchanged: an images/edits multipart, whose boundary is already in
-            # the Content-Type header that came with it.
-            upstream = client.build_request(
-                "POST", target_of(route), headers=attempt_headers,
-                **({"content": raw} if raw is not None else {"json": payload}))
-            resp = await client.send(upstream, stream=True)
-        except httpx.TimeoutException:
-            # A slow reasoning call and a hung one are indistinguishable here.
-            # Retrying would pay twice for the same prompt while the original
-            # may still be running, so the caller decides instead. For the same
-            # reason this does not demote the route: slow is not broken, and a
-            # long reasoning turn must not cost an endpoint its share.
-            quota.note_timeout(route, entry[3] if len(entry) > 3 else None)
-            if not cfg.retry_on_timeout:
-                _ev("timeout", "warning",
-                    "<- 504 %s model=%s timed out after %ss on %s",
-                    face, requested, cfg.timeout, route,
-                    route=route, face=face, model=requested,
-                    seconds=cfg.timeout, status=504)
-                return _error(504, "upstream timed out after {}s on {}".format(
-                    cfg.timeout, route), "upstream_timeout")
-            last_error = "timeout on {}".format(route)
-        except httpx.HTTPError as e:
-            quota.failed(route, "transport")
-            if not cfg.retry_on_transport_error:
-                _ev("response", "warning",
-                    "<- 502 %s model=%s transport error on %s: %s",
-                    face, requested, route, e,
-                    route=route, face=face, model=requested,
-                    status=502, error=str(e))
-                return _error(502, "transport error on {}: {}".format(route, e),
-                              "upstream_transport_error")
-            last_error = "transport error on {}: {}".format(route, e)
-        else:
-            # Record before deciding what to do with the response: a 429 on the
-            # last route is still a 429, and the demotion it earns is what keeps
-            # the *next* request off this endpoint.
-            quota.observed(route, resp.status_code, resp.headers)
-            retry_after_hint = resp.headers.get("retry-after")
+            log.debug("%s model=%s attempt %d/%d on %s",
+                      face, requested, i + 1, len(attempts), route)
 
-            # Azure refuses streamed Responses calls with a 200 that carries
-            # retry-after (see THROTTLE_HEADER). Treating that as retryable
-            # here, off the headers, is what makes it behave exactly like a 429:
-            # decided before any body is read, so the failover window does not
-            # depend on how large the stream's preamble happens to be.
-            throttled = _throttled_200(resp)
-            retryable = resp.status_code in cfg.retry_on_status or throttled
-            if retryable:
-                if throttled:
-                    _ev("throttle", "warning",
-                        "!! %s answered 200 + %s: %s throttled",
-                        route, THROTTLE_HEADER,
-                        resp.headers.get(THROTTLE_HEADER),
-                        route=route, face=face, model=requested, inband=True,
-                        header=resp.headers.get(THROTTLE_HEADER))
-                quota.demote(route, "429" if throttled else str(resp.status_code),
-                             resp.headers.get("retry-after"),
-                             entry[3] if len(entry) > 3 else None)
+            # The Responses API's built-in image_generation tool needs to be told
+            # which deployment to draw with, per attempt, because the answer is a
+            # property of the endpoint the attempt landed on. See the handler for
+            # why the attempt list is already restricted to endpoints that have one.
+            attempt_headers = headers
+            # A route may authenticate against a non-default scope (the AI-Foundry
+            # project endpoint uses ai.azure.com); its token was resolved at the top
+            # of the loop, before this route was charged, so a lapsed scope skips
+            # the route rather than settling a charge it never sent.
+            if route_token is not None:
+                attempt_headers = dict(attempt_headers,
+                                       Authorization="Bearer " + route_token)
+            if image_tool:
+                deployment = image_deployments.get(route.endpoint)
+                if deployment:
+                    attempt_headers = dict(attempt_headers,
+                                           **{IMAGE_TOOL_HEADER: deployment})
 
-            if retryable and not is_last:
-                await resp.aread()
-                await resp.aclose()
-                last_error = "{} from {}".format(
-                    "200+throttled" if throttled else resp.status_code, route)
-            elif stream and resp.status_code == 200:
-                # A 200 is not yet an answer on this face. Read the head of the
-                # stream before releasing any of it — see _probe_stream_head.
-                # This is now a backstop: the header check above catches the
-                # refusal Azure has actually been seen to send. It stays because
-                # it is the only thing that can catch one sent without the
-                # header, and it costs nothing when there is nothing to find.
-                head = await _probe_stream_head(resp)
-
-                if head.timed_out:
-                    await resp.aclose()
-                    quota.note_timeout(
-                        route, entry[3] if len(entry) > 3 else None)
+            try:
+                # stream=True returns as soon as the response headers are in, which
+                # is what makes the retry decision possible before any body has been
+                # handed to the client. A buffered reply just reads it straight back.
+                #
+                # `content=` rather than `json=` when the caller's body must survive
+                # unchanged: an images/edits multipart, whose boundary is already in
+                # the Content-Type header that came with it.
+                upstream = client.build_request(
+                    "POST", target_of(route), headers=attempt_headers,
+                    **({"content": raw} if raw is not None else {"json": payload}))
+                resp = await client.send(upstream, stream=True)
+            except httpx.TimeoutException:
+                # A slow reasoning call and a hung one are indistinguishable here.
+                # Retrying would pay twice for the same prompt while the original
+                # may still be running, so the caller decides instead. For the same
+                # reason this does not demote the route: slow is not broken, and a
+                # long reasoning turn must not cost an endpoint its share.
+                telemetry.note_timeout(route, entry)
+                if not cfg.retry_on_timeout:
                     _ev("timeout", "warning",
-                        "<- 504 %s model=%s timed out on %s",
-                        face, requested, route,
+                        "<- 504 %s model=%s timed out after %ss on %s",
+                        face, requested, cfg.timeout, route,
                         route=route, face=face, model=requested,
-                        status=504, in_stream=True)
+                        seconds=cfg.timeout, status=504)
                     return _error(504, "upstream timed out after {}s on {}".format(
                         cfg.timeout, route), "upstream_timeout")
-
-                if head.retry_reason or head.error is not None:
-                    reason = head.retry_reason or "transport"
-                    # Nothing has reached the caller, so this is still a
-                    # pre-first-byte failure and the ordinary failover rules
-                    # apply. That is the entire point of having probed.
-                    #
-                    # Unless the header check above already charged for it: one
-                    # refusal, one demotion. Otherwise a throttle that shows up
-                    # in both places would park the route twice as hard as one
-                    # that only shows up in the headers.
-                    if not throttled:
-                        quota.demote(route,
-                                     "429" if head.retry_reason else reason,
-                                     resp.headers.get("retry-after"),
-                                     entry[3] if len(entry) > 3 else None)
-                    if not is_last:
-                        await resp.aclose()
-                        last_error = "in-stream {} from {}".format(reason, route)
-                        wait, how = pause(attempts[i + 1],
-                                          resp.headers.get("retry-after"))
-                        _ev("failover", "warning",
-                            "!! %s, %s in %.1fs", last_error, how, wait,
-                            route=route, face=face, model=requested,
-                            to_route=str(attempts[i + 1]), reason=reason,
-                            wait_seconds=round(wait, 2), in_stream=True)
-                        await asyncio.sleep(wait)
-                        delay *= cfg.backoff_multiplier
-                        continue
-                    if head.error is not None:
-                        # A connection that died during the probe has no body to
-                        # hand over, so with nowhere left to fail over to this
-                        # is the no-response case.
-                        await resp.aclose()
-                        last_error = "in-stream {} from {}".format(reason, route)
-                        break
-                    # Last route, but there is still a stream to give. Relay it:
-                    # a throttled stream carrying Azure's own error event is more
-                    # use to the caller than a 503 this proxy invented, and it is
-                    # what a direct call would have got.
-                    _ev("throttle", "warning",
-                        "%s model=%s: in-stream %s on the last route "
-                        "%s; relaying it", face, requested, reason, route,
+                last_error = "timeout on {}".format(route)
+            except httpx.HTTPError as e:
+                telemetry.failed(route, "transport", entry)
+                if not cfg.retry_on_transport_error:
+                    _ev("response", "warning",
+                        "<- 502 %s model=%s transport error on %s: %s",
+                        face, requested, route, e,
                         route=route, face=face, model=requested,
-                        reason=reason, in_stream=True, last_route=True)
-
-                if sticky:
-                    affinity.pin(session, route, family, session_type)
-                return _relay_stream(resp, route, face, started, head,
-                                     request_bytes, entry,
-                                     counted=bool(head.retry_reason) or throttled,
-                                     model=requested, family=family)
+                        status=502, error=str(e))
+                    return _error(502, "transport error on {}: {}".format(route, e),
+                                  "upstream_transport_error")
+                last_error = "transport error on {}: {}".format(route, e)
             else:
-                # Everything else is the caller's answer, including a 4xx from
-                # the deployment: parameters are forwarded untouched, so a 400
-                # about an unsupported parameter is the real, useful result.
-                #
-                # A retryable status on the LAST route is relayed too, rather
-                # than replaced with a synthetic 503. A real 429 carries
-                # Retry-After and the upstream's own message, which is what the
-                # client's backoff needs; the error below is reserved for the
-                # case where no route produced a response at all.
-                await resp.aread()
-                await resp.aclose()
-                _ev("response", "info",
-                    "<- %s %s model=%s route=%s %.1fs", resp.status_code,
-                    face, requested, route, time.monotonic() - started,
-                    route=route, face=face, model=requested, stream=False,
-                    status=resp.status_code,
-                    seconds=round(time.monotonic() - started, 1))
-                # The buffered face's shape of the same refusal: a 400 whose
-                # body names invalid_encrypted_content. Same treatment — say so
-                # in the log, and make the client's retry go out stripped.
-                if sticky and ENCRYPTED_REJECTED in resp.content:
-                    _ev("upstream_error", "warning",
-                        "!! %s refused %s model=%s for the encrypted state it "
-                        "carried (%s)", route, face, requested,
-                        ENCRYPTED_REJECTED.decode(),
-                        route=route, face=face, model=requested,
-                        error_code=ENCRYPTED_REJECTED.decode(),
-                        status=resp.status_code)
-                    affinity.note_rejected(family)
-                if sticky and resp.status_code < 400:
-                    affinity.pin(session, route, family, session_type)
-                return _relay(resp, route, request_bytes, entry,
-                              counted=retryable)
+                # Record before deciding what to do with the response: a 429 on the
+                # last route is still a 429, and the demotion it earns is what keeps
+                # the *next* request off this endpoint.
+                telemetry.observed(route, resp.status_code, resp.headers, entry)
+                retry_after_hint = resp.headers.get("retry-after")
 
-        if is_last:
-            break
-        wait, how = pause(attempts[i + 1], retry_after_hint)
-        _ev("failover", "warning", "!! %s, %s in %.1fs", last_error, how, wait,
-            route=route, face=face, model=requested,
-            to_route=str(attempts[i + 1]), reason=last_error,
-            wait_seconds=round(wait, 2))
-        await asyncio.sleep(wait)
-        delay *= cfg.backoff_multiplier
+                # Azure refuses streamed Responses calls with a 200 that carries
+                # retry-after (see THROTTLE_HEADER). Treating that as retryable
+                # here, off the headers, is what makes it behave exactly like a 429:
+                # decided before any body is read, so the failover window does not
+                # depend on how large the stream's preamble happens to be.
+                throttled = _throttled_200(resp)
+                retryable = resp.status_code in cfg.retry_on_status or throttled
+                if retryable:
+                    if throttled:
+                        _ev("throttle", "warning",
+                            "!! %s answered 200 + %s: %s throttled",
+                            route, THROTTLE_HEADER,
+                            resp.headers.get(THROTTLE_HEADER),
+                            route=route, face=face, model=requested, inband=True,
+                            header=resp.headers.get(THROTTLE_HEADER))
+                    telemetry.demote(route, "429" if throttled else str(resp.status_code),
+                                 resp.headers.get("retry-after"),
+                                 entry)
+
+                if retryable and not is_last:
+                    await resp.aread()
+                    await resp.aclose()
+                    last_error = "{} from {}".format(
+                        "200+throttled" if throttled else resp.status_code, route)
+                elif stream and resp.status_code == 200:
+                    # A 200 is not yet an answer on this face. Read the head of the
+                    # stream before releasing any of it — see _probe_stream_head.
+                    # This is now a backstop: the header check above catches the
+                    # refusal Azure has actually been seen to send. It stays because
+                    # it is the only thing that can catch one sent without the
+                    # header, and it costs nothing when there is nothing to find.
+                    head = await _probe_stream_head(resp)
+
+                    if head.timed_out:
+                        await resp.aclose()
+                        telemetry.note_timeout(
+                            route, entry)
+                        _ev("timeout", "warning",
+                            "<- 504 %s model=%s timed out on %s",
+                            face, requested, route,
+                            route=route, face=face, model=requested,
+                            status=504, in_stream=True)
+                        return _error(504, "upstream timed out after {}s on {}".format(
+                            cfg.timeout, route), "upstream_timeout")
+
+                    if head.retry_reason or head.error is not None:
+                        reason = head.retry_reason or "transport"
+                        # Nothing has reached the caller, so this is still a
+                        # pre-first-byte failure and the ordinary failover rules
+                        # apply. That is the entire point of having probed.
+                        #
+                        # Unless the header check above already charged for it: one
+                        # refusal, one demotion. Otherwise a throttle that shows up
+                        # in both places would park the route twice as hard as one
+                        # that only shows up in the headers.
+                        if not throttled:
+                            telemetry.demote(route,
+                                         "429" if head.retry_reason else reason,
+                                         resp.headers.get("retry-after"),
+                                         entry)
+                        if not is_last:
+                            await resp.aclose()
+                            last_error = "in-stream {} from {}".format(reason, route)
+                            wait, how = pause(attempts[i + 1],
+                                              resp.headers.get("retry-after"))
+                            _ev("failover", "warning",
+                                "!! %s, %s in %.1fs", last_error, how, wait,
+                                route=route, face=face, model=requested,
+                                to_route=str(attempts[i + 1]), reason=reason,
+                                wait_seconds=round(wait, 2), in_stream=True)
+                            await asyncio.sleep(wait)
+                            delay *= cfg.backoff_multiplier
+                            continue
+                        if head.error is not None:
+                            # A connection that died during the probe has no body to
+                            # hand over, so with nowhere left to fail over to this
+                            # is the no-response case.
+                            await resp.aclose()
+                            last_error = "in-stream {} from {}".format(reason, route)
+                            break
+                        # Last route, but there is still a stream to give. Relay it:
+                        # a throttled stream carrying Azure's own error event is more
+                        # use to the caller than a 503 this proxy invented, and it is
+                        # what a direct call would have got.
+                        _ev("throttle", "warning",
+                            "%s model=%s: in-stream %s on the last route "
+                            "%s; relaying it", face, requested, reason, route,
+                            route=route, face=face, model=requested,
+                            reason=reason, in_stream=True, last_route=True)
+
+                    if sticky:
+                        affinity.pin(session, route, family, session_type)
+                    return _relay_stream(resp, route, face, started, head,
+                                         request_bytes, entry,
+                                         counted=bool(head.retry_reason) or throttled,
+                                         model=requested, family=family)
+                else:
+                    # Everything else is the caller's answer, including a 4xx from
+                    # the deployment: parameters are forwarded untouched, so a 400
+                    # about an unsupported parameter is the real, useful result.
+                    #
+                    # A retryable status on the LAST route is relayed too, rather
+                    # than replaced with a synthetic 503. A real 429 carries
+                    # Retry-After and the upstream's own message, which is what the
+                    # client's backoff needs; the error below is reserved for the
+                    # case where no route produced a response at all.
+                    await resp.aread()
+                    await resp.aclose()
+                    _ev("response", "info",
+                        "<- %s %s model=%s route=%s %.1fs", resp.status_code,
+                        face, requested, route, time.monotonic() - started,
+                        route=route, face=face, model=requested, stream=False,
+                        status=resp.status_code,
+                        seconds=round(time.monotonic() - started, 1))
+                    # The buffered face's shape of the same refusal: a 400 whose
+                    # body names invalid_encrypted_content. Same treatment — say so
+                    # in the log, and make the client's retry go out stripped.
+                    if sticky and ENCRYPTED_REJECTED in resp.content:
+                        _ev("upstream_error", "warning",
+                            "!! %s refused %s model=%s for the encrypted state it "
+                            "carried (%s)", route, face, requested,
+                            ENCRYPTED_REJECTED.decode(),
+                            route=route, face=face, model=requested,
+                            error_code=ENCRYPTED_REJECTED.decode(),
+                            status=resp.status_code)
+                        affinity.note_rejected(family)
+                    if sticky and resp.status_code < 400:
+                        affinity.pin(session, route, family, session_type)
+                    return _relay(resp, route, request_bytes, entry,
+                                  counted=retryable)
+
+            if is_last:
+                break
+            wait, how = pause(attempts[i + 1], retry_after_hint)
+            _ev("failover", "warning", "!! %s, %s in %.1fs", last_error, how, wait,
+                route=route, face=face, model=requested,
+                to_route=str(attempts[i + 1]), reason=last_error,
+                wait_seconds=round(wait, 2))
+            await asyncio.sleep(wait)
+            delay *= cfg.backoff_multiplier
+        finally:
+            if not entry.streaming:
+                telemetry.finish(entry)
 
     _ev("exhausted", "error",
         "<- 503 %s model=%s: all %d attempt(s) failed; last: %s",
@@ -3681,13 +2319,28 @@ def _wants_image_tool(body: dict) -> bool:
                for t in tools)
 
 
+def _routes_for(request, body, table):
+    active = getattr(cfg, table).get(body.get("model"), [])
+    if cfg.affinity_enabled and affinity.sticky(body):
+        return affinity.candidates(request, body, table, active)
+    return active
+
+
+def _image_deployments(request, body):
+    deployments = dict(cfg.image_deployments)
+    if cfg.affinity_enabled and affinity.sticky(body):
+        family = affinity.family(request, body)
+        deployments.update(affinity._catalog.get(family, {}).get("images", {}))
+    return deployments
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body, requested, err = await _body_and_model(request)
     if err is not None:
         return err
 
-    routes = cfg.routes.get(requested)
+    routes = _routes_for(request, body, "routes")
     if not routes:
         elsewhere = _other_faces(requested,
                                  ("/v1/responses", cfg.responses_routes),
@@ -3722,7 +2375,7 @@ async def responses(request: Request):
     if err is not None:
         return err
 
-    routes = cfg.responses_routes.get(requested)
+    routes = _routes_for(request, body, "responses_routes")
     if not routes:
         elsewhere = _other_faces(requested,
                                  ("/v1/chat/completions", cfg.routes),
@@ -3764,7 +2417,8 @@ async def responses(request: Request):
     image_tool = (_wants_image_tool(body)
                   and IMAGE_TOOL_HEADER not in request.headers)
     if image_tool:
-        with_images = [r for r in routes if r.endpoint in cfg.image_deployments]
+        image_deployments = _image_deployments(request, body)
+        with_images = [r for r in routes if r.endpoint in image_deployments]
         if not with_images:
             _ev("image_tool", "warning",
                 "%s model=%s asks for the image_generation tool but no endpoint "

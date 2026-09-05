@@ -10,7 +10,7 @@
 #
 #   ./start.sh     start it in the background
 #   ./stop.sh      stop it
-#   ./restart.sh   stop and start again, after editing settings/ or re-probing
+#   ./restart.sh   restart routing after editing its policy or re-probing
 #
 # `python -m tui --attach` is the same thing without the checks below, and
 # takes --url for a proxy on another host or port.

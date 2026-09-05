@@ -1,16 +1,7 @@
-"""Run the proxy in the foreground. start.sh nohups this.
+"""Run serving in the foreground against the last published routing snapshot.
 
-No daemonising and no second mode. Backgrounding is start.sh's job with
-nohup; a process that forks itself is one that cannot be supervised by
-anything that did not expect it to.
-
-The dashboard is a separate, read-only program (see tui/) that watches this
-one over its own HTTP surface. It used to be able to run in here on a thread,
-which meant the proxy's lifetime was tied to a terminal — the wrong tradeoff
-for something every client on the box points at.
-
-    python -m proxy
-    uvicorn proxy.server:app --host 127.0.0.1 --port 8787
+The management scripts provide background operation. Routing runs separately
+via python -m routing and can be restarted while this process keeps serving.
 """
 
 import atexit

@@ -107,7 +107,7 @@ refresh token——这台机器上的那份就同时有两个——整份拷过�
 ```
 azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目录可以直接搬走
 ├── start.sh / tui.sh / stop.sh / restart.sh
-├── preflight.sh         # 两个启动脚本共用的检查，别单独跑
+├── preflight.sh         # 看板启动检查，供 tui.sh 使用
 ├── az.sh                # 代理专属的 az —— 运维一律走它，别用裸 az
 ├── import-identity.sh   # 从已有登录里挑出一个账号的凭据装进来
 ├── requirements.txt
@@ -122,13 +122,21 @@ azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目�
 ├── runtime/             # 探测生成，勿手改
 │   ├── sources.json         每个 endpoint 的状态与存活部署
 │   ├── models.json          模型名 → 路由（按故障切换顺序），带每个部署的配额
-│   └── capacity.json        运行中学到的最大安全 RPM，实时原子保存
+│   ├── capacity.json        routing 导出的最大安全 RPM
+│   └── control.sqlite3      映射、原始观测与统计检查点（含 WAL 附属文件）
 ├── probe/
 │   └── probe.py
 ├── proxy/
-│   ├── __main__.py          前台跑 uvicorn；后台化是 start.sh 的 nohup
-│   ├── server.py
-│   └── events.py            结构化事件环，/events 的后面
+│   ├── __main__.py          serving 前台入口
+│   ├── server.py            转发、连接、会话亲和
+│   ├── bridge.py            内存映射与后台观测同步
+│   ├── config.py / state.py 共享配置和状态交换
+│   ├── manage.py / process.py 进程管理
+│   └── events.py            结构化事件定义
+├── routing/
+│   ├── __main__.py          routing 前台入口
+│   ├── engine.py            重放、检查点、映射发布
+│   └── quota.py             配额计算与选路
 ├── tui/                 # 看板。独立进程，只读，不管服务死活
 │   ├── app.py               Live 循环、raw-tty 按键、看板切换
 │   ├── boards.py            源 / 模型 / 事件流 三个看板
@@ -139,33 +147,81 @@ azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目�
 │   └── theme.py             低饱和调色板 + 字符表
 └── test/
     ├── fake_azure.py        可编程的假上游
-    └── run_tests.py
+    ├── run_tests.py         协议与配额回归
+    └── test_split.py        独立重启与恢复验收
 ```
 
-`settings/` 是 YAML，因为注释有用。`runtime/` 是 JSON，因为它不该被手改——
-JSON 不支持注释这件事本身就在说明这一点。
+`settings/` 使用 YAML 保存人工配置。`runtime/` 使用 JSON 保存探测结果，
+使用 SQLite 保存进程间交换状态和统计检查点。
 
 ---
 
 ## 运行
 
-服务只有一种起法，后台。看板是另一个进程，只读，起停跟服务无关。
+serving 和 routing 是两个独立进程，看板保持独立只读。
+两个服务进程使用同一系统账号和同一份本地运行目录；SQLite WAL 需要本地文件系统。
 
-| 命令 | 做什么 |
+| 命令 | 行为 |
 |---|---|
-| `./start.sh` | 后台起，日志进 `proxy.log` |
-| `./stop.sh` | 停 |
-| `./restart.sh` | stop + start。改过 `settings/` 或重跑过探测之后用 —— 配置只在启动时读一次 |
-| `./tui.sh` | 打开看板，看**已经在跑**的那个服务；服务没跑就报错退出 |
+| `./start.sh` | 先启动 routing 并生成映射，再启动 serving |
+| `./start.sh serving` / `./start.sh routing` | 启动指定进程 |
+| `./restart.sh` | 默认只重启 routing，等待 serving 接受新映射 |
+| `./restart.sh serving` / `./restart.sh all` | 显式重启 serving 或两个进程 |
+| `./stop.sh routing` | 停止 routing，serving 继续使用缓存映射 |
+| `./stop.sh` | 先排空并停止 serving，再停止 routing |
+| `./tui.sh` | 打开看板 |
 
-**`start.sh` 撞上已在运行时 exit 1**，要先 `./stop.sh`，或者用 `./restart.sh`。
-以前这里是 exit 0 —— 那对任何看返回码的脚本来说都读作「你的新配置生效了」，而它没有：
-配置只在启动时读一次。在线的判据有两条，pidfile 里的进程活着**或者** `/healthz` 有应答；
-后者是为了抓住不是脚本起的那个进程，因为两个代理各记各的账本、花同一份配额，还都以为
-自己是唯一的。`tui.sh` 问的是同一个问题、要的是相反的答案：没在跑就没什么可看的。
+serving 使用 `.proxy.pid` 和 `proxy.log`，routing 使用 `.routing.pid` 和
+`routing.log`。每个角色有独立的单实例锁。重复启动返回错误。
+停止默认等待 30 秒；当请求仍在排空时，命令返回错误并保留进程。
+可以通过 `--timeout 120` 延长等待；`--force` 明确允许超时后强制结束。
 
-`.proxy.pid` 由代理进程自己写、退出时自己删。以前是 `start.sh` 用 `$!` 写的，少的就是
-后半截 —— 干净退出时不再留下一个需要 `stop.sh` 认出来是垃圾的 pid。
+前台入口分别是 `./.venv/bin/python -m proxy` 和
+`./.venv/bin/python -m routing`。serving 启动需要一份有效映射快照。
+
+### 职责与更新
+
+serving 持有 HTTP/SSE 连接、Azure token 和会话绑定，按内存中的映射执行转发。
+routing 根据配额计算各接口、各模型的当前目标和备用顺序，负责 RPM、容量学习和看板统计。
+
+- 修改 routing 代码、`routing.balance`、`routing.balancing` 或重新探测部署后，执行
+  `./restart.sh routing`。新映射由后台同步，已有连接与绑定继续使用原部署。
+- 修改 serving 的转发代码、监听地址、认证、请求兼容处理、超时重试或
+  `routing.session_affinity` 设置后，需要安排 serving 重启。
+- 当部署从新映射移除时，新会话停止分配到该部署；已有会话保存完整部署信息，并按原 TTL 排空。
+  上游本身的故障仍按既有重试和亲和策略处理。
+- 同一请求固定使用一代映射。routing 停止期间，已有会话和新请求都使用 serving 的最后有效映射。
+
+### 状态交换与恢复
+
+`runtime/control.sqlite3` 使用 SQLite WAL，保存原始观测、统计检查点、消费游标和版本化快照。
+两个进程默认每 100ms 同步一次；serving 的转发路径只访问内存。
+空闲时 routing 每秒更新心跳，事件历史仅在发生变化时写入。
+原始观测包含时间、部署、状态、配额头和 token 用量，请求与响应正文不进入交换数据库。
+
+routing 按事件发生时间恢复统计，完成追平后发布新映射。消费游标和检查点事务提交，
+重复重放不会重复记账；已完成检查点覆盖的原始记录会被清理。已学习容量继续导出到
+`runtime/capacity.json`。当需要复制运行中的数据库时，应使用 SQLite backup API；
+WAL 模式的数据库包含尚未合并到主文件的记录。
+
+`/healthz.routing` 提供 routing 的 PID、实例 ID、心跳、已接受映射版本、消费水位和积压，
+`/routes.stats_stale` 标明统计是否陈旧。当 routing 停止、快照不兼容或交换存储异常时，
+serving 保持旧映射并显示告警。内存观测队列上限为 100,000 条；当存储故障使队列溢出时，
+`telemetry_dropped` 记录统计缺口，转发继续运行。
+内部协议采用版本检查，不兼容的进程或数据库升级需要维护窗口。
+
+### 首次从单进程迁移
+
+首次替换旧 serving 需要维护窗口，旧进程的连接和内存绑定无法转交给新进程。
+先运行隔离测试，再安排 `./restart.sh all`。完成首次切换后，日常路由和统计更新使用
+`./restart.sh`。
+
+测试全部使用临时配置和本地假上游：
+
+```bash
+./.venv/bin/python test/run_tests.py
+./.venv/bin/python test/test_split.py
+```
 
 监听 `127.0.0.1:8811`（在 `settings/policy.yaml` 改）。共享机器上这个端口段常有别人的
 服务，换端口前先 `ss -lnt` 看一眼。
@@ -212,8 +268,8 @@ python -m tui --url ...                 # 同上，少了下面那几项检查
 
 **看板只读，不管服务的死活。** 它是独立进程，通过代理自己的 HTTP 面
 （`/healthz` `/routes` `/events`）取数，所以随开随关都不碰服务；关掉它所在的终端
-带走的只有看板。反过来 `./restart.sh` 的时候开着的看板会显示一两秒「不可达」然后
-自己接上新的。服务没在跑时 `tui.sh` 直接报错退出；一块开着却只会说
+带走的只有看板。执行 `./restart.sh` 时 serving 持续可达；当 routing 重启造成
+统计暂时陈旧时，看板显示 `routing/statistics stale`，恢复后自动刷新。服务没在跑时 `tui.sh` 直接报错退出；一块开着却只会说
 「unreachable」的屏幕读起来像故障，而实际情况是根本没人让它跑。
 
 三个看板，`←` `→` 切换，`↑` `↓` 滚动：
@@ -281,7 +337,7 @@ gpt-5.4        ███▓▓▒▒▚░░░░··············�
 每行最右侧显示该路由的最大 RPM；尚无完成样本时显示 `—`。
 
 **空条 `────` 加 `—` 表示还没有成功请求可用于建立安全 RPM。** 每个成功请求都会用它发出
-时的一分钟窗口 RPM 更新最大值；最大值只增不减，并立即原子写入 `runtime/capacity.json`。
+时的一分钟窗口 RPM 更新最大值；最大值只增不减，由 routing 提交检查点后原子导出到 `runtime/capacity.json`。
 对于 Responses 流式请求，收到完整的 `response.completed` 事件时立即记账。
 当请求仍在生成、提前断开或被限流时，该请求尚不能提供成功样本，因此当前 RPM 可能暂时高于历史最大安全 RPM。
 
@@ -665,14 +721,15 @@ codex 的 `include: ["reasoning.encrypted_content"]` 照常工作。
 
 ## 主动负载均衡（`routing.balance`）
 
-三种模式，**默认 `priority_threshold`**。三种都走同一套故障切换规则，都不会重复试同一个
-endpoint，区别只在**先试谁**。
+三种模式，默认 `priority_threshold`。routing 计算目标顺序，serving 执行该顺序。
+同一个同步周期内的新请求可能使用同一目标；分流结果随 routing 的观测和发布更新。
+已有绑定的会话继续使用其部署。
 
 | 模式 | 行为 |
 | --- | --- |
 | `strict_priority` | 严格优先级。优先级 1 吃下 100% 流量，只有它出错才往下走。这是 kill switch |
 | `priority_threshold` | **默认。** 按优先级走，但一条路由用掉自己配额的 `spill_threshold`（默认 70%）之后就跳过它，发给下一条 |
-| `capacity` | 完全无视优先级，每个请求按实测配额抽样 |
+| `capacity` | routing 按实测配额抽样计算当前目标和备用顺序 |
 
 `priority` / `weighted` 是前两个和最后一个的旧名字，仍然有效。
 
@@ -981,10 +1038,8 @@ client_metadata.session_id: 01a0216b-…                             (body)
 对方的路由、判定不可用、然后被均衡到一个解不开自己密文的部署上。那一整批 run 全部死于
 `invalid_encrypted_content`。加上模型名之后是两格，互不干扰。
 
-同一个原因，**查钉子的时候不删钉子**。钉住的路由不服务当前模型时，这一轮不用它，但那一格
-留着：这条记录属于钉它的那个会话，下一次成功响应本来就会覆盖它，而在读的路径上删掉，等于
-把「这一轮用不上」变成「那个会话从此没有钉子」——后者会被均衡走，然后整个 run 结束。留一格
-陈旧记录的代价是 TTL 到期前占一个槽位。
+绑定保存完整部署信息。当 routing 更新后某部署从候选列表中移除时，已有会话继续使用保存的
+部署，新会话使用新映射。绑定及该会话家族的部署目录按既有 TTL 和数量上限清理。
 
 ### 什么算「带状态」
 
@@ -1115,9 +1170,8 @@ refresh token 要等一小时后才暴露。
 **同一份 refresh token 别留两份在用。** AAD 对 public client 的 refresh token 是轮换的，
 两个进程各拿一份去刷，早晚互相把对方作废。所以拷完就该把原来那份停掉。
 
-启动时 `start.sh` 会把当前账号和 `policy.yaml` 的 `expected_account` 比一下，不一致就
-警告并告诉你怎么修；代理进程自己也会在 `proxy.log` 里再喊一次——都不 fatal，手上的
-token 可能还能用，启动失败反而更难查。
+serving 启动时会比较当前账号和 `policy.yaml` 的 `expected_account`。当两者不一致时，
+`proxy.log` 会记录警告和修复提示。routing 的启动和重启使用本地部署信息。
 
 **关键事实二：`az account get-access-token` 给的是 `az` 自己缓存里的 token，剩余寿命
 不可预测。** 实测拿到过 6 分钟和 9.7 分钟的，也可能拿到接近一小时的——取决于你取的
