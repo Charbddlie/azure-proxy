@@ -122,7 +122,7 @@ azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目�
 ├── runtime/             # 探测生成，勿手改
 │   ├── sources.json         每个 endpoint 的状态与存活部署
 │   ├── models.json          模型名 → 路由（按故障切换顺序），带每个部署的配额
-│   └── capacity.json        运行中学到的最大安全 QPM，实时原子保存
+│   └── capacity.json        运行中学到的最大安全 RPM，实时原子保存
 ├── probe/
 │   └── probe.py
 ├── proxy/
@@ -180,7 +180,7 @@ JSON 不支持注释这件事本身就在说明这一点。
 | `POST /v1/images/edits` | 改图，multipart。body 原样转发，只读出 `model` 用来选路由 |
 | `GET /v1/models` | 可用模型 + 每个模型的路由链和支持的面 |
 | `GET /healthz` | 存活、每个面各有几个模型、凭据目录、上次探测时间、当前 `balance` 模式和溢出阈值、监听地址、已运行时长 |
-| `GET /routes` | 每条路由的当前 QPM、持久化的最大安全 QPM、限流时观测到的 `others` QPM、按五个「面」拆开的 QPM、当前权重、429 次数、降权状态、钉住的会话 |
+| `GET /routes` | 每条路由的当前 RPM、持久化的最大安全 RPM、限流时观测到的 `others` RPM、按五个「面」拆开的 RPM、当前权重、429 次数、降权状态、钉住的会话 |
 | `GET /events` | 最近的结构化事件环，看板的数据源。`?since=<游标>&limit=&kind=`，`kind=problems` 只要出问题的那几类 |
 
 **不实现** `GET/DELETE /v1/responses/{id}`、`/cancel`、`/input_items`。没有调用方
@@ -218,11 +218,11 @@ python -m tui --url ...                 # 同上，少了下面那几项检查
 
 三个看板，`←` `→` 切换，`↑` `↓` 滚动：
 
-**源** —— 一个 endpoint 一张卡。这个资源上哪些部署在被用、当前 QPM 和最大安全 QPM。
+**源** —— 一个 endpoint 一张卡。这个资源上哪些部署在被用、当前 RPM 和最大安全 RPM。
 一个 endpoint 是一份钱、一个爆炸半径，所以按它分组。
 
-**模型** —— 一个模型一张卡。显示活跃 session 数量及类型、可用源、当前 QPM 和最大安全
-QPM。`codex` 表示普通 Codex session，`subagent` 表示输入中带 `agent_message` 的子 agent
+**模型** —— 一个模型一张卡。显示活跃 session 数量及类型、可用源、当前 RPM 和最大安全
+RPM。`codex` 表示普通 Codex session，`subagent` 表示输入中带 `agent_message` 的子 agent
 session。
 
 ### 卡片的顺序，以及什么被藏起来了
@@ -257,24 +257,33 @@ pro > codex-max > codex > 裸模型 > mini > nano。
 跟在消息后面，因为跟在后面时它是第一个被截掉的，而它恰恰是整行最重要的东西：
 消息说发生了什么，这一列说代理现在的判断变了。
 
-### QPM 条怎么读
+### RPM 条怎么读
+
+RPM（requests per minute）表示每分钟请求数。`/routes` 使用 `current_rpm`、
+`capacity_rpm`、`other_rpm` 和 `rpm_by_face` 字段；统计窗口由
+`routing.balancing.rpm_window_seconds` 配置。旧配置与历史容量文件可继续读取，
+容量文件下次保存时使用新字段，原有每分钟数值保持不变。
 
 ```
-gpt-5.4        ███▓▓▒▒▚░░░░····················   42%
+gpt-5.4        ███▓▓▒▒▚░░░░····················   100.0 RPM
                └── current 31% ──┘└others 11%┘└available┘
 ```
 
-条形的分母是这条路由历史上成功承载过的最大 QPM：
+条形的分母是这条路由历史上成功承载过的最大 RPM：
 
 - **current**（鼠尾草绿）：当前一分钟滑动窗口内的请求数。
   五个字符是同一个数的五个切片，**同色不同字符**：`█` chat、`▓` chat 流式、
   `▒` responses、`▚` responses 流式、`▞` 图像。它们抢的是同一个上限，所以是一个
   颜色；给五种颜色会读成五条互不相干的条恰好挨在一起，那是错的心智模型。
-- **░ others**（灰褐）：当当前 QPM 低于历史最大值却触发限流时，两者的差值。
-- **· available**（暗）：最大安全 QPM 中尚未被 current 和 others 占用的部分。
+- **░ others**（灰褐）：当当前 RPM 低于历史最大值却触发限流时，两者的差值。
+- **· available**（暗）：最大安全 RPM 中尚未被 current 和 others 占用的部分。
 
-**空条 `────` 加 `—` 表示还没有成功请求可用于建立安全 QPM。** 每个成功请求都会用它发出
-时的一分钟窗口 QPM 更新最大值；最大值只增不减，并立即原子写入 `runtime/capacity.json`。
+每行最右侧显示该路由的最大 RPM；尚无完成样本时显示 `—`。
+
+**空条 `────` 加 `—` 表示还没有成功请求可用于建立安全 RPM。** 每个成功请求都会用它发出
+时的一分钟窗口 RPM 更新最大值；最大值只增不减，并立即原子写入 `runtime/capacity.json`。
+对于 Responses 流式请求，收到完整的 `response.completed` 事件时立即记账。
+当请求仍在生成、提前断开或被限流时，该请求尚不能提供成功样本，因此当前 RPM 可能暂时高于历史最大安全 RPM。
 
 细到看不见的量会强行占一格。四次请求对 300k token 的上限是 1e-5，50 格的条上五个面
 全部舍成 0、空白吃满整条 —— 那条条会说「这里什么都没发生」，而它恰恰是正在扛流量的

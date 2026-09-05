@@ -32,7 +32,7 @@ KINDS = (
     "boot",         # startup narration: identity, endpoints, mode
     "request",      # a request arrived; face + model, before any route is picked
     "response",     # a request finished; the route that answered and the status
-    "capacity",     # a successful request raised the persisted safe-QPM maximum
+    "capacity",     # a successful request raised the persisted safe-RPM maximum
     "throttle",     # 429, or the 200-plus-retry-after that means the same thing
     "demote",       # 5xx or transport error: park the route, but not a quota fact
     "foreign",      # the estimate of what OTHER tenants hold moved

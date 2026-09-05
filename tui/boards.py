@@ -23,27 +23,27 @@ from rich.table import Table
 from rich.text import Text
 
 from . import theme
-from .bars import capacity_bar, percent
+from .bars import capacity_bar, rpm_capacity
 from .layout import column_widths, rows, truncate
 from .snapshot import Group, RouteView, Snapshot
 
 BOARDS = ("sources", "models", "events")
 BOARD_TITLES = {"sources": "源", "models": "模型", "events": "事件流"}
 
-# Below this a card cannot hold a name, a bar and a percentage on one line, so
+# Below this a card cannot hold a name, a bar and a capacity on one line, so
 # the grid stops adding columns and lets the cards get wider instead.
 MIN_CARD = 46
 
 # How much of a card's inner width the bar may take. The rest is the row label
-# and the percentage, both of which have a floor — a bar that grew until the
+# and the capacity, both of which have a floor — a bar that grew until the
 # name beside it was three letters would be a very precise picture of something
 # unidentifiable.
 BAR_SHARE = 0.45
 BAR_MIN = 8
 
 
-def _bar_width(inner: int, label_width: int) -> int:
-    spare = inner - label_width - 6          # 6 = gap + " 100%"
+def _bar_width(inner: int, label_width: int, capacity_width: int) -> int:
+    spare = inner - label_width - capacity_width - 2  # two column gaps
     return max(BAR_MIN, min(int(inner * BAR_SHARE), spare))
 
 
@@ -98,16 +98,19 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
 
     The bar row is a three-column grid; the detail line is NOT part of it. A
     long cell in a `Table.grid` grows its column and pushes the fixed-width
-    ones off the end — the percentage column vanished entirely the first time
+    ones off the end — the capacity column vanished entirely the first time
     this was one table — so the wide line gets its own full-width row and is
     truncated to the card by hand.
 
     `detail` is dropped first when the terminal gets short, before anything is
-    truncated. The bar and the percentage are the card; the second line is
+    truncated. The bar and the maximum RPM are the card; the second line is
     commentary on them.
     """
-    label_width = max(10, min(22, width - BAR_MIN - 8))
-    bar_width = _bar_width(width, label_width)
+    capacities = {route.key: rpm_capacity(route.capacity_rpm) for route in routes}
+    capacity_width = max([8] + [cell_len(text.plain)
+                                for text in capacities.values()])
+    label_width = max(10, min(22, width - BAR_MIN - capacity_width - 2))
+    bar_width = _bar_width(width, label_width, capacity_width)
 
     lines = []
     for route in Snapshot.sorted_routes(routes):
@@ -118,12 +121,12 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
         row = Table.grid(padding=(0, 1), expand=True)
         row.add_column(width=label_width, no_wrap=True)
         row.add_column(width=bar_width, no_wrap=True)
-        row.add_column(justify="right", width=4, no_wrap=True)
+        row.add_column(justify="right", width=capacity_width, no_wrap=True)
         row.add_row(Text(truncate(label, label_width),
                          style=theme.TEXT if route.busy else theme.LABEL),
-                    capacity_bar(bar_width, route.qpm_load_by_face,
-                                 route.qpm_other_load),
-                    percent(route.qpm_load))
+                    capacity_bar(bar_width, route.rpm_load_by_face,
+                                 route.rpm_other_load),
+                    capacities[route.key])
         lines.append(row)
         if detail:
             # Indented to start where the bar starts, so the numbers sit under
@@ -133,7 +136,7 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
 
 
 def _detail(route: RouteView, width: int, indent: int) -> Text:
-    """Current, outside and learned-safe QPM for one route."""
+    """Current, outside and learned-safe RPM for one route."""
     indent = max(0, min(indent, width - 12))
     out = Text(" " * indent, style=theme.DIM, no_wrap=True)
     budget = width - indent
@@ -144,15 +147,27 @@ def _detail(route: RouteView, width: int, indent: int) -> Text:
         # line run a clause past the edge of the card.
         return cell_len(out.plain) - indent + cell_len(text) <= budget
 
-    if route.capacity_qpm is None:
-        out.append("尚未测得安全 QPM", style=theme.DIM)
+    if route.capacity_rpm is None:
+        out.append("尚无完成样本", style=theme.DIM)
+        if route.data.get("last_status") == "timeout":
+            rpm = route.data.get("last_timeout_rpm")
+            clause = ("· {:.1f} RPM 时超时".format(rpm)
+                      if rpm is not None else "· 最近超时")
+            if room(" " + clause):
+                out.append(" " + clause, style=theme.CRIT)
+        elif route.data.get("rate_limited", 0) > 0:
+            rpm = route.data.get("last_throttle_rpm")
+            clause = ("· {:.1f} RPM 时限流".format(rpm)
+                      if rpm is not None else "· 已限流")
+            if room(" " + clause):
+                out.append(" " + clause, style=theme.WARN)
         return out
 
     out.append("当前 ", style=theme.DIM)
-    out.append("{:.1f}".format(route.current_qpm), style=theme.OURS)
+    out.append("{:.1f}".format(route.current_rpm), style=theme.OURS)
     out.append(" · others ", style=theme.DIM)
-    out.append("{:.1f}".format(route.other_qpm), style=theme.FOREIGN)
-    clause = " · 最大安全 {:.1f} QPM".format(route.capacity_qpm or 0.0)
+    out.append("{:.1f}".format(route.other_rpm), style=theme.FOREIGN)
+    clause = " · 最大安全 {:.1f} RPM".format(route.capacity_rpm or 0.0)
     if room(clause):
         out.append(clause, style=theme.DIM)
 
@@ -173,8 +188,8 @@ def _source_card(group: Group, width: int, detail: bool, pinned: int,
     subtitle = Text()
     subtitle.append("{}/{} 在用".format(group.active, len(group.routes)),
                     style=theme.LABEL if group.active else theme.DIM)
-    if group.capacity_qpm:
-        subtitle.append(" · 最大安全 {:.1f} QPM".format(group.capacity_qpm),
+    if group.capacity_rpm:
+        subtitle.append(" · 最大安全 {:.1f} RPM".format(group.capacity_rpm),
                         style=theme.DIM)
     if pinned:
         # Sessions carrying encrypted reasoning cannot be moved off the endpoint
@@ -195,7 +210,7 @@ def _source_card(group: Group, width: int, detail: bool, pinned: int,
                        {}, detail)
     return Panel(RichGroup(subtitle, body), title=title, width=width,
                  border_style=theme.severity(
-                     _load_or_none(group.peak_qpm_load)),
+                     _load_or_none(group.peak_rpm_load)),
                  padding=(0, 1))
 
 
@@ -217,8 +232,8 @@ def _model_card(group: Group, width: int, detail: bool,
     subtitle.append(" · {} 个源".format(len(group.routes)), style=theme.LABEL)
     if group.faces:
         subtitle.append(" · {}".format("+".join(group.faces)), style=theme.DIM)
-    if group.capacity_qpm:
-        subtitle.append(" · 最大安全 {:.1f} QPM".format(group.capacity_qpm),
+    if group.capacity_rpm:
+        subtitle.append(" · 最大安全 {:.1f} RPM".format(group.capacity_rpm),
                         style=theme.DIM)
     if group.released:
         subtitle.append(" · {}".format(group.released), style=theme.DIM)
@@ -230,7 +245,7 @@ def _model_card(group: Group, width: int, detail: bool,
                        {}, detail)
     return Panel(RichGroup(subtitle, body), title=title, width=width,
                  border_style=theme.severity(
-                     _load_or_none(group.peak_qpm_load)),
+                     _load_or_none(group.peak_rpm_load)),
                  padding=(0, 1))
 
 
@@ -395,12 +410,12 @@ def _event_change(event: dict, width: int) -> Text:
         return out
 
     if event.get("foreign_updated") or event.get("kind") == "foreign":
-        other_qpm = event.get("other_qpm")
-        capacity_qpm = event.get("capacity_qpm")
-        if other_qpm is not None and capacity_qpm:
+        other_rpm = event.get("other_rpm")
+        capacity_rpm = event.get("capacity_rpm")
+        if other_rpm is not None and capacity_rpm:
             out.append("others ", style=theme.DIM)
-            out.append("{:.1f} QPM".format(other_qpm), style=theme.FOREIGN)
-            out.append(" / max {:.1f}".format(capacity_qpm), style=theme.DIM)
+            out.append("{:.1f} RPM".format(other_rpm), style=theme.FOREIGN)
+            out.append(" / max {:.1f}".format(capacity_rpm), style=theme.DIM)
             return out
         before, after = event.get("foreign_before"), event.get("foreign_after")
         if before is not None and after is not None:

@@ -286,7 +286,8 @@ class Config:
             b.get("demote_recovery_halflife_seconds", 30))
         self.spill_threshold = float(b.get("spill_threshold", 0.70))
         self.load_window = float(b.get("load_window_seconds", 60))
-        self.qpm_window = max(1.0, float(b.get("qpm_window_seconds", 60.0)))
+        self.rpm_window = max(1.0, float(b.get(
+            "rpm_window_seconds", b.get("qpm_window_seconds", 60.0))))
         capacity_file = b.get("capacity_state_file", "runtime/capacity.json")
         self.capacity_state_file = os.path.expanduser(str(capacity_file))
         if not os.path.isabs(self.capacity_state_file):
@@ -545,8 +546,9 @@ class RouteState:
                  "penalty", "penalty_until", "penalty_at", "attempts", "ok",
                  "rate_limited", "errors", "last_status", "sent",
                  "tokens_per_char", "token_samples",
-                 "safe_qpm", "other_qpm", "qpm_samples",
-                 "last_dispatch_qpm",
+                 "safe_rpm", "other_rpm", "rpm_samples",
+                 "last_dispatch_rpm", "last_throttle_rpm",
+                 "timeouts", "last_timeout_rpm",
                  "foreign", "foreign_at", "foreign_hold_until",
                  "foreign_samples", "foreign_our_load")
 
@@ -586,11 +588,14 @@ class RouteState:
         # that instant was safe, so the largest such observation is a lower
         # bound on the route's capacity. It only grows and is persisted by the
         # tracker. A throttle below that bound exposes concurrent traffic from
-        # other users: safe_qpm - our_qpm.
-        self.safe_qpm = 0.0
-        self.other_qpm = 0.0
-        self.qpm_samples = 0
-        self.last_dispatch_qpm = 0.0
+        # other users: safe_rpm - our_rpm.
+        self.safe_rpm = 0.0
+        self.other_rpm = 0.0
+        self.rpm_samples = 0
+        self.last_dispatch_rpm = 0.0
+        self.last_throttle_rpm: Optional[float] = None
+        self.timeouts = 0
+        self.last_timeout_rpm: Optional[float] = None
 
         # What everyone ELSE is estimated to be taking from this deployment, as
         # a fraction of its ceiling. Only ever learned at the moment of a
@@ -663,7 +668,7 @@ class QuotaTracker:
 
     def __init__(self, config: Config):
         self.cfg = config
-        self.qpm_window = max(1.0, float(getattr(config, "qpm_window", 60.0)))
+        self.rpm_window = max(1.0, float(getattr(config, "rpm_window", 60.0)))
         self.capacity_state_file = getattr(config, "capacity_state_file", None)
         self.states: Dict[str, RouteState] = {}
         self._legacy_qps_capacity = False
@@ -672,7 +677,7 @@ class QuotaTracker:
             self._save_capacity()
 
     def _load_capacity(self) -> Dict[str, float]:
-        """Load monotonic safe-QPM observations from the previous process."""
+        """Load monotonic safe-RPM observations from the previous process."""
         if not self.capacity_state_file:
             return {}
         try:
@@ -683,11 +688,12 @@ class QuotaTracker:
         values = doc.get("routes") if isinstance(doc, dict) else None
         if not isinstance(values, dict):
             return {}
-        # b8af145 stored QPS in the same file. Convert that one published
-        # format once so restarting after this upgrade preserves the learned
-        # capacity in the new unit.
+        # Older files used QPM for the same per-minute unit; their values
+        # carry over unchanged. Only the earlier QPS format needs scaling.
         self._legacy_qps_capacity = (
-            "qps_window_seconds" in doc and "qpm_window_seconds" not in doc)
+            "qps_window_seconds" in doc
+            and "rpm_window_seconds" not in doc
+            and "qpm_window_seconds" not in doc)
         scale = 60.0 if self._legacy_qps_capacity else 1.0
         out = {}
         for key, value in values.items():
@@ -711,7 +717,7 @@ class QuotaTracker:
             with open(temporary, "w") as f:
                 json.dump({"updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                        time.gmtime()),
-                           "qpm_window_seconds": self.qpm_window,
+                           "rpm_window_seconds": self.rpm_window,
                            "routes": dict(sorted(self._saved_capacity.items()))},
                           f, indent=2, sort_keys=True)
                 f.write("\n")
@@ -733,15 +739,13 @@ class QuotaTracker:
         st = self.states.get(key)
         if st is None:
             st = self.states[key] = RouteState(key)
-            st.safe_qpm = self._saved_capacity.get(key, 0.0)
+            st.safe_rpm = self._saved_capacity.get(key, 0.0)
         return st
 
     def observed(self, route: Route, status: int, headers) -> None:
         """Fold one upstream response into the route's state."""
         st = self.state(route)
         st.last_status = str(status)
-        if status < 400:
-            st.ok += 1
 
         limit_r = _as_number(headers.get("x-ratelimit-limit-requests"))
         limit_t = _as_number(headers.get("x-ratelimit-limit-tokens"))
@@ -785,53 +789,63 @@ class QuotaTracker:
         """Record a dispatch. Returns the ledger entry, for `settle`."""
         now = time.time()
         st = self.state(route)
-        st.prune(now, max(self.cfg.load_window, self.qpm_window))
-        cutoff = now - self.qpm_window
+        st.prune(now, max(self.cfg.load_window, self.rpm_window))
+        cutoff = now - self.rpm_window
         recent = sum(1 for item in st.sent if item[0] >= cutoff)
-        dispatch_qpm = (recent + 1) * 60.0 / self.qpm_window
-        entry = [now, float(tokens), face, dispatch_qpm]
+        dispatch_rpm = (recent + 1) * 60.0 / self.rpm_window
+        entry = [now, float(tokens), face, dispatch_rpm]
         st.sent.append(entry)
-        st.last_dispatch_qpm = dispatch_qpm
+        st.last_dispatch_rpm = dispatch_rpm
         return entry
 
-    def qpm(self, st: RouteState, now: float) -> float:
+    def rpm(self, st: RouteState, now: float) -> float:
         """Requests per minute over the configured rolling window."""
-        cutoff = now - self.qpm_window
+        cutoff = now - self.rpm_window
         return sum(1 for item in st.sent if item[0] >= cutoff) \
-            * 60.0 / self.qpm_window
+            * 60.0 / self.rpm_window
 
-    def qpm_by_face(self, st: RouteState, now: float) -> Dict[str, float]:
-        cutoff = now - self.qpm_window
+    def rpm_by_face(self, st: RouteState, now: float) -> Dict[str, float]:
+        cutoff = now - self.rpm_window
         counts = [0] * len(FACES)
         for item in st.sent:
             if item[0] >= cutoff:
                 counts[item[2] if len(item) > 2 else 0] += 1
-        return {name: count * 60.0 / self.qpm_window
+        return {name: count * 60.0 / self.rpm_window
                 for name, count in zip(FACES, counts)}
 
     def note_success(self, route: Route,
                      entry: Optional[List[float]]) -> None:
-        """Raise the saved capacity to the largest proven-safe dispatch QPM."""
+        """Raise the saved capacity to the largest proven-safe dispatch RPM."""
         st = self.state(route)
         observed = (float(entry[3]) if entry is not None and len(entry) > 3
-                    else self.qpm(st, time.time()))
+                    else self.rpm(st, time.time()))
         if observed <= 0:
             return
-        st.qpm_samples += 1
-        if observed > st.safe_qpm:
-            before = st.safe_qpm
-            st.safe_qpm = observed
+        st.ok += 1
+        st.rpm_samples += 1
+        if observed > st.safe_rpm:
+            before = st.safe_rpm
+            st.safe_rpm = observed
             self._saved_capacity[st.key] = observed
             self._save_capacity()
             _ev("capacity", "info",
-                "%s raised learned capacity from %.2f to %.2f QPM",
+                "%s raised learned capacity from %.2f to %.2f RPM",
                 route, before, observed, route=route,
                 capacity_before=round(before, 4),
                 capacity_after=round(observed, 4))
         # A success at this rate proves a previous `others` observation can no
         # longer make the route exceed its learned capacity.
-        st.other_qpm = min(st.other_qpm,
-                           max(0.0, st.safe_qpm - observed))
+        st.other_rpm = min(st.other_rpm,
+                           max(0.0, st.safe_rpm - observed))
+
+    def note_timeout(self, route: Route,
+                     observed_rpm: Optional[float] = None) -> None:
+        """Record a request that produced no complete upstream response."""
+        st = self.state(route)
+        st.timeouts += 1
+        st.last_status = "timeout"
+        st.last_timeout_rpm = (observed_rpm if observed_rpm is not None
+                               else st.last_dispatch_rpm or None)
 
     def settle(self, route: Route, entry: Optional[List[float]],
                request_bytes: int, total_tokens: Optional[int]) -> None:
@@ -991,7 +1005,7 @@ class QuotaTracker:
 
         Reclaimed linearly since the last throttle, after that throttle's
         Retry-After has passed. This remains an internal routing signal; the
-        dashboard reports the separate safe-QPM observation.
+        dashboard reports the separate safe-RPM observation.
         """
         if not self.cfg.foreign_enabled or st.foreign <= 0.0:
             return 0.0
@@ -1016,15 +1030,16 @@ class QuotaTracker:
         return ours + self.foreign_load(st, now)
 
     def note_foreign(self, route: Route, retry_after=None,
-                     observed_qpm: Optional[float] = None) -> Optional[dict]:
-        """At a throttle, capacity minus our QPM is concurrent outside QPM."""
+                     observed_rpm: Optional[float] = None) -> Optional[dict]:
+        """At a throttle, capacity minus our RPM is concurrent outside RPM."""
         now = time.time()
         st = self.state(route)
-        our_qpm = (observed_qpm if observed_qpm is not None
-                   else st.last_dispatch_qpm or self.qpm(st, now))
-        before_qpm = st.other_qpm
-        outside_qpm = max(0.0, st.safe_qpm - our_qpm)
-        st.other_qpm = outside_qpm
+        our_rpm = (observed_rpm if observed_rpm is not None
+                   else st.last_dispatch_rpm or self.rpm(st, now))
+        st.last_throttle_rpm = our_rpm
+        before_rpm = st.other_rpm
+        outside_rpm = max(0.0, st.safe_rpm - our_rpm)
+        st.other_rpm = outside_rpm
 
         ours = self.load(st, now)
         held = self.foreign_load(st, now)
@@ -1037,24 +1052,24 @@ class QuotaTracker:
         st.foreign_samples += 1
         st.foreign_our_load = ours
         moved = {"our_load": (round(ours, 4) if ours is not None else None),
-                 "our_qpm": round(our_qpm, 4),
-                 "capacity_qpm": (round(st.safe_qpm, 4)
-                                  if st.safe_qpm > 0 else None),
-                 "other_qpm": round(outside_qpm, 4),
+                 "our_rpm": round(our_rpm, 4),
+                 "capacity_rpm": (round(st.safe_rpm, 4)
+                                  if st.safe_rpm > 0 else None),
+                 "other_rpm": round(outside_rpm, 4),
                  "foreign_before": round(held, 4),
                  "foreign_after": round(st.foreign, 4),
                  "foreign_samples": st.foreign_samples,
                  "foreign_hold_seconds": round(max(0.0, park or 0.0), 1)}
-        if outside_qpm > 0:
+        if outside_rpm > 0:
             _ev("foreign", "info",
-                "%s throttled at %.2f QPM below its %.2f QPM learned maximum; "
-                "the %.2f QPM difference is others",
-                route, our_qpm, st.safe_qpm, outside_qpm,
+                "%s throttled at %.2f RPM below its %.2f RPM learned maximum; "
+                "the %.2f RPM difference is others",
+                route, our_rpm, st.safe_rpm, outside_rpm,
                 route=route, **moved)
-        return moved if ours is not None or st.safe_qpm > 0 else None
+        return moved if ours is not None or st.safe_rpm > 0 else None
 
     def demote(self, route: Route, reason: str, retry_after=None,
-               observed_qpm: Optional[float] = None) -> None:
+               observed_rpm: Optional[float] = None) -> None:
         """Temporarily send less traffic here.
 
         Not just "skip it for this one request" — a 429 says the deployment is
@@ -1088,7 +1103,7 @@ class QuotaTracker:
             # connection reset means the endpoint is unwell, not that its quota
             # is spoken for, and inferring a foreign share from one would
             # permanently shrink a route for being briefly broken.
-            moved = self.note_foreign(route, retry_after, observed_qpm)
+            moved = self.note_foreign(route, retry_after, observed_rpm)
         else:
             st.errors += 1
         st.last_status = reason
@@ -1145,7 +1160,7 @@ class QuotaTracker:
         so which one is used has to be decided rather than assumed.
 
         This value remains the routing signal. The dashboard uses the separate,
-        persisted safe-QPM maximum learned from successful traffic.
+        persisted safe-RPM maximum learned from successful traffic.
         """
         return st.limit_tokens or st.limit_requests or None
 
@@ -1379,8 +1394,8 @@ class QuotaTracker:
                 requests, tokens = st.in_window(now, self.cfg.load_window)
                 by_face = st.in_window_by_face(now, self.cfg.load_window)
                 load_by_face = self.load_by_face(st, now)
-                current_qpm = self.qpm(st, now)
-                qpm_by_face = self.qpm_by_face(st, now)
+                current_rpm = self.rpm(st, now)
+                rpm_by_face = self.rpm_by_face(st, now)
                 seen[st.key] = {
                     "endpoint": r.endpoint,
                     "deployment": r.deployment,
@@ -1393,18 +1408,25 @@ class QuotaTracker:
                     # means the quota moved since the last probe.
                     "capacity_requests": r.capacity_requests,
                     "capacity_tokens": r.capacity_tokens,
-                    # Runtime capacity is learned from traffic. The largest QPM
+                    # Runtime capacity is learned from traffic. The largest RPM
                     # that completed without a limit is monotonic and persisted;
                     # a later throttle below it exposes the difference as other
-                    # users' concurrent QPM.
-                    "current_qpm": round(current_qpm, 4),
-                    "capacity_qpm": (round(st.safe_qpm, 4)
-                                     if st.safe_qpm > 0 else None),
-                    "other_qpm": round(st.other_qpm, 4),
-                    "qpm_window_seconds": self.qpm_window,
-                    "qpm_samples": st.qpm_samples,
-                    "qpm_by_face": {k: round(v, 4)
-                                    for k, v in qpm_by_face.items()},
+                    # users' concurrent RPM.
+                    "current_rpm": round(current_rpm, 4),
+                    "capacity_rpm": (round(st.safe_rpm, 4)
+                                     if st.safe_rpm > 0 else None),
+                    "other_rpm": round(st.other_rpm, 4),
+                    "rpm_window_seconds": self.rpm_window,
+                    "rpm_samples": st.rpm_samples,
+                    "last_throttle_rpm": (round(st.last_throttle_rpm, 4)
+                                          if st.last_throttle_rpm is not None
+                                          else None),
+                    "timeouts": st.timeouts,
+                    "last_timeout_rpm": (round(st.last_timeout_rpm, 4)
+                                         if st.last_timeout_rpm is not None
+                                         else None),
+                    "rpm_by_face": {k: round(v, 4)
+                                    for k, v in rpm_by_face.items()},
                     "limit_requests": st.limit_requests,
                     "limit_tokens": st.limit_tokens,
                     # What THIS proxy has sent inside the load window, which is
@@ -1484,7 +1506,7 @@ class QuotaTracker:
                 }
         return {"balance": self.cfg.balance,
                 "load_window_seconds": self.cfg.load_window,
-                "qpm_window_seconds": self.qpm_window,
+                "rpm_window_seconds": self.rpm_window,
                 # The canonical order of the four faces, so a reader stacking
                 # them does not have to hard-code it and drift.
                 "faces": list(FACES),
@@ -2523,6 +2545,9 @@ OVERLAP_BYTES = 48
 
 _TOTAL_TOKENS = re.compile(rb'"total_tokens"\s*:\s*(\d+)')
 _EVENT_SPLIT = re.compile(rb"\r?\n\r?\n")
+_COMPLETED_EVENT = re.compile(
+    rb'(?:^|\n)(?:event:[ \t]*response\.completed[ \t]*\r?(?:\n|$)'
+    rb'|data:[ \t]*\{[ \t]*"type"[ \t]*:[ \t]*"response\.completed")')
 
 
 def _throttled_200(resp: httpx.Response) -> bool:
@@ -2583,7 +2608,7 @@ class _StreamWatch:
     """
 
     __slots__ = ("_overlap", "rate_limited", "total_tokens", "_error_tail",
-                 "completed")
+                 "completed", "_completion_tail", "_completion_pending")
 
     def __init__(self):
         self._overlap = b""
@@ -2593,6 +2618,8 @@ class _StreamWatch:
         # without this is a turn the client reports as "disconnected before
         # completion", whether or not anything explained why.
         self.completed = False
+        self._completion_tail = b""
+        self._completion_pending = False
         # The bytes that followed an `error` event, capped at ERROR_TAIL_BYTES.
         # None until one goes past. Accumulating a bounded tail is what makes
         # the code readable whichever chunk boundary it lands on; the marker
@@ -2608,8 +2635,18 @@ class _StreamWatch:
         total = _read_total_tokens(window)
         if total is not None:
             self.total_tokens = total
-        if not self.completed and STREAM_COMPLETED in window:
-            self.completed = True
+        if not self.completed:
+            # Confirm a terminal event only after its blank-line delimiter.
+            # Keep a bounded tail of the current event so large response bodies
+            # and markers split across network chunks need no full buffering.
+            parts = _EVENT_SPLIT.split(self._completion_tail + chunk)
+            for event in parts[:-1]:
+                if self._completion_pending or _COMPLETED_EVENT.search(event):
+                    self.completed = True
+                self._completion_pending = False
+            tail = parts[-1]
+            self._completion_pending |= bool(_COMPLETED_EVENT.search(tail))
+            self._completion_tail = tail[-OVERLAP_BYTES:]
         if self._error_tail is None:
             match = _STREAM_ERROR_EVENT.search(window)
             if match:
@@ -2842,12 +2879,21 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
         # upstream: a client that hangs up mid-turn also lands in `finally`,
         # and warning about that would blame the wrong end.
         drained = False
+        success_recorded = False
         watch = _StreamWatch()
         watch.rate_limited = counted
         # Only accumulated when diagnostics are on; otherwise it stays empty and
         # the stream is forwarded without ever being held in memory.
         keep = bool(cfg.capture_dir)
         seen = bytearray() if keep else None
+
+        def record_success() -> None:
+            nonlocal success_recorded
+            if not success_recorded and not watch.rate_limited \
+                    and not watch.upstream_error():
+                quota.settle(route, entry, request_bytes, watch.total_tokens)
+                quota.note_success(route, entry)
+                success_recorded = True
 
         def inspect(chunk: bytes) -> None:
             if keep:
@@ -2862,6 +2908,10 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                 quota.demote(route, "429", resp.headers.get("retry-after"),
                              entry[3] if entry is not None and len(entry) > 3
                              else None)
+            if watch.completed:
+                # Clients may close immediately after receiving this event.
+                # Record it before yielding, while cleanup and EOF are pending.
+                record_success()
 
         try:
             for chunk in head.chunks:
@@ -2896,11 +2946,11 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                 seconds=round(time.monotonic() - started, 1))
             raise
         finally:
+            if drained and face != RESPONSES_FACE:
+                record_success()
+            if not success_recorded:
+                quota.settle(route, entry, request_bytes, watch.total_tokens)
             await resp.aclose()
-            quota.settle(route, entry, request_bytes, watch.total_tokens)
-            if drained and not watch.rate_limited and not watch.upstream_error() \
-                    and (watch.completed or face != RESPONSES_FACE):
-                quota.note_success(route, entry)
             if keep:
                 _capture_stream(route, resp, bytes(seen))
             _note_upstream_error(watch.upstream_error(), route, face, model,
@@ -3413,6 +3463,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
             # may still be running, so the caller decides instead. For the same
             # reason this does not demote the route: slow is not broken, and a
             # long reasoning turn must not cost an endpoint its share.
+            quota.note_timeout(route, entry[3] if len(entry) > 3 else None)
             if not cfg.retry_on_timeout:
                 _ev("timeout", "warning",
                     "<- 504 %s model=%s timed out after %ss on %s",
@@ -3475,6 +3526,8 @@ async def _forward(request: Request, body: dict, routes: List[Route],
 
                 if head.timed_out:
                     await resp.aclose()
+                    quota.note_timeout(
+                        route, entry[3] if len(entry) > 3 else None)
                     _ev("timeout", "warning",
                         "<- 504 %s model=%s timed out on %s",
                         face, requested, route,

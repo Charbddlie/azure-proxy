@@ -19,6 +19,18 @@ from typing import Dict, List, Optional
 import re
 
 
+def _rpm_fields(data: dict) -> dict:
+    """Read older proxy snapshots using the current per-minute field names."""
+    out = dict(data)
+    for key in data:
+        if "qpm" in key:
+            out.setdefault(key.replace("qpm", "rpm"), data[key])
+            out.pop(key)
+    if isinstance(out.get("message"), str):
+        out["message"] = out["message"].replace("QPM", "RPM")
+    return out
+
+
 class RouteView:
     """One (endpoint, deployment) row, with the model it serves attached.
 
@@ -34,7 +46,7 @@ class RouteView:
         self.key = key
         self.model = model
         self.share = share
-        self.data = data
+        self.data = _rpm_fields(data)
 
     def __getattr__(self, name):
         # Everything /routes reports is readable as an attribute, so adding a
@@ -68,35 +80,35 @@ class RouteView:
         return self.data.get("foreign_load") or 0.0
 
     @property
-    def current_qpm(self) -> float:
-        return self.data.get("current_qpm") or 0.0
+    def current_rpm(self) -> float:
+        return self.data.get("current_rpm") or 0.0
 
     @property
-    def capacity_qpm(self) -> Optional[float]:
-        return self.data.get("capacity_qpm")
+    def capacity_rpm(self) -> Optional[float]:
+        return self.data.get("capacity_rpm")
 
     @property
-    def other_qpm(self) -> float:
-        return self.data.get("other_qpm") or 0.0
+    def other_rpm(self) -> float:
+        return self.data.get("other_rpm") or 0.0
 
     @property
-    def qpm_load(self) -> Optional[float]:
-        if not self.capacity_qpm:
+    def rpm_load(self) -> Optional[float]:
+        if not self.capacity_rpm:
             return None
-        return (self.current_qpm + self.other_qpm) / self.capacity_qpm
+        return (self.current_rpm + self.other_rpm) / self.capacity_rpm
 
     @property
-    def qpm_other_load(self) -> float:
-        if not self.capacity_qpm:
+    def rpm_other_load(self) -> float:
+        if not self.capacity_rpm:
             return 0.0
-        return self.other_qpm / self.capacity_qpm
+        return self.other_rpm / self.capacity_rpm
 
     @property
-    def qpm_load_by_face(self) -> Optional[Dict[str, float]]:
-        if not self.capacity_qpm:
+    def rpm_load_by_face(self) -> Optional[Dict[str, float]]:
+        if not self.capacity_rpm:
             return None
-        values = self.data.get("qpm_by_face") or {}
-        return {name: (values.get(name) or 0.0) / self.capacity_qpm
+        values = self.data.get("rpm_by_face") or {}
+        return {name: (values.get(name) or 0.0) / self.capacity_rpm
                 for name in values}
 
     @property
@@ -126,8 +138,8 @@ class RouteView:
 
     @property
     def busy_load(self) -> float:
-        """Current QPM for activity ordering."""
-        return self.current_qpm
+        """Current RPM for activity ordering."""
+        return self.current_rpm
 
     @property
     def released(self) -> Optional[str]:
@@ -175,8 +187,8 @@ class Group:
         return sum(r.data.get("capacity_requests") or 0.0 for r in self.routes)
 
     @property
-    def capacity_qpm(self) -> float:
-        return sum(r.capacity_qpm or 0.0 for r in self.routes)
+    def capacity_rpm(self) -> float:
+        return sum(r.capacity_rpm or 0.0 for r in self.routes)
 
     @property
     def sent_requests(self) -> int:
@@ -210,8 +222,8 @@ class Group:
         return max([r.busy_load for r in self.routes] or [0.0])
 
     @property
-    def peak_qpm_load(self) -> float:
-        values = [r.qpm_load for r in self.routes if r.qpm_load is not None]
+    def peak_rpm_load(self) -> float:
+        values = [r.rpm_load for r in self.routes if r.rpm_load is not None]
         return max(values or [-1.0])
 
     @property
@@ -320,12 +332,13 @@ class Snapshot:
         self.age = raw.get("age")
         self.dropped = raw.get("dropped", False)
         self.health: dict = raw.get("health") or {}
-        self.events: List[dict] = raw.get("events") or []
-        routes_doc: dict = raw.get("routes") or {}
+        self.events: List[dict] = [_rpm_fields(e)
+                                   for e in (raw.get("events") or [])]
+        routes_doc: dict = _rpm_fields(raw.get("routes") or {})
 
         self.balance = routes_doc.get("balance") or self.health.get("balance")
         self.load_window = routes_doc.get("load_window_seconds")
-        self.qpm_window = routes_doc.get("qpm_window_seconds")
+        self.rpm_window = routes_doc.get("rpm_window_seconds")
         self.affinity = (routes_doc.get("session_affinity")
                          or self.health.get("session_affinity") or {})
         self.faces = routes_doc.get("faces") or []
@@ -438,7 +451,7 @@ class Snapshot:
             return sorted(groups, key=lambda g: g.name)
         if mode == "capacity":
             return sorted(groups,
-                          key=lambda g: (-g.capacity_qpm, g.name))
+                          key=lambda g: (-g.capacity_rpm, g.name))
         # Activity first — this is a dashboard, and the thing that is moving is
         # the thing to look at. `recency_key` settles everything below that:
         # newest release, then strongest variant, then name. Which matters more

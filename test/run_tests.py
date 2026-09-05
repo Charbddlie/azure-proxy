@@ -583,6 +583,13 @@ def test_no_failover_on_timeout():
             assert status == 504, (status, body)
             assert body["error"]["code"] == "upstream_timeout", body
             assert b.hits == 0, "must not retry a timeout elsewhere"
+            _status, report = p.get("/routes")
+            alpha = report["routes"]["alpha/" + DEPLOYMENT]
+            assert alpha["timeouts"] == 1, alpha
+            assert alpha["last_status"] == "timeout", alpha
+            assert alpha["last_timeout_rpm"] == 1.0, alpha
+            assert alpha["capacity_rpm"] is None, alpha
+            assert alpha["ok"] == 0, alpha
         finally:
             p.close()
     finally:
@@ -1018,6 +1025,9 @@ def test_streamed_token_cost_is_read_off_the_bytes():
             alpha = report["routes"]["alpha/" + DEPLOYMENT]
             assert alpha["sent_tokens_in_window"] == 1234, alpha
             assert alpha["token_samples"] == 1, alpha
+            assert alpha["capacity_rpm"] == 1.0, alpha
+            assert alpha["rpm_samples"] == 1, alpha
+            assert alpha["ok"] == 1, alpha
         finally:
             p.close()
     finally:
@@ -1311,6 +1321,10 @@ def test_throttled_200_is_detected_from_the_headers():
             # Once, not twice: the header check and the body backstop must not
             # both charge for the same refusal.
             assert alpha["rate_limited"] == 1, alpha
+            assert alpha["last_throttle_rpm"] == 1.0, alpha
+            assert alpha["capacity_rpm"] is None, alpha
+            assert alpha["rpm_samples"] == 0, alpha
+            assert alpha["ok"] == 0, alpha
             # Retry-After was 4, so the park is Azure's number, not the default.
             assert 0 < alpha["parked_for_seconds"] <= 4.5, alpha
         finally:
@@ -1709,7 +1723,7 @@ def route_state(proxy, name="alpha"):
     return report["routes"][name + "/" + DEPLOYMENT]
 
 
-def test_safe_qpm_capacity_only_grows_and_survives_restart():
+def test_safe_rpm_capacity_only_grows_and_survives_restart():
     """Successful dispatch rates raise a monotonic, atomically saved maximum."""
     sys.path.insert(0, ROOT)
     import logging
@@ -1720,7 +1734,7 @@ def test_safe_qpm_capacity_only_grows_and_survives_restart():
     try:
         class Cfg:
             capacity_state_file = os.path.join(directory, "capacity.json")
-            qpm_window = 60.0
+            rpm_window = 60.0
             load_window = 60
             chars_per_token = 4
             foreign_enabled = False
@@ -1732,22 +1746,24 @@ def test_safe_qpm_capacity_only_grows_and_survives_restart():
         first = tracker.charge(route, 1)
         second = tracker.charge(route, 1)
         tracker.note_success(route, second)
-        assert tracker.state(route).safe_qpm == 2.0
+        assert tracker.state(route).safe_rpm == 2.0
 
         # A later, lower successful observation cannot lower the maximum.
         tracker.note_success(route, first)
-        assert tracker.state(route).safe_qpm == 2.0
+        assert tracker.state(route).safe_rpm == 2.0
 
         restored = QuotaTracker(Cfg())
-        assert restored.state(route).safe_qpm == 2.0
+        assert restored.state(route).safe_rpm == 2.0
         with open(Cfg.capacity_state_file) as f:
             saved = json.load(f)
+        assert saved["rpm_window_seconds"] == 60.0, saved
+        assert "qpm_window_seconds" not in saved, saved
         assert saved["routes"][str(route)] == 2.0, saved
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def test_throttle_below_safe_qpm_attributes_the_difference_to_others():
+def test_throttle_below_safe_rpm_attributes_the_difference_to_others():
     sys.path.insert(0, ROOT)
     import logging
     from proxy.server import QuotaTracker, Route
@@ -1755,7 +1771,7 @@ def test_throttle_below_safe_qpm_attributes_the_difference_to_others():
 
     class Cfg:
         capacity_state_file = None
-        qpm_window = 60.0
+        rpm_window = 60.0
         load_window = 60
         chars_per_token = 4
         foreign_enabled = False
@@ -1764,13 +1780,175 @@ def test_throttle_below_safe_qpm_attributes_the_difference_to_others():
     route = Route("alpha", "http://x/", "v", "deployment",
                   "max_completion_tokens", 0)
     tracker = QuotaTracker(Cfg())
-    tracker.state(route).safe_qpm = 7.0
-    moved = tracker.note_foreign(route, observed_qpm=3.0)
-    assert tracker.state(route).other_qpm == 4.0
-    assert moved["other_qpm"] == 4.0, moved
+    tracker.state(route).safe_rpm = 7.0
+    moved = tracker.note_foreign(route, observed_rpm=3.0)
+    assert tracker.state(route).other_rpm == 4.0
+    assert moved["other_rpm"] == 4.0, moved
 
 
-def test_legacy_qps_capacity_is_converted_to_qpm():
+def test_completed_stream_updates_safe_rpm_before_eof_or_client_disconnect():
+    """A terminal SSE event confirms success before HTTP cleanup can cancel."""
+    sys.path.insert(0, ROOT)
+    import asyncio
+    import httpx
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+    from proxy import server
+
+    async def run(directory, buffered, cancel_close):
+        config = SimpleNamespace(
+            capacity_state_file=os.path.join(directory, "capacity.json"),
+            rpm_window=60.0, load_window=60, capture_dir=None,
+            stream_retry_markers=[server.INBAND_RATE_LIMIT])
+        tracker = server.QuotaTracker(config)
+        route = server.Route("alpha", "http://x/", "v", DEPLOYMENT,
+                             "max_completion_tokens", 0)
+        first = tracker.charge(route, 1)
+        tracker.note_success(route, first)
+        entry = tracker.charge(route, 1)
+        chunk = (b'event: response.completed\ndata: {"type":"response.completed",'
+                 b'"response":{"usage":{"total_tokens":123}}}\n\n')
+
+        async def upstream():
+            if not buffered:
+                yield chunk
+            raise AssertionError("the client stops after the completed event")
+
+        resp = httpx.Response(200, headers={"content-type": "text/event-stream"})
+        resp.aclose = AsyncMock(side_effect=(asyncio.CancelledError()
+                                             if cancel_close else None))
+        head = server._StreamHead(upstream())
+        if buffered:
+            head.chunks.append(chunk)
+        with patch.multiple(server, cfg=config, quota=tracker):
+            reply = server._relay_stream(resp, route, server.RESPONSES_FACE,
+                                         time.monotonic(), head, 10, entry)
+            try:
+                assert await reply.body_iterator.__anext__() == chunk
+                state = tracker.state(route)
+                assert state.safe_rpm == 2.0, state.safe_rpm
+                assert state.rpm_samples == 2, state.rpm_samples
+                assert state.ok == 2, state.ok
+                assert entry[1] == 123, entry
+                restored = server.QuotaTracker(config)
+                assert restored.state(route).safe_rpm == 2.0
+            finally:
+                try:
+                    await reply.body_iterator.aclose()
+                except asyncio.CancelledError:
+                    assert cancel_close
+                finally:
+                    await head.aiter.aclose()
+            assert tracker.state(route).rpm_samples == 2
+            resp.aclose.assert_awaited_once()
+
+    for buffered in (False, True):
+        for cancel_close in (False, True):
+            with tempfile.TemporaryDirectory(prefix="azure-proxy-stream-rpm-") as d:
+                _run(run(d, buffered, cancel_close))
+
+
+def test_incomplete_or_failed_stream_does_not_raise_safe_rpm():
+    sys.path.insert(0, ROOT)
+    import httpx
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from proxy import server
+
+    completed = b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+    cases = [
+        b'event: response.output_text.delta\ndata: {"delta":"still working"}\n\n',
+        completed[:-1],  # The terminal event's final delimiter is incomplete.
+        b'event: response.output_text.delta\ndata: {"delta":"response.completed"}\n\n',
+        b'event: error\ndata: {"code":"server_error"}\n\n' + completed,
+    ]
+
+    async def run(chunk, drain, counted):
+        config = SimpleNamespace(capacity_state_file=None, rpm_window=60.0,
+                                 load_window=60, capture_dir=None,
+                                 stream_retry_markers=[server.INBAND_RATE_LIMIT])
+        tracker = server.QuotaTracker(config)
+        route = server.Route("alpha", "http://x/", "v", DEPLOYMENT,
+                             "max_completion_tokens", 0)
+        entry = tracker.charge(route, 1)
+
+        async def upstream():
+            yield chunk
+
+        resp = httpx.Response(200, headers={"content-type": "text/event-stream"})
+        head = server._StreamHead(upstream())
+        with patch.multiple(server, cfg=config, quota=tracker):
+            reply = server._relay_stream(
+                resp, route, server.RESPONSES_FACE, time.monotonic(),
+                head, 10, entry, counted=counted)
+            assert await reply.body_iterator.__anext__() == chunk
+            if drain:
+                async for _ in reply.body_iterator:
+                    pass
+            await reply.body_iterator.aclose()
+            await head.aiter.aclose()
+        state = tracker.state(route)
+        assert state.safe_rpm == 0.0, (chunk, drain, counted, state.safe_rpm)
+        assert state.rpm_samples == 0, state.rpm_samples
+        assert state.ok == 0, state.ok
+
+    for drain in (False, True):
+        for chunk in cases:
+            _run(run(chunk, drain, False))
+        _run(run(completed, drain, True))
+
+
+def test_stream_completion_waits_for_the_terminal_event_delimiter():
+    sys.path.insert(0, ROOT)
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from proxy import server
+
+    prefixes = (b'event: response.completed\ndata: {"type":"response.completed",',
+                b'data: {"type":"response.completed",')
+    with patch.object(server, "cfg", SimpleNamespace(stream_retry_markers=[])):
+        for prefix in prefixes:
+            for newline in (b"\n", b"\r\n"):
+                event = (prefix + b'"response":{"usage":{"total_tokens":123}}}\n\n')
+                event = event.replace(b"\n", newline)
+                for size in (1, 7, 48, 1024):
+                    watch = server._StreamWatch()
+                    for i in range(0, len(event) - 1, size):
+                        watch.feed(event[i:min(i + size, len(event) - 1)])
+                        assert not watch.completed, (prefix, newline, size, i)
+                    watch.feed(event[-1:])
+                    assert watch.completed, (prefix, newline, size)
+                    assert watch.total_tokens == 123, watch.total_tokens
+
+        # The terminal event can be much larger than the retained overlap.
+        event = (prefixes[0] + b'"output":"' + b"x" * 100000 + b'"}\n\n')
+        watch = server._StreamWatch()
+        for i in range(0, len(event), 1024):
+            watch.feed(event[i:i + 1024])
+            assert len(watch._completion_tail) <= server.OVERLAP_BYTES
+        assert watch.completed
+
+
+def test_tui_explains_a_throttle_before_the_first_completed_sample():
+    """A refusal is an observation even when it proves no safe lower bound."""
+    sys.path.insert(0, ROOT)
+    from tui.boards import _detail
+    from tui.snapshot import RouteView
+
+    route = RouteView("alpha/deployment", MODEL, None, {
+        "endpoint": "alpha",
+        "deployment": "deployment",
+        "capacity_rpm": None,
+        "last_status": "429",
+        "rate_limited": 1,
+        "last_throttle_rpm": 1.0,
+    })
+    text = _detail(route, 80, 20).plain
+    assert "尚无完成样本" in text, text
+    assert "1.0 RPM 时限流" in text, text
+
+
+def test_legacy_qps_capacity_is_converted_to_rpm():
     sys.path.insert(0, ROOT)
     import logging
     from proxy.server import QuotaTracker, Route
@@ -1784,7 +1962,7 @@ def test_legacy_qps_capacity_is_converted_to_qpm():
 
         class Cfg:
             capacity_state_file = path
-            qpm_window = 60.0
+            rpm_window = 60.0
             load_window = 60
             chars_per_token = 4
             foreign_enabled = False
@@ -1793,14 +1971,189 @@ def test_legacy_qps_capacity_is_converted_to_qpm():
         route = Route("alpha", "http://x/", "v", "deployment",
                       "max_completion_tokens", 0)
         tracker = QuotaTracker(Cfg())
-        assert tracker.state(route).safe_qpm == 120.0
+        assert tracker.state(route).safe_rpm == 120.0
         with open(path) as f:
             saved = json.load(f)
         assert "qps_window_seconds" not in saved, saved
-        assert saved["qpm_window_seconds"] == 60.0, saved
+        assert saved["rpm_window_seconds"] == 60.0, saved
         assert saved["routes"][str(route)] == 120.0, saved
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_legacy_qpm_capacity_keeps_its_value_and_saves_as_rpm():
+    sys.path.insert(0, ROOT)
+    from proxy.server import QuotaTracker, Route
+
+    with tempfile.TemporaryDirectory(prefix="azure-proxy-rpm-migrate-") as directory:
+        path = os.path.join(directory, "capacity.json")
+
+        class Cfg:
+            capacity_state_file = path
+            rpm_window = 60.0
+            load_window = 60
+
+        route = Route("alpha", "http://x/", "v", "deployment",
+                      "max_completion_tokens", 0)
+        # Per-minute metadata takes precedence over any stale QPS metadata.
+        for metadata in ({"qpm_window_seconds": 60.0},
+                         {"qpm_window_seconds": 60.0,
+                          "qps_window_seconds": 1.0}):
+            _dump(path, dict(metadata, routes={str(route): 2.0}))
+            tracker = QuotaTracker(Cfg())
+            assert tracker.state(route).safe_rpm == 2.0
+            for _ in range(3):
+                entry = tracker.charge(route, 1)
+            tracker.note_success(route, entry)
+            with open(path) as f:
+                saved = json.load(f)
+            assert saved["routes"][str(route)] == 3.0, saved
+            assert saved["rpm_window_seconds"] == 60.0, saved
+            assert "qpm_window_seconds" not in saved, saved
+            assert "qps_window_seconds" not in saved, saved
+            assert QuotaTracker(Cfg()).state(route).safe_rpm == 3.0
+
+
+def test_rpm_window_config_accepts_legacy_name_and_prefers_new_name():
+    sys.path.insert(0, ROOT)
+    from unittest.mock import patch
+    from proxy import server
+
+    policy = {
+        "server": {"host": "127.0.0.1", "port": 0},
+        "routing": {"retry_on_status": [], "retry_on_transport_error": False,
+                    "retry_on_timeout": False, "request_timeout_seconds": 30,
+                    "max_attempts_per_request": 1, "backoff_initial_seconds": 1,
+                    "backoff_multiplier": 2, "backoff_jitter_seconds": 0},
+        "request": {"forward_headers": False},
+        "auth": {"scope": "test", "refresh_margin_seconds": 300}}
+    with tempfile.TemporaryDirectory(prefix="azure-proxy-rpm-config-") as directory:
+        _dump(os.path.join(directory, "sources.json"), {"endpoints": []})
+        _dump(os.path.join(directory, "models.json"), {"models": {}})
+        for fields, expected in (({}, 60.0),
+                                 ({"qpm_window_seconds": 30}, 30.0),
+                                 ({"rpm_window_seconds": 15}, 15.0),
+                                 ({"rpm_window_seconds": 15,
+                                   "qpm_window_seconds": 30}, 15.0)):
+            policy["routing"]["balancing"] = fields
+            _dump(os.path.join(directory, "policy.yaml"), policy)
+            with patch.multiple(server, SETTINGS=directory, RUNTIME=directory):
+                config = server.Config()
+            config.capacity_state_file = None
+            tracker = server.QuotaTracker(config)
+            assert tracker.rpm_window == expected
+            route = server.Route("alpha", "http://x/", "v", "deployment",
+                                 "max_completion_tokens", 0)
+            assert tracker.charge(route, 1)[3] == 60.0 / expected
+
+
+def test_routes_and_dashboard_use_rpm_names():
+    sys.path.insert(0, ROOT)
+    from tui.bars import legend
+    from tui.boards import _detail
+    from tui.snapshot import Snapshot
+
+    a = FakeAzure("alpha").start()
+    try:
+        p = Proxy([("alpha", a.url)])
+        try:
+            assert ask(p)[0] == 200
+            assert ask(p)[0] == 200
+            _status, report = p.get("/routes")
+            route = report["routes"]["alpha/" + DEPLOYMENT]
+            assert report["rpm_window_seconds"] == 60.0, report
+            assert route["current_rpm"] == 2.0, route
+            assert route["capacity_rpm"] == 2.0, route
+            assert route["other_rpm"] == 0.0, route
+            assert route["rpm_samples"] == 2, route
+            assert route["rpm_by_face"]["chat"] == 2.0, route
+            assert "qpm" not in json.dumps(report).lower(), report
+            snapshot = Snapshot({"routes": report})
+            view = snapshot.sources[0].routes[0]
+            assert view.rpm_load == 1.0
+            assert "RPM" in _detail(view, 100, 0).plain
+            assert "RPM" in legend().plain
+            _status, feed = p.get("/events")
+            capacities = [e for e in feed["events"] if e["kind"] == "capacity"]
+            assert capacities and all("RPM" in e["message"] for e in capacities)
+            assert "qpm" not in json.dumps(feed).lower(), feed
+        finally:
+            p.close()
+    finally:
+        a.stop()
+
+
+def test_dashboard_reads_legacy_qpm_snapshots_as_rpm():
+    sys.path.insert(0, ROOT)
+    from tui.boards import _detail, _event_change
+    from tui.snapshot import RouteView, Snapshot
+
+    data = {"current_qpm": 2.0, "capacity_qpm": 4.0, "other_qpm": 1.0,
+            "qpm_by_face": {"chat": 2.0}}
+    event = {"kind": "foreign", "other_qpm": 1.0, "capacity_qpm": 4.0,
+             "message": "others 1.0 QPM"}
+    snapshot = Snapshot({
+        "routes": {"qpm_window_seconds": 60.0,
+                   "routes": {"alpha/deployment": data}},
+        "events": [event]})
+    view = snapshot.sources[0].routes[0]
+    assert snapshot.rpm_window == 60.0
+    assert view.current_rpm == 2.0
+    assert view.capacity_rpm == 4.0
+    assert view.rpm_load == 0.75
+    assert view.rpm_other_load == 0.25
+    assert view.rpm_load_by_face == {"chat": 0.5}
+    assert "RPM" in _detail(view, 100, 0).plain
+    assert "QPM" not in snapshot.events[0]["message"]
+    assert "1.0 RPM" in _event_change(snapshot.events[0], 100).plain
+    # New fields win during a mixed-version rollout; input stays untouched.
+    mixed = RouteView("alpha/deployment", MODEL, None,
+                      dict(data, current_rpm=3.0))
+    assert mixed.current_rpm == 3.0
+    assert "current_qpm" not in mixed.data
+    assert data["current_qpm"] == 2.0
+    assert event["message"] == "others 1.0 QPM"
+
+
+def test_dashboard_rightmost_column_shows_maximum_rpm():
+    sys.path.insert(0, ROOT)
+    from io import StringIO
+    from rich.cells import cell_len
+    from rich.console import Console
+    from tui.bars import rpm_capacity
+    from tui.boards import _source_card, _model_card
+    from tui.snapshot import Snapshot
+
+    assert rpm_capacity(None).plain == "—"
+    assert rpm_capacity(0.0).plain == "0.0 RPM"
+    assert rpm_capacity(2.5).plain == "2.5 RPM"
+    assert rpm_capacity(12000).plain == "12k RPM"
+    table = {}
+    for deployment, capacity in (("small", 2.5), ("medium", 999.5),
+                                  ("large", 12000), ("unknown", None)):
+        table["alpha/" + deployment] = {
+            "endpoint": "alpha", "deployment": deployment,
+            "current_rpm": 1.0, "capacity_rpm": capacity,
+            "other_rpm": 0.0, "rpm_by_face": {"chat": 1.0},
+            "sent_requests_in_window": 1}
+    snapshot = Snapshot({"routes": {
+        "rpm_window_seconds": 60.0, "routes": table,
+        "models": {MODEL: [{"route": key} for key in table]}}})
+    for width in (46, 80, 120):
+        for detail in (False, True):
+            cards = [_source_card(snapshot.sources[0], width, detail, 0,
+                                   snapshot, True),
+                     _model_card(snapshot.models[0], width, detail, snapshot)]
+            for card in cards:
+                stream = StringIO()
+                Console(file=stream, width=width, color_system=None).print(card)
+                rendered = stream.getvalue()
+                assert "%" not in rendered, rendered
+                lines = rendered.splitlines()
+                assert all(cell_len(line) <= width for line in lines), rendered
+                for value in ("2.5 RPM", "999.5 RPM", "12k RPM", "—"):
+                    assert any(line.rstrip(" │").endswith(value) for line in lines), \
+                        (value, width, detail, rendered)
 
 
 def test_foreign_load_is_estimated_from_a_throttle_at_low_load():
@@ -3722,6 +4075,29 @@ def test_declared_capacity_is_the_cold_start_prior():
             p.close()
     finally:
         a.stop(); b.stop()
+
+
+def test_capacity_mode_balances_two_deployments_on_the_same_endpoint():
+    """Separate deployments share traffic in proportion to their own quotas."""
+    a = FakeAzure("alpha").start()
+    try:
+        p = Proxy([("alpha", a.url)], balance="capacity",
+                  deployments={"alpha": [
+                      {"name": "small", "capacity_tokens": 5000000},
+                      {"name": "big", "capacity_tokens": 15000000}]})
+        try:
+            for _ in range(200):
+                assert ask(p)[0] == 200
+            hits = deployment_hits(a)
+            assert set(hits) == {"small", "big"}, hits
+            assert 0.62 < hits["big"] / 200.0 < 0.88, hits
+            _status, report = p.get("/routes")
+            for deployment, count in hits.items():
+                assert report["routes"]["alpha/" + deployment]["attempts"] == count
+        finally:
+            p.close()
+    finally:
+        a.stop()
 
 
 def test_a_pinned_session_does_not_move_between_deployments():
