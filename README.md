@@ -139,7 +139,7 @@ azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目�
 │   └── quota.py             配额计算与选路
 ├── tui/                 # 看板。独立进程，只读，不管服务死活
 │   ├── app.py               Live 循环、raw-tty 按键、看板切换
-│   ├── boards.py            源 / 模型 / 事件流 三个看板
+│   ├── boards.py            源 / 模型 / 事件流 / TRAPI 四个看板
 │   ├── bars.py              分段容量条
 │   ├── layout.py            宽度感知的列分配与格子分配
 │   ├── snapshot.py          把 JSON 归一成「按源」「按模型」两个视图
@@ -274,7 +274,8 @@ python -m tui --url ...                 # 同上，少了下面那几项检查
 统计暂时陈旧时，看板显示 `routing/statistics stale`，恢复后自动刷新。服务没在跑时 `tui.sh` 直接报错退出；一块开着却只会说
 「unreachable」的屏幕读起来像故障，而实际情况是根本没人让它跑。
 
-三个看板，`←` `→` 切换，`↑` `↓` 滚动：
+四个看板，`←` `→` 切换，`↑` `↓` 滚动。默认显示 Azure 源；
+第四个 TRAPI 看板展示独立状态，小窗口按渲染行滚动。
 
 **源** —— 一个 endpoint 一张卡。这个资源上哪些部署在被用、当前 RPM 和最大安全 RPM。
 一个 endpoint 是一份钱、一个爆炸半径，所以按它分组。
@@ -387,11 +388,59 @@ gpt-5.4        ███▓▓▒▒▚░░░░··············�
 
 ---
 
+## TRAPI embeddings：显式前缀与独立看板
+
+TRAPI 是可选通道，默认关闭。只有在本地 `settings/policy.yaml` 填入
+`trapi.embeddings_url`（完整的 embeddings 请求地址）并重启 serving 后才启用：
+
+```yaml
+trapi:
+  embeddings_url: null  # 在本地替换为团队提供的完整 URL，不要提交真实地址
+```
+
+TRAPI 使用现有 Azure CLI 身份获取 `api://trapi/.default` token。
+凭据只保存在代理自己的身份目录；不要把 token 写入配置或客户端。
+TRAPI URL 只在 serving 启动时读取，修改后执行 `./restart.sh serving`。
+
+目前仅注册一个显式模型：`trapi/text-embedding-ada-002_2`，通过
+`POST /v1/embeddings` 调用。未配置 URL 时不会在 `/v1/models` 公布该模型。
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8811/v1", api_key="local")
+reply = client.embeddings.create(
+    model="trapi/text-embedding-ada-002_2",
+    input="Hello, world!",
+)
+print(len(reply.data[0].embedding))
+```
+
+请求仅改写模型名为 `text-embedding-ada-002_2`；上游响应、错误状态和
+`Retry-After` 头原样返回。普通模型仍使用 Azure，失败不会切换到 TRAPI。
+不带前缀的 embedding 请求、未注册的 TRAPI 模型以及发往 Chat、Responses、
+图像接口的 `trapi/...` 请求都返回 404，不会跨 provider 重试。
+
+TUI 增加第四个「TRAPI」标签页，保留默认的 Azure 源看板。TRAPI 使用独立卡片
+展示累计请求、错误数、最近 HTTP 状态和鉴权状态，小窗口可逐行滚动。
+看板读取的是本地 `GET /embeddings/status`，不会触发 token 获取或上游请求；
+旧代理没有这个接口或该状态暂时不可读时，Azure 状态仍正常显示。
+
+TRAPI 不加入 Azure 的路由、配额或启动健康检查，使用独立连接池和 token cache；
+关闭 serving 时回收连接池。没有自动启用模型目录中的其他模型。
+
+本机说明 `DEPLOYMENT.md`、真实配置 `settings/*.yaml`、身份目录、运行时数据、
+日志和导出的运行快照均不应提交。模板只含空 URL，所有真实 endpoint 和 token
+留在部署机器上。
+
+---
+
 ## 测试
 
 ```bash
 .venv/bin/python test/run_tests.py         # 全部
 .venv/bin/python test/run_tests.py failover  # 名字匹配的
+.venv/bin/python test/test_trapi.py       # TRAPI 隔离、转发与 TUI
 ```
 
 测的是**代理自己的行为**，不是 Azure 的行为——故障切换、优先级、三种均衡模式、

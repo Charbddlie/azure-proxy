@@ -16,6 +16,13 @@ __pycache__/
 # 这条匹配。
 settings/*.yaml
 
+# Local deployment notes, credentials, and exported runtime snapshots.
+/DEPLOYMENT.md
+.env
+.env.*
+!.env.example
+/azure-proxy-runtime-*.tar.gz
+
 # 凭据。
 #
 # keys.json: probe/probe.py 会读它拿 Azure api-key（走 auth: key 的 endpoint 用）。
@@ -36,6 +43,7 @@ az-identity/
 # 项目自带的虚拟环境。跟着仓库走，但不进版本库——它是一堆平台相关的二进制，
 # 重建两条命令就够（见 README「环境」）。
 .venv/
+.venv
 env/
 
 # 探测产物。代理启动时要读 runtime/models.json，所以一个新 clone 在跑过

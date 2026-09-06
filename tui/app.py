@@ -29,7 +29,8 @@ from rich.text import Text
 from . import theme
 from .bars import legend
 from .boards import (BOARD_TITLES, BOARDS, DEFAULT_EVENT_FILTER, EVENT_FILTERS,
-                     EVENT_KIND_FILTERS, filter_events, render_events, render_groups)
+                     EVENT_KIND_FILTERS, filter_events, render_events, render_groups,
+                     render_trapi)
 from .client import Poller
 from .snapshot import SORTS, Snapshot
 
@@ -42,13 +43,13 @@ class Dashboard:
         self.poller = poller
         self.console = console
         self.board = 0
-        self.offset = [0, 0, 0]         # one scroll position per board
+        self.offset = [0] * len(BOARDS)
         self.sort = 0
         self.filter = DEFAULT_EVENT_FILTER
         self.kind_filter = 0
         self.show_all = False
         self.quit = False
-        self._extent = [0, 0, 0]        # scrollable rows, from the last render
+        self._extent = [0] * len(BOARDS)
 
     # -- keys -------------------------------------------------------------
     def key(self, seq: str) -> None:
@@ -99,7 +100,10 @@ class Dashboard:
         # header (3) + tabs (1) + rule (1) + footer (2)
         body_height = max(4, self.console.height - 7)
 
-        if self.board == 2:
+        if BOARDS[self.board] == "trapi":
+            body, extent = render_trapi(
+                snapshot, width, body_height, self.offset[self.board])
+        elif self.board == 2:
             body, extent = render_events(
                 snapshot.events, width, body_height, self.offset[2],
                 self.filter, snapshot.dropped, self.kind_filter)
@@ -112,8 +116,10 @@ class Dashboard:
                 snapshot.sources, width, body_height, self.offset[0],
                 SORTS[self.sort], snapshot, "source", self.show_all)
         self._extent[self.board] = extent
+        if BOARDS[self.board] == "trapi":
+            self.offset[self.board] = min(self.offset[self.board], max(0, extent - 1))
 
-        return RichGroup(_header(snapshot), _tabs(self.board, snapshot,
+        return RichGroup(_header(snapshot, BOARDS[self.board] == "trapi"), _tabs(self.board, snapshot,
                                                   self.show_all, self.filter,
                                                   self.kind_filter),
                          Rule(style=theme.BORDER), body,
@@ -134,7 +140,7 @@ class Dashboard:
 # chrome
 # --------------------------------------------------------------------------
 
-def _header(snapshot: Snapshot) -> Table:
+def _header(snapshot: Snapshot, trapi: bool = False) -> Table:
     health = snapshot.health
     table = Table.grid(padding=(0, 2), expand=True)
     table.add_column(ratio=1)
@@ -145,18 +151,24 @@ def _header(snapshot: Snapshot) -> Table:
     host, port = health.get("host"), health.get("port")
     if host:
         left.append("  {}:{}".format(host, port), style=theme.LABEL)
-    if snapshot.balance:
+    if trapi:
+        left.append("  provider ", style=theme.DIM)
+        left.append("TRAPI", style=theme.ACCENT)
+    elif snapshot.balance:
         left.append("  balance ", style=theme.DIM)
         left.append(snapshot.balance, style=theme.ACCENT)
     spill = health.get("spill_threshold")
-    if spill and snapshot.balance == "priority_threshold":
+    if not trapi and spill and snapshot.balance == "priority_threshold":
         left.append(" @{:.0%}".format(spill), style=theme.DIM)
-    if snapshot.rpm_window:
+    if not trapi and snapshot.rpm_window:
         left.append("  RPM", style=theme.DIM)
 
     right = Text()
     token = health.get("token") or {}
-    if snapshot.error:
+    if trapi:
+        if snapshot.trapi_error:
+            right.append("TRAPI status unavailable", style=theme.WARN)
+    elif snapshot.error:
         # The proxy is unreachable. Say it here rather than blanking the board:
         # the numbers below are still the last true ones, and their age is in
         # the footer.
@@ -166,7 +178,7 @@ def _header(snapshot: Snapshot) -> Table:
         right.append("routing/statistics stale", style=theme.WARN)
     elif token.get("have_token"):
         seconds = token.get("expires_in_seconds") or 0
-        right.append("token ", style=theme.DIM)
+        right.append("Azure token ", style=theme.DIM)
         right.append("{:.0f}m".format(seconds / 60),
                      style=theme.OK if seconds > 300 else theme.WARN)
     elif health:
@@ -195,7 +207,10 @@ def _tabs(active: int, snapshot: Snapshot, show_all: bool,
                          else "{}/{}".format(visible_models,
                                              len(snapshot.models))),
               "events": "{}/{}".format(len(filter_events(snapshot.events, filter_mode, kind_mode)),
-                                         len(snapshot.events))}
+                                         len(snapshot.events)),
+              "trapi": ("!" if snapshot.trapi_error else
+                        "0" if snapshot.trapi.get("enabled") is False else
+                        "1" if snapshot.trapi.get("model") else "—")}
     for index, name in enumerate(BOARDS):
         label = " {} {} ".format(BOARD_TITLES[name], counts[name])
         if index == active:
@@ -224,7 +239,7 @@ def _footer(dash: "Dashboard", snapshot: Snapshot, extent: int) -> Table:
         keys.append(" {}  ".format(EVENT_FILTERS[dash.filter]), style=theme.DIM)
         keys.append("t", style=theme.ACCENT)
         keys.append(" {}  ".format(EVENT_KIND_FILTERS[dash.kind_filter]), style=theme.DIM)
-    else:
+    elif dash.board in (0, 1):
         keys.append("s", style=theme.ACCENT)
         keys.append(" {}  ".format(SORTS[dash.sort]), style=theme.DIM)
         # Never silent. A board that leaves models out has to say how many and
@@ -247,15 +262,22 @@ def _footer(dash: "Dashboard", snapshot: Snapshot, extent: int) -> Table:
     if extent > 1:
         state.append("{}/{}  ".format(dash.offset[dash.board] + 1, extent),
                      style=theme.DIM)
-    age = snapshot.age
-    if snapshot.error:
-        state.append(snapshot.error[:40], style=theme.CRIT)
+    is_trapi = BOARDS[dash.board] == "trapi"
+    age = snapshot.trapi_age if is_trapi else snapshot.age
+    error = snapshot.trapi_error if is_trapi else snapshot.error
+    if error:
+        state.append(error[:40], style=theme.CRIT)
     elif age is not None:
         state.append("{:.0f}s ago".format(age),
                      style=theme.DIM if age < 5 else theme.WARN)
 
-    table.add_row(legend() if dash.board != 2 else keys, state)
-    if dash.board != 2:
+    if is_trapi:
+        note = Text("仅 trapi/ 白名单 · 不参与 Azure 路由", style=theme.LABEL)
+        note.append("  /  本地只读 · 计数自启动累计", style=theme.DIM)
+        table.add_row(note, state)
+    else:
+        table.add_row(legend() if dash.board in (0, 1) else keys, state)
+    if dash.board in (0, 1) or is_trapi:
         table.add_row(keys, Text(""))
     return table
 
