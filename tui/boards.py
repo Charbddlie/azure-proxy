@@ -16,9 +16,10 @@ from typing import List, Optional
 
 import time
 
-from rich.console import Group as RichGroup
+from rich.console import Console, Group as RichGroup
 from rich.cells import cell_len
 from rich.panel import Panel
+from rich.segment import Segment, Segments
 from rich.table import Table
 from rich.text import Text
 
@@ -29,8 +30,9 @@ from .bars import capacity_bar, rpm_capacity
 from .layout import column_widths, rows, truncate
 from .snapshot import Group, RouteView, Snapshot
 
-BOARDS = ("sources", "models", "events")
-BOARD_TITLES = {"sources": "源", "models": "模型", "events": "事件流"}
+BOARDS = ("sources", "models", "events", "trapi")
+BOARD_TITLES = {"sources": "源", "models": "模型", "events": "事件流",
+                "trapi": "TRAPI"}
 
 # Below this a card cannot hold a name, a bar and a capacity on one line, so
 # the grid stops adding columns and lets the cards get wider instead.
@@ -42,6 +44,96 @@ MIN_CARD = 46
 # unidentifiable.
 BAR_SHARE = 0.45
 BAR_MIN = 8
+
+
+def render_trapi(snapshot: Snapshot, width: int, height: int, offset: int):
+    """The same card grid as Azure, with independent provider statistics.
+
+    No capacity bar: this provider exposes cumulative counts, not a learned
+    RPM ceiling. Scroll by rendered lines so even a tall card can be fully read.
+    """
+    status = snapshot.trapi
+    if not status or status.get("enabled") is False:
+        colour = theme.WARN if snapshot.trapi_error else theme.DIM
+        body = RichGroup(
+            Text(snapshot.trapi_error or ("TRAPI 未配置" if status else
+                                         "正在读取 TRAPI 状态…"), style=colour),
+            Text("仅读取本地统计 · 不发起上游请求", style=theme.DIM))
+        panel = Panel(body, title=Text("TRAPI · Embeddings", style=theme.TITLE),
+                      width=width, border_style=colour, padding=(0, 1))
+        return _trapi_viewport(panel, width, height, offset)
+
+    requests = status.get("requests", 0)
+    errors = status.get("errors", 0)
+    last = status.get("last_status")
+    last_colour = (theme.DIM if last is None else
+                   theme.CRIT if isinstance(last, int) and last >= 500 else
+                   theme.WARN if isinstance(last, int) and last >= 400 else
+                   theme.OK)
+    counts = Text(str(requests), style=theme.TEXT)
+    counts.append(" 次 · ", style=theme.DIM)
+    counts.append(str(errors), style=theme.WARN if errors else theme.DIM)
+    counts.append(" 错误", style=theme.DIM)
+
+    token = status.get("token") or {}
+    expires = token.get("expires_in_seconds") or 0
+    valid_token = token.get("have_token") and expires > 0
+    if valid_token:
+        auth = Text("有效", style=theme.OK if expires > 300 else theme.WARN)
+    elif not requests and not token.get("last_error"):
+        auth = Text("首次请求时获取", style=theme.DIM)
+    else:
+        auth = Text("下次请求时刷新", style=theme.WARN)
+    connected = status.get("client_initialized", False)
+    widths = column_widths(width, 2, MIN_CARD)
+    stale = bool(snapshot.trapi_error)
+    subtitle = (snapshot.trapi_error + " · 上次状态" if stale
+                else "独立 provider · 显式路由")
+    cards = [
+        _trapi_card("TRAPI · Embeddings", subtitle, [
+            ("模型", Text(str(status.get("model") or "—"), style=theme.TEXT)),
+            ("接口", Text("/v1/embeddings", style=theme.LABEL)),
+            ("累计请求", counts),
+            ("最近结果", Text("HTTP {}".format(last) if last is not None
+                              else "尚无完成请求", style=last_colour)),
+        ], widths[0], theme.WARN if stale else last_colour),
+        _trapi_card("TRAPI · 连接", "独立鉴权 · 独立连接池", [
+            ("Token", auth),
+            ("有效期", Text("{:.0f}m".format(expires / 60) if valid_token else "—",
+                          style=auth.style)),
+            ("连接池", Text("已初始化" if connected else "首次请求时建立",
+                          style=theme.LABEL if connected else theme.DIM)),
+            ("鉴权异常", Text("有失败记录" if token.get("last_error") else "无记录",
+                           style=theme.WARN if token.get("last_error") else theme.DIM)),
+        ], widths[-1], theme.WARN if stale or token.get("last_error") else auth.style),
+    ]
+    banded = rows(cards, len(widths))
+    body = RichGroup(*[_grid(band, widths[:len(band)]) for band in banded])
+    return _trapi_viewport(body, width, height, offset)
+
+
+def _trapi_viewport(body, width, height, offset):
+    """Crop rendered lines, preserving Rich styles and every scroll position."""
+    console = Console(width=max(1, width))
+    lines = console.render_lines(body, console.options, pad=False)
+    height = max(1, height)
+    positions = max(1, len(lines) - height + 1)
+    start = max(0, min(offset, positions - 1))
+    visible = lines[start:start + height]
+    segments = [segment for line in visible for segment in [*line, Segment.line()]]
+    return Segments(segments), positions
+
+
+def _trapi_card(title, subtitle, fields, width, border):
+    """Use the existing panel palette and spacing; let long values wrap."""
+    table = Table.grid(padding=(0, 1), expand=True)
+    table.add_column(width=8, no_wrap=True)
+    table.add_column(ratio=1)
+    for label, value in fields:
+        table.add_row(Text(label, style=theme.LABEL), value)
+    return Panel(RichGroup(Text(subtitle, style=theme.LABEL), table),
+                 title=Text(title, style=theme.TITLE), width=width,
+                 border_style=border, padding=(0, 1))
 
 
 def _bar_width(inner: int, label_width: int, capacity_width: int) -> int:

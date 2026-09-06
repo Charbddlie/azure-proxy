@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .events import PROBLEM_KINDS, EventLog, event_level
+from . import trapi_embeddings
 from .config import Config, Route, _as_number
 from .bridge import (Attempt, ConfigView, ServingBridge, SnapshotMiddleware,
                      Telemetry)
@@ -1030,8 +1031,8 @@ async def list_models():
                             or cfg.image_routes.get(name) or [])],
                 "faces": [f for f, table in tables if name in table],
             }
-            for name in names
-        ],
+            for name in names if not name.startswith("trapi/")
+        ] + ([trapi_embeddings.model_entry()] if _trapi_url else []),
     }
 
 
@@ -1839,9 +1840,15 @@ async def _body_and_model(request: Request):
     except Exception:
         return None, None, _error(400, "request body is not valid JSON",
                                   "invalid_json")
+    if not isinstance(body, dict):
+        return None, None, _error(400, "request body must be a JSON object", "invalid_json")
     requested = body.get("model")
-    if not requested:
+    if not isinstance(requested, str) or not requested:
         return None, None, _error(400, "`model` is required", "missing_model")
+    if requested.startswith("trapi/"):
+        return None, None, _error(
+            404, "TRAPI models are only supported on /v1/embeddings; "
+            "there is no fallback to Azure", "unsupported_trapi_route")
     return body, requested, None
 
 
@@ -2506,6 +2513,9 @@ async def images_edits(request: Request):
     if not requested:
         return _error(400, "`model` is required", "missing_model")
 
+    if requested.startswith("trapi/"):
+        return _error(404, "TRAPI models are only supported on /v1/embeddings; "
+                      "there is no fallback to Azure", "unsupported_trapi_route")
     routes = cfg.image_edit_routes.get(requested)
     if not routes:
         if requested in cfg.image_routes:
@@ -2526,3 +2536,10 @@ async def images_edits(request: Request):
                           lambda r: r.image_target("edits"),
                           requested, IMAGE_FACES["edits"],
                           raw=blob, content_type=content_type)
+
+
+# Optional provider: kept out of Azure routing and startup token priming.
+_trapi_embedding_tokens = TokenCache(trapi_embeddings.SCOPE, cfg.refresh_margin)
+_trapi_url = (cfg.policy.get("trapi") or {}).get("embeddings_url")
+trapi_embeddings.install(app, _trapi_embedding_tokens.get,
+                         _trapi_embedding_tokens.status, _ev, url=_trapi_url)

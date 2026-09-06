@@ -57,7 +57,7 @@ class Proxy:
                  affinity_off_route="strip",
                  foreign=True, foreign_reclaim=0.1, deployments=None,
                  faces=None, images=None, image_attempts=3,
-                 image_max_wait=30):
+                 image_max_wait=30, trapi_url=None):
         """endpoints: list of (name, url). Order is failover priority.
 
         deployments: {endpoint name: [{"name": …, "capacity_tokens": …}, …]},
@@ -157,7 +157,9 @@ class Proxy:
                 "auth:\n"
                 "  scope: https://cognitiveservices.azure.com/.default\n"
                 "  expected_account: test\n"
-                "  refresh_margin_seconds: 300\n".format(
+                "  refresh_margin_seconds: 300\n"
+                "trapi:\n"
+                "  embeddings_url: {trapi_url}\n".format(
                     port=self.port, timeout=timeout, attempts=max_attempts,
                     balance=balance, ttl=observation_ttl,
                     demote=demote_seconds, halflife=demote_halflife,
@@ -170,7 +172,8 @@ class Proxy:
                     conflict=affinity_on_conflict, waits=affinity_attempts,
                     maxwait=affinity_max_wait, offroute=affinity_off_route,
                     weights=weights or "      {}\n",
-                    compat="true" if responses_compat else "false"))
+                    compat="true" if responses_compat else "false",
+                    trapi_url=json.dumps(trapi_url)))
 
         header = {"_generated_by": "test", "_generated_at": "test"}
         both = ["chat", "responses"] if responses else ["chat"]

@@ -332,6 +332,9 @@ class Snapshot:
         self.age = raw.get("age")
         self.dropped = raw.get("dropped", False)
         self.health: dict = raw.get("health") or {}
+        self.trapi: dict = raw.get("trapi") or {}
+        self.trapi_error = raw.get("trapi_error")
+        self.trapi_age = raw.get("trapi_age")
         self.events: List[dict] = [_rpm_fields(e)
                                    for e in (raw.get("events") or [])]
         routes_doc: dict = _rpm_fields(raw.get("routes") or {})

@@ -13,6 +13,8 @@ convenience.
 Nothing here writes. Every endpoint it touches is a reader, and /events and
 /routes are documented as numbers-only — no request or response content passes
 through either, so the dashboard cannot become a place prompts end up.
+The optional /embeddings/status reader contains TRAPI's independent counters;
+its failure is reported separately from Azure health.
 """
 
 import json
@@ -47,6 +49,11 @@ class Poller:
         self._dropped = False
         self._fetched_at = 0.0
         self._error: Optional[str] = None
+        # An optional, independent provider. Its status must never turn the
+        # Azure dashboard unhealthy, including when watching an older proxy.
+        self._trapi: Optional[dict] = None
+        self._trapi_error: Optional[str] = None
+        self._trapi_fetched_at = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -71,6 +78,9 @@ class Poller:
             return {"health": self._health, "routes": self._routes,
                     "events": list(self._events), "dropped": self._dropped,
                     "fetched_at": self._fetched_at, "error": self._error,
+                    "trapi": self._trapi, "trapi_error": self._trapi_error,
+                    "trapi_age": (time.time() - self._trapi_fetched_at
+                                  if self._trapi_fetched_at else None),
                     "age": (time.time() - self._fetched_at
                             if self._fetched_at else None)}
 
@@ -112,5 +122,24 @@ class Poller:
                     self._dropped = self._dropped or bool(feed.get("dropped"))
                     self._fetched_at = time.time()
                     self._error = None
+            self._poll_trapi()
             self._wake.wait(self.interval)
             self._wake.clear()
+
+    def _poll_trapi(self) -> None:
+        # This endpoint only returns in-memory statistics. Reading it neither
+        # obtains a TRAPI token nor opens an upstream connection.
+        try:
+            status = self._get("/embeddings/status")
+            if not isinstance(status, dict):
+                raise ValueError("invalid TRAPI status response")
+        except Exception as exc:
+            error = ("此代理未启用 TRAPI" if isinstance(exc, urllib.error.HTTPError)
+                     and exc.code == 404 else "TRAPI 状态读取失败")
+            with self._lock:
+                self._trapi_error = error
+        else:
+            with self._lock:
+                self._trapi = status
+                self._trapi_fetched_at = time.time()
+                self._trapi_error = None

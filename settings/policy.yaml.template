@@ -617,3 +617,9 @@ auth:
   # your-own@example.com, something logged your personal identity into the proxy's
   # credential directory and the deployments will start returning 401/403.
   expected_account: null      # e.g. svc-account@example.com
+
+# Optional embedding provider. Fill in the full URL only in your gitignored
+# settings/policy.yaml. Null leaves TRAPI disabled; Azure remains the default.
+# This setting is read when serving starts. No token or endpoint belongs here.
+trapi:
+  embeddings_url: null
