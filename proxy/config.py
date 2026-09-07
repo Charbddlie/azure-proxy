@@ -6,7 +6,7 @@ Importing this module performs no file I/O and starts no services.
 import json
 import math
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
@@ -114,6 +114,8 @@ class Route:
 
 
 class Config:
+    """With load_routes=False, parse serving startup settings only."""
+
     def __init__(self, load_routes=True):
         with open(os.path.join(SETTINGS, "policy.yaml")) as f:
             policy = yaml.safe_load(f)
@@ -144,40 +146,6 @@ class Config:
         self.backoff_initial = r["backoff_initial_seconds"]
         self.backoff_multiplier = r["backoff_multiplier"]
         self.backoff_jitter = r["backoff_jitter_seconds"]
-
-        # How the attempt order is chosen. Unknown values fall back to the
-        # conservative one rather than refusing to boot: a typo here should not
-        # take the proxy down, and strict priority is what it did before any of
-        # this existed.
-        self.balance_configured = r.get("balance", "priority_threshold")
-        self.balance = BALANCE_ALIASES.get(self.balance_configured,
-                                           self.balance_configured)
-        if self.balance not in BALANCE_MODES:
-            self.balance = "strict_priority"
-
-        b = r.get("balancing") or {}
-        self.static_weights = b.get("static_weights") or {}
-        self.headroom_high_water = float(b.get("headroom_high_water", 0.5))
-        self.weight_floor = float(b.get("weight_floor", 0.05))
-        self.observation_ttl = float(b.get("observation_ttl_seconds", 120))
-        self.demote_multiplier = float(b.get("demote_multiplier", 0.25))
-        self.demote_seconds = float(b.get("demote_seconds", 30))
-        self.demote_halflife = float(
-            b.get("demote_recovery_halflife_seconds", 30))
-        self.spill_threshold = float(b.get("spill_threshold", 0.70))
-        self.load_window = float(b.get("load_window_seconds", 60))
-        self.rpm_window = max(1.0, float(b.get(
-            "rpm_window_seconds", b.get("qpm_window_seconds", 60.0))))
-        capacity_file = b.get("capacity_state_file", "runtime/capacity.json")
-        self.capacity_state_file = os.path.expanduser(str(capacity_file))
-        if not os.path.isabs(self.capacity_state_file):
-            self.capacity_state_file = os.path.join(ROOT,
-                                                    self.capacity_state_file)
-        self.chars_per_token = float(b.get("assumed_chars_per_token", 4)) or 4.0
-
-        f = b.get("foreign_load") or {}
-        self.foreign_enabled = bool(f.get("enabled", True))
-        self.foreign_reclaim = float(f.get("reclaim_per_minute", 0.1))
 
         s = r.get("stream_probe") or {}
         self.probe_seconds = float(s.get("hold_seconds", 0.5))
@@ -256,6 +224,49 @@ class Config:
                 self.az_config_dir = os.path.join(ROOT, self.az_config_dir)
             os.environ["AZURE_CONFIG_DIR"] = self.az_config_dir
 
+        self.routes: Dict[str, List[Route]] = {}
+        self.responses_routes: Dict[str, List[Route]] = {}
+        self.image_routes: Dict[str, List[Route]] = {}
+        self.image_edit_routes: Dict[str, List[Route]] = {}
+        self.image_deployments: Dict[str, str] = {}
+        self.routing_report = {}
+        if not load_routes:
+            return
+
+        # Routing owns algorithm settings and deployment discovery. Serving
+        # receives their results in snapshots and can boot without parsing them.
+        self.balance_configured = r.get("balance", "priority_threshold")
+        self.balance = BALANCE_ALIASES.get(self.balance_configured,
+                                          self.balance_configured)
+        if self.balance not in BALANCE_MODES:
+            self.balance = "strict_priority"
+
+        b = r.get("balancing") or {}
+        self.static_weights = b.get("static_weights") or {}
+        self.headroom_high_water = float(b.get("headroom_high_water", 0.5))
+        self.weight_floor = float(b.get("weight_floor", 0.05))
+        self.observation_ttl = float(b.get("observation_ttl_seconds", 120))
+        self.demote_multiplier = float(b.get("demote_multiplier", 0.25))
+        self.demote_seconds = float(b.get("demote_seconds", 30))
+        self.demote_halflife = float(
+            b.get("demote_recovery_halflife_seconds", 30))
+        self.spill_threshold = float(b.get("spill_threshold", 0.70))
+        self.load_window = float(b.get("load_window_seconds", 60))
+        self.rpm_window = max(1.0, float(b.get(
+            "rpm_window_seconds", b.get("qpm_window_seconds", 60.0))))
+        for name in ("load_window", "rpm_window", "spill_threshold"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError("invalid routing window/threshold: " + name)
+        capacity_file = b.get("capacity_state_file", "runtime/capacity.json")
+        self.capacity_state_file = os.path.expanduser(str(capacity_file))
+        if not os.path.isabs(self.capacity_state_file):
+            self.capacity_state_file = os.path.join(ROOT, self.capacity_state_file)
+        self.chars_per_token = float(b.get("assumed_chars_per_token", 4)) or 4.0
+
+        f = b.get("foreign_load") or {}
+        self.foreign_enabled = bool(f.get("enabled", True))
+        self.foreign_reclaim = float(f.get("reclaim_per_minute", 0.1))
+
         # An endpoint counts as usable if any face is up. They are gated
         # separately by Azure and they fail separately: a resource whose chat
         # face is refused can still serve the Responses API, and dropping it
@@ -266,13 +277,6 @@ class Config:
         self.endpoints = [(e["name"], e["status"], e.get("responses_status", "?"),
                            e.get("image_status", "?"))
                           for e in sources["endpoints"]]
-        self.routes: Dict[str, List[Route]] = {}
-        self.responses_routes: Dict[str, List[Route]] = {}
-        self.image_routes: Dict[str, List[Route]] = {}
-        # The subset that also serves /images/edits. Separate rather than
-        # filtered at request time so the 404 for an edits call against a
-        # generations-only model can name what is available.
-        self.image_edit_routes: Dict[str, List[Route]] = {}
         for name, spec in models["models"].items():
             built, responses, images = [], [], []
             for hop in spec["routes"]:

@@ -632,8 +632,10 @@ class QuotaTracker:
         halflife = self.cfg.demote_halflife
         if halflife <= 0:
             st.penalty = 1.0
-        else:
-            st.penalty = min(1.0, st.penalty * 2 ** ((now - start) / halflife))
+        elif st.penalty > 0:
+            # Clamp in log space before exponentiation, including long replay gaps.
+            exponent = math.log2(st.penalty) + (now - start) / halflife
+            st.penalty = 2 ** min(0.0, exponent)
         st.penalty_at = now
 
     # -- weights ----------------------------------------------------------

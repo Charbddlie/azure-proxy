@@ -17,6 +17,7 @@ it was because each was summing the routes it happened to have to hand.
 from typing import Dict, List, Optional
 
 import re
+import time
 
 
 def _rpm_fields(data: dict) -> dict:
@@ -330,11 +331,31 @@ class Snapshot:
     def __init__(self, raw: dict):
         self.error = raw.get("error")
         self.age = raw.get("age")
+        self.health_error = raw.get("health_error", self.error)
+        self.health_age = raw.get("health_age", self.age)
         self.dropped = raw.get("dropped", False)
         self.health: dict = raw.get("health") or {}
         self.events: List[dict] = [_rpm_fields(e)
                                    for e in (raw.get("events") or [])]
         routes_doc: dict = _rpm_fields(raw.get("routes") or {})
+        self.routing = self.health.get("routing") or {}
+        heartbeat_age = self.routing.get("heartbeat_age_seconds")
+        self.heartbeat_age = (max(0, heartbeat_age + (self.health_age or 0))
+                              if heartbeat_age is not None else None)
+        updated_at = routes_doc.get("updated_at")
+        self.stats_age = (max(0, time.time() - updated_at)
+                          if updated_at is not None else None)
+        report_routing = routes_doc.get("routing") or {}
+        if (updated_at is not None and report_routing.get("heartbeat") is not None
+                and report_routing.get("heartbeat_age_seconds") is not None):
+            # Use the server's relative age when attaching from a different clock.
+            self.stats_age = max(0, report_routing["heartbeat_age_seconds"]
+                                 + report_routing["heartbeat"] - updated_at
+                                 + (self.age or 0))
+        self.stats_stale = (bool(routes_doc.get("stats_stale"))
+                            or bool(self.routing and not self.routing.get("ok"))
+                            or bool(self.routing.get("telemetry_dropped"))
+                            or (self.stats_age is not None and self.stats_age >= 3))
 
         self.balance = routes_doc.get("balance") or self.health.get("balance")
         self.load_window = routes_doc.get("load_window_seconds")

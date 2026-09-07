@@ -1,0 +1,650 @@
+{
+  "started_at": "20260907T154307Z",
+  "model": "gpt-5.5",
+  "endpoint": "gpt4v-scus",
+  "url": "https://gpt4v-scus.openai.azure.com/openai/v1/responses",
+  "scope": "https://cognitiveservices.azure.com/.default",
+  "routes": [
+    {
+      "deployment": "gpt-5.5-2",
+      "model": "gpt-5.5",
+      "model_version": "2026-04-24"
+    },
+    {
+      "deployment": "gpt-5.5",
+      "model": "gpt-5.5",
+      "model_version": "2026-04-24"
+    }
+  ],
+  "protocol": {
+    "direct_upstream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "reasoning_effort": "low",
+    "max_output_tokens": 512,
+    "concurrency": 1,
+    "request_limit": 16,
+    "repeats": 2,
+    "deployment_order": [
+      "gpt-5.5",
+      "gpt-5.5-2"
+    ],
+    "retry_limit": 2,
+    "max_wait_seconds": 30,
+    "replay": "original input + all unmodified output items + new user turn",
+    "negative_control": "one ciphertext character changed in a separate request"
+  },
+  "requests": [
+    {
+      "label": "round1:gpt-5.5:mint",
+      "deployment": "gpt-5.5",
+      "input_ciphers": [],
+      "input_history_sha256": "954b99c0ef1ae0c6cbbb7ab82b586b95966f454891ca7c8d8f587def4af9fc25",
+      "timestamp": "2026-09-07T15:43:07.626103+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.334,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "4999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "5000",
+        "x-ratelimit-remaining-tokens": "4973339",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "5000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 30,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 50,
+        "output_tokens_details": {
+          "reasoning_tokens": 42
+        },
+        "total_tokens": 80
+      },
+      "output_ciphers": [
+        {
+          "length": 1036,
+          "sha256": "bee7ea6f3d9d1a696d920fefa0fa8f51694dd3a34b64b7078660fc56e41a8671"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.5:self",
+      "deployment": "gpt-5.5",
+      "input_ciphers": [
+        {
+          "length": 1036,
+          "sha256": "bee7ea6f3d9d1a696d920fefa0fa8f51694dd3a34b64b7078660fc56e41a8671"
+        }
+      ],
+      "input_history_sha256": "bf4b9818e893cc8c0d8db84df798f006f20f0d483b7aa46dd3852e8637370b03",
+      "timestamp": "2026-09-07T15:43:09.961241+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 1.7,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "4999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "5000",
+        "x-ratelimit-remaining-tokens": "4999961",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "5000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 56,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 25,
+        "output_tokens_details": {
+          "reasoning_tokens": 17
+        },
+        "total_tokens": 81
+      },
+      "output_ciphers": [
+        {
+          "length": 972,
+          "sha256": "c090cc09c71237fe54c85a8283fb0f9f5e55e86322874ffafa401af3727f1fd5"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.5:cross_deployment",
+      "deployment": "gpt-5.5-2",
+      "input_ciphers": [
+        {
+          "length": 1036,
+          "sha256": "bee7ea6f3d9d1a696d920fefa0fa8f51694dd3a34b64b7078660fc56e41a8671"
+        }
+      ],
+      "input_history_sha256": "bf4b9818e893cc8c0d8db84df798f006f20f0d483b7aa46dd3852e8637370b03",
+      "timestamp": "2026-09-07T15:43:11.663199+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.653,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "14999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "15000",
+        "x-ratelimit-remaining-tokens": "14999961",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "15000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5-2",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 56,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 28,
+        "output_tokens_details": {
+          "reasoning_tokens": 20
+        },
+        "total_tokens": 84
+      },
+      "output_ciphers": [
+        {
+          "length": 996,
+          "sha256": "05b23d6ccdfc6aa9662a6de681491d98a7b8f519ad8363eb097c35535b0bbf8f"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.5:tampered_self",
+      "deployment": "gpt-5.5",
+      "input_ciphers": [
+        {
+          "length": 1036,
+          "sha256": "ad11dc516cbb2462b2f3e237188b8e1d329221851a285c472c536e163051eb72"
+        }
+      ],
+      "input_history_sha256": "f805a5bce357685ba57e0829c7a0634961bce607493ae43e5f4884fb2ca4277d",
+      "timestamp": "2026-09-07T15:43:14.316550+00:00",
+      "http_status": 400,
+      "elapsed_seconds": 0.901,
+      "quota_headers": {},
+      "response_status": null,
+      "response_model": null,
+      "error_code": "invalid_encrypted_content",
+      "error_type": "invalid_request_error",
+      "incomplete_reason": null,
+      "usage": null,
+      "output_ciphers": [],
+      "answer_matches_expected": false,
+      "completed": false,
+      "outcome": "encrypted_content_rejected"
+    },
+    {
+      "label": "round1:gpt-5.5-2:mint",
+      "deployment": "gpt-5.5-2",
+      "input_ciphers": [],
+      "input_history_sha256": "954b99c0ef1ae0c6cbbb7ab82b586b95966f454891ca7c8d8f587def4af9fc25",
+      "timestamp": "2026-09-07T15:43:15.218567+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.889,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "14999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "15000",
+        "x-ratelimit-remaining-tokens": "14999977",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "15000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5-2",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 30,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 42,
+        "output_tokens_details": {
+          "reasoning_tokens": 34
+        },
+        "total_tokens": 72
+      },
+      "output_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "b0c01d7c47593052487e6ce6e475ec4e6528963e8ced9cb0d4e8a777c84a054c"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.5-2:self",
+      "deployment": "gpt-5.5-2",
+      "input_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "b0c01d7c47593052487e6ce6e475ec4e6528963e8ced9cb0d4e8a777c84a054c"
+        }
+      ],
+      "input_history_sha256": "df4f70f0bafe1707b81974c26fa5545d3174dbe116c9cf57fd47d6846bcd4c22",
+      "timestamp": "2026-09-07T15:43:18.108982+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.169,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "14999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "15000",
+        "x-ratelimit-remaining-tokens": "14988499",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "15000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5-2",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 56,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 26,
+        "output_tokens_details": {
+          "reasoning_tokens": 18
+        },
+        "total_tokens": 82
+      },
+      "output_ciphers": [
+        {
+          "length": 996,
+          "sha256": "a27105642b7668c15755e23f76085e6fe554c59bd9e98df56ad2def290a5eddc"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.5-2:cross_deployment",
+      "deployment": "gpt-5.5",
+      "input_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "b0c01d7c47593052487e6ce6e475ec4e6528963e8ced9cb0d4e8a777c84a054c"
+        }
+      ],
+      "input_history_sha256": "df4f70f0bafe1707b81974c26fa5545d3174dbe116c9cf57fd47d6846bcd4c22",
+      "timestamp": "2026-09-07T15:43:20.279289+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 4.436,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "4999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "5000",
+        "x-ratelimit-remaining-tokens": "4981958",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "5000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 56,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 29,
+        "output_tokens_details": {
+          "reasoning_tokens": 21
+        },
+        "total_tokens": 85
+      },
+      "output_ciphers": [
+        {
+          "length": 996,
+          "sha256": "7c757b8bae377e8c91fe43dce83d0a623425847051d2fe76e041596d3c75ebe1"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.5-2:tampered_self",
+      "deployment": "gpt-5.5-2",
+      "input_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "82b6c6f7f8bdec1600006bc699bc9d608759665cf4812e0a709f860d5ca3611f"
+        }
+      ],
+      "input_history_sha256": "34a67261e3b528baa75f4b4d6a26f6dcb58b6867721d5dc503344fb2232b3f49",
+      "timestamp": "2026-09-07T15:43:24.716411+00:00",
+      "http_status": 400,
+      "elapsed_seconds": 0.93,
+      "quota_headers": {},
+      "response_status": null,
+      "response_model": null,
+      "error_code": "invalid_encrypted_content",
+      "error_type": "invalid_request_error",
+      "incomplete_reason": null,
+      "usage": null,
+      "output_ciphers": [],
+      "answer_matches_expected": false,
+      "completed": false,
+      "outcome": "encrypted_content_rejected"
+    },
+    {
+      "label": "round2:gpt-5.5:mint",
+      "deployment": "gpt-5.5",
+      "input_ciphers": [],
+      "input_history_sha256": "4e3b9a893bc56c8db40b08ea7c29b7b639c1d91bf5f4bc0f91a1c2a0b3fbcdfb",
+      "timestamp": "2026-09-07T15:43:25.647293+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 3.519,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "4999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "5000",
+        "x-ratelimit-remaining-tokens": "4999977",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "5000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 30,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 45,
+        "output_tokens_details": {
+          "reasoning_tokens": 37
+        },
+        "total_tokens": 75
+      },
+      "output_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "be37a244829cc7af85a8699baeae16339cd0bd14ed759429a18e54cb895cf822"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.5:cross_deployment",
+      "deployment": "gpt-5.5-2",
+      "input_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "be37a244829cc7af85a8699baeae16339cd0bd14ed759429a18e54cb895cf822"
+        }
+      ],
+      "input_history_sha256": "0755382d814a4f75c8e02566dc4e8e8d6dbcf6b632bedd3d00122c509ffcf384",
+      "timestamp": "2026-09-07T15:43:29.166885+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.608,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "14999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "15000",
+        "x-ratelimit-remaining-tokens": "14999961",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "15000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5-2",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 56,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 29,
+        "output_tokens_details": {
+          "reasoning_tokens": 21
+        },
+        "total_tokens": 85
+      },
+      "output_ciphers": [
+        {
+          "length": 996,
+          "sha256": "9a747b956ae1dca83ef26957eea34546feab880ab2600abda2234981502a4791"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.5:self",
+      "deployment": "gpt-5.5",
+      "input_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "be37a244829cc7af85a8699baeae16339cd0bd14ed759429a18e54cb895cf822"
+        }
+      ],
+      "input_history_sha256": "0755382d814a4f75c8e02566dc4e8e8d6dbcf6b632bedd3d00122c509ffcf384",
+      "timestamp": "2026-09-07T15:43:31.775928+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.013,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "4999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "5000",
+        "x-ratelimit-remaining-tokens": "4971841",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "5000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 56,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 37,
+        "output_tokens_details": {
+          "reasoning_tokens": 29
+        },
+        "total_tokens": 93
+      },
+      "output_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "68be5fcaedcbd63235faacbc5f99ed23ce03e9d35dc0efb28fc09a8ccd010552"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.5-2:mint",
+      "deployment": "gpt-5.5-2",
+      "input_ciphers": [],
+      "input_history_sha256": "4e3b9a893bc56c8db40b08ea7c29b7b639c1d91bf5f4bc0f91a1c2a0b3fbcdfb",
+      "timestamp": "2026-09-07T15:43:33.789629+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.563,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "14999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "15000",
+        "x-ratelimit-remaining-tokens": "14999977",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "15000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5-2",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 30,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 44,
+        "output_tokens_details": {
+          "reasoning_tokens": 36
+        },
+        "total_tokens": 74
+      },
+      "output_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "c30bfcbee18e6c11f9d662da77121e238cbc23a3eef9084277ffe806d828a432"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.5-2:cross_deployment",
+      "deployment": "gpt-5.5",
+      "input_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "c30bfcbee18e6c11f9d662da77121e238cbc23a3eef9084277ffe806d828a432"
+        }
+      ],
+      "input_history_sha256": "4b6bc6a5cb7d3ad5a868cb20d6b2078b01cbb95ec1d086b4a16ca59ee7992af9",
+      "timestamp": "2026-09-07T15:43:36.354162+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 1.839,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "4999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "5000",
+        "x-ratelimit-remaining-tokens": "4976859",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "5000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 56,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 29,
+        "output_tokens_details": {
+          "reasoning_tokens": 21
+        },
+        "total_tokens": 85
+      },
+      "output_ciphers": [
+        {
+          "length": 996,
+          "sha256": "e96b502b7ad7308bd36e6bebe4b402d2e12719418e08e2908ed9922cf6a1a77a"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.5-2:self",
+      "deployment": "gpt-5.5-2",
+      "input_ciphers": [
+        {
+          "length": 1016,
+          "sha256": "c30bfcbee18e6c11f9d662da77121e238cbc23a3eef9084277ffe806d828a432"
+        }
+      ],
+      "input_history_sha256": "4b6bc6a5cb7d3ad5a868cb20d6b2078b01cbb95ec1d086b4a16ca59ee7992af9",
+      "timestamp": "2026-09-07T15:43:38.193854+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.023,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "14999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "15000",
+        "x-ratelimit-remaining-tokens": "14999961",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "15000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.5-2",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 56,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 28,
+        "output_tokens_details": {
+          "reasoning_tokens": 20
+        },
+        "total_tokens": 84
+      },
+      "output_ciphers": [
+        {
+          "length": 996,
+          "sha256": "900906a1c2ac15bc3873a35fdc86aebeeef04b05dc226b88b7be04a2d295ff9a"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    }
+  ],
+  "finished_at": "2026-09-07T15:43:40.217838+00:00",
+  "request_count": 14,
+  "retry_count": 0
+}

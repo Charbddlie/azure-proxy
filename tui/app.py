@@ -23,6 +23,7 @@ from typing import List
 from rich.console import Console, Group as RichGroup
 from rich.live import Live
 from rich.rule import Rule
+from rich.segment import SegmentLines
 from rich.table import Table
 from rich.text import Text
 
@@ -96,28 +97,43 @@ class Dashboard:
     def render(self):
         snapshot = Snapshot(self.poller.snapshot())
         width = self.console.width
-        # header (3) + tabs (1) + rule (1) + footer (2)
-        body_height = max(4, self.console.height - 7)
+        header = RichGroup(_header(snapshot), _processes(snapshot),
+                           _tabs(self.board, snapshot, self.show_all, self.filter,
+                                 self.kind_filter), Rule(style=theme.BORDER))
+        footer = _footer(self, snapshot, self._extent[self.board])
+        options = self.console.options.update(height=None)
+        header_height = len(self.console.render_lines(header, options, pad=False))
+        footer_height = len(self.console.render_lines(footer, options, pad=False))
+        chrome_height = header_height + footer_height
+        body_height = max(1, self.console.height - chrome_height)
 
-        if self.board == 2:
-            body, extent = render_events(
-                snapshot.events, width, body_height, self.offset[2],
-                self.filter, snapshot.dropped, self.kind_filter)
-        elif self.board == 1:
-            body, extent = render_groups(
-                snapshot.models, width, body_height, self.offset[1],
-                SORTS[self.sort], snapshot, "model", self.show_all)
-        else:
-            body, extent = render_groups(
-                snapshot.sources, width, body_height, self.offset[0],
+        def render_body(height):
+            if self.board == 2:
+                return render_events(
+                    snapshot.events, width, height, self.offset[2],
+                    self.filter, snapshot.dropped, self.kind_filter)
+            if self.board == 1:
+                return render_groups(
+                    snapshot.models, width, height, self.offset[1],
+                    SORTS[self.sort], snapshot, "model", self.show_all)
+            return render_groups(
+                snapshot.sources, width, height, self.offset[0],
                 SORTS[self.sort], snapshot, "source", self.show_all)
+
+        body, extent = render_body(body_height)
+        footer = _footer(self, snapshot, extent)
+        extra = len(self.console.render_lines(footer, options, pad=False)) - footer_height
+        if extra > 0:
+            # A newly visible scroll counter can wrap the footer on narrow terminals.
+            body_height = max(1, body_height - extra)
+            body, extent = render_body(body_height)
+            footer = _footer(self, snapshot, extent)
         self._extent[self.board] = extent
 
-        return RichGroup(_header(snapshot), _tabs(self.board, snapshot,
-                                                  self.show_all, self.filter,
-                                                  self.kind_filter),
-                         Rule(style=theme.BORDER), body,
-                         _footer(self, snapshot, extent))
+        # Bound the scrollable cards so process status and freshness remain visible.
+        body = SegmentLines(self.console.render_lines(body, options.update(height=body_height)),
+                            new_lines=True)
+        return RichGroup(header, body, footer)
 
     # -- loop -------------------------------------------------------------
     def run(self) -> None:
@@ -156,14 +172,8 @@ def _header(snapshot: Snapshot) -> Table:
 
     right = Text()
     token = health.get("token") or {}
-    if snapshot.error:
-        # The proxy is unreachable. Say it here rather than blanking the board:
-        # the numbers below are still the last true ones, and their age is in
-        # the footer.
-        right.append("unreachable", style=theme.CRIT)
-    elif health.get("routing") and (not health["routing"].get("ok")
-                                   or health["routing"].get("telemetry_dropped")):
-        right.append("routing/statistics stale", style=theme.WARN)
+    if snapshot.health_error:
+        right.append("last known credentials", style=theme.DIM)
     elif token.get("have_token"):
         seconds = token.get("expires_in_seconds") or 0
         right.append("token ", style=theme.DIM)
@@ -171,9 +181,6 @@ def _header(snapshot: Snapshot) -> Table:
                      style=theme.OK if seconds > 300 else theme.WARN)
     elif health:
         right.append("no token", style=theme.CRIT)
-    uptime = health.get("uptime_seconds")
-    if uptime is not None:
-        right.append("  up {}".format(_duration(uptime)), style=theme.DIM)
     probed = health.get("probed_at")
     if probed:
         right.append("  probed {}".format(probed[:16].replace("T", " ")),
@@ -181,6 +188,53 @@ def _header(snapshot: Snapshot) -> Table:
 
     table.add_row(left, right)
     return table
+
+
+def _processes(snapshot: Snapshot) -> RichGroup:
+    """HTTP proves serving reachability; routing liveness comes from its heartbeat."""
+    serving = Text("serving ", style=theme.LABEL, no_wrap=True, overflow="ellipsis")
+    if snapshot.health_error:
+        status, style = "unreachable", theme.CRIT
+    elif not snapshot.health:
+        status, style = "connecting", theme.DIM
+    elif snapshot.health_age is not None and snapshot.health_age >= 5:
+        status, style = "unconfirmed", theme.WARN
+    else:
+        status, style = "online", theme.OK
+    serving.append(status, style=style)
+    pid = snapshot.health.get("pid")
+    if pid is not None:
+        serving.append("  {}PID {}".format("" if status == "online" else "last ", pid),
+                       style=theme.DIM)
+    uptime = snapshot.health.get("uptime_seconds")
+    if uptime is not None:
+        serving.append("  up {}".format(_duration(uptime)), style=theme.DIM)
+
+    state = snapshot.routing
+    routing = Text("routing ", style=theme.LABEL, no_wrap=True, overflow="ellipsis")
+    if status != "online" or not state:
+        route_status, style = "unknown", theme.WARN
+    elif state.get("ready") is False:
+        route_status, style = "stopped", theme.CRIT
+    elif snapshot.heartbeat_age is not None and snapshot.heartbeat_age >= 3:
+        route_status, style = "no heartbeat", theme.CRIT
+    elif state.get("exchange_error") or not state.get("ok"):
+        route_status, style = "degraded", theme.WARN
+    else:
+        route_status, style = "online", theme.OK
+    routing.append(route_status, style=style)
+    pid = state.get("pid")
+    if pid is not None:
+        routing.append("  {}PID {}".format(
+            "" if route_status in ("online", "degraded") else "last ", pid), style=theme.DIM)
+    if snapshot.heartbeat_age is not None:
+        routing.append("  heartbeat {} ago".format(_duration(snapshot.heartbeat_age)),
+                       style=theme.DIM if route_status == "online" else theme.WARN)
+    if state.get("backlog"):
+        routing.append("  backlog {:,}".format(state["backlog"]), style=theme.WARN)
+    if state.get("telemetry_dropped"):
+        routing.append("  dropped {:,}".format(state["telemetry_dropped"]), style=theme.CRIT)
+    return RichGroup(serving, routing)
 
 
 def _tabs(active: int, snapshot: Snapshot, show_all: bool,
@@ -251,8 +305,13 @@ def _footer(dash: "Dashboard", snapshot: Snapshot, extent: int) -> Table:
     if snapshot.error:
         state.append(snapshot.error[:40], style=theme.CRIT)
     elif age is not None:
-        state.append("{:.0f}s ago".format(age),
+        state.append("fetch {} ago".format(_duration(age)),
                      style=theme.DIM if age < 5 else theme.WARN)
+    if snapshot.stats_age is not None:
+        state.append("  stats {} ago".format(_duration(snapshot.stats_age)),
+                     style=theme.WARN if snapshot.stats_stale else theme.DIM)
+    if snapshot.stats_stale:
+        state.append("  stale", style=theme.WARN)
 
     table.add_row(legend() if dash.board != 2 else keys, state)
     if dash.board != 2:

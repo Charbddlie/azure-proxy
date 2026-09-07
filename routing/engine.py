@@ -1,20 +1,58 @@
 """Replay observations, calculate targets, and atomically publish a generation."""
 
 import collections
+import logging
 import os
 import time
 import uuid
 
-from proxy.bridge import SNAPSHOT_FIELDS, decode_snapshot, route_record
-from proxy.config import Config, Route, TABLES
+from proxy.bridge import SNAPSHOT_FIELDS, SNAPSHOT_VERSION, decode_snapshot
+from proxy.config import BALANCE_ALIASES, Config, Route, TABLES
 from proxy.events import event_level, normalized_event
 from proxy.state import SCHEMA_VERSION, Store
+from proxy.retention import CLEANUP_INTERVAL, RETENTION_SECONDS, prune_checkpoint, recent
 from .quota import QuotaTracker, RouteState
+
+
+# These fields also describe deployments in v1 telemetry and checkpoints.
+ROUTE_FIELDS = (
+    "endpoint", "url", "api_version", "deployment", "limit_param", "priority",
+    "responses_path", "model_version", "capacity_requests", "capacity_tokens",
+    "image_edits", "scope",
+)
+
+
+def route_record(route):
+    return {key: getattr(route, key) for key in ROUTE_FIELDS}
+
+
+def route_from_record(record):
+    return Route(**{key: record[key] for key in ROUTE_FIELDS if key in record})
+
+
+def target_record(route):
+    """Resolve URL conventions here; serving executes the published addresses."""
+    targets = {
+        "/v1/chat/completions": route.chat_target(),
+        "/v1/images/generations": route.image_target("generations"),
+        "/v1/images/edits": route.image_target("edits"),
+    }
+    if route.responses_path:
+        targets["/v1/responses"] = route.responses_target()
+    return dict(endpoint=route.endpoint, deployment=route.deployment, scope=route.scope,
+                targets=targets, routing_data=route_record(route))
 
 
 class Engine:
     def __init__(self, root, config=None):
         self.config = config or Config()
+        cfg = self.config
+        log = logging.getLogger(__name__)
+        if cfg.balance_configured != cfg.balance:
+            level = logging.INFO if cfg.balance_configured in BALANCE_ALIASES else logging.WARNING
+            log.log(level, "routing.balance=%r resolved to %s", cfg.balance_configured, cfg.balance)
+        log.info("routing balance=%s spill_threshold=%s load_window=%ss cold-start weights=%s",
+                 cfg.balance, cfg.spill_threshold, cfg.load_window, cfg.static_weights)
         self.store = Store(root)
         self.instance = uuid.uuid4().hex
         self.now = time.time()
@@ -26,11 +64,15 @@ class Engine:
         self.event_seq = 0
         self.quota = QuotaTracker(self.config, clock=lambda: self.now,
                                  emit=self.event, persist_capacity=False)
-        snapshot = self.store.get("snapshot")
-        self.revision = snapshot["revision"] if snapshot else 0
-        saved = self.store.get("checkpoint")
-        if saved:
-            self.restore(saved)
+        try:
+            snapshot = self.store.get("snapshot")
+            self.revision = snapshot["revision"] if snapshot else 0
+            saved = self.store.get("checkpoint")
+            if saved:
+                self.restore(saved)
+        except Exception:
+            self.store.close()
+            raise
         self.mirrored_capacity = None
         self.last_publication = None
         self.published_at = 0.0
@@ -51,6 +93,7 @@ class Engine:
     def restore(self, saved):
         if saved.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("incompatible routing checkpoint")
+        prune_checkpoint(saved, time.time() - RETENTION_SECONDS + CLEANUP_INTERVAL)
         self.cursor = saved["cursor"]
         self.sessions = saved["sessions"]
         self.events.extend(normalized_event(event) for event in saved["events"])
@@ -70,6 +113,7 @@ class Engine:
 
     def checkpoint(self):
         return dict(schema_version=SCHEMA_VERSION, cursor=self.cursor,
+                    retention_epoch=int(self.now // CLEANUP_INTERVAL),
                     capacity=dict(self.quota._saved_capacity), pending=self.pending,
                     catalog=self.catalog, sessions=self.sessions,
                     events=list(self.events), event_seq=self.event_seq,
@@ -100,7 +144,7 @@ class Engine:
         if kind == "finish":
             self.pending.pop(attempt, None)
             return
-        route = Route(**event["route"])
+        route = route_from_record(event["route"])
         record = self.pending.get(attempt)
         entry = record["entry"] if record else None
         if kind == "dispatch":
@@ -126,8 +170,14 @@ class Engine:
             record["success"] = True
 
     def snapshot(self, ready=True):
+        cutoff = self.now - RETENTION_SECONDS + CLEANUP_INTERVAL
+        self.events = collections.deque(recent(self.events, cutoff), maxlen=2000)
+        self.pending = {key: value for key, value in self.pending.items()
+                        if value.get("entry") and value["entry"][0] > cutoff}
+        for state in self.quota.states.values():
+            state.sent = collections.deque(entry for entry in state.sent if entry[0] > cutoff)
         cfg = self.config
-        tables = {name: {model: [route_record(route) for route in self.quota.order(routes)]
+        tables = {name: {model: [target_record(route) for route in self.quota.order(routes)]
                          for model, routes in getattr(cfg, name).items()} for name in TABLES}
         merged = {}
         for name in TABLES:
@@ -137,11 +187,12 @@ class Engine:
                 current.extend(route for route in routes if str(route) not in seen)
         for item in self.catalog.values():
             model = item["model"]
-            route = Route(**item["route"])
+            route = route_from_record(item["route"])
             if model and str(route) not in {str(r) for r in merged.get(model, [])}:
                 merged.setdefault(model, []).append(route)
         report = self.quota.report(merged)
         report.update(session_affinity=self.sessions,
+                      spill_threshold=cfg.spill_threshold, probed_at=cfg.generated_at,
                       model_faces={model: [face for face, name in zip(
                           ("chat", "responses", "image", "image_edits"), TABLES)
                           if model in getattr(cfg, name)] for model in merged},
@@ -151,7 +202,7 @@ class Engine:
                       updated_at=self.now)
         config = {name: sorted(value) if isinstance(value, set) else value
                   for name in SNAPSHOT_FIELDS for value in [getattr(cfg, name)]}
-        return dict(schema_version=SCHEMA_VERSION, revision=self.revision + 1,
+        return dict(schema_version=SNAPSHOT_VERSION, revision=self.revision + 1,
                     config=config, tables=tables, report=report,
                     routing=dict(pid=os.getpid(), instance_id=self.instance,
                                  heartbeat=self.now, processed_seq=self.cursor, ready=ready),
@@ -162,16 +213,32 @@ class Engine:
         # Catch up to a fixed waterline before publishing; concurrent arrivals
         # belong to the next generation and cannot starve publication.
         waterline = self.store.highwater()
+        cutoff = time.time() - RETENTION_SECONDS + CLEANUP_INTERVAL
         if (ready and self.last_publication is not None and self.cursor == waterline
                 and time.monotonic() - self.published_at < 1.0):
             return self.last_publication
+        replaying = waterline - self.cursor >= 10000
+        progress_at = time.monotonic()
+        log = logging.getLogger(__name__)
+        if replaying:
+            log.info("routing replay starting: seq %s -> %s", self.cursor, waterline)
         while self.cursor < waterline:
-            batch = self.store.read_events(self.cursor)
+            batch = self.store.read_events(self.cursor, through=waterline)
             if not batch:
+                retention = self.store.get("retention") or {}
+                if retention.get("through", 0) >= waterline:
+                    self.cursor = waterline
+                    break
                 raise RuntimeError("telemetry gap before routing waterline")
             for seq, event in batch:
-                self.consume(event)
+                if event["at"] > cutoff:
+                    self.consume(event)
                 self.cursor = seq
+            if replaying and time.monotonic() - progress_at >= 5:
+                log.info("routing replay progress: seq %s / %s", self.cursor, waterline)
+                progress_at = time.monotonic()
+        if replaying:
+            log.info("routing replay complete: seq %s", self.cursor)
         self.now = time.time()
         snapshot = self.snapshot(ready)
         decode_snapshot(snapshot, self.config)

@@ -9,8 +9,22 @@ import fcntl
 import json
 import os
 import sqlite3
+import collections
+import time
+
+from .retention import CLEANUP_INTERVAL, RETENTION_SECONDS, prune_checkpoint, recent
 
 SCHEMA_VERSION = 1
+COMPACT_BATCH = 2000
+
+
+def is_busy(error):
+    """Recognize transient SQLite lock errors across supported Python versions."""
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xff in (5, 6)  # SQLITE_BUSY / SQLITE_LOCKED, including extended codes.
+    return str(error).split(":", 1)[0] in (
+        "database is locked", "database table is locked", "database schema is locked")
 
 
 def encode(value):
@@ -40,11 +54,23 @@ class Store:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
         self.db = sqlite3.connect(path, timeout=1, check_same_thread=False)
+        try:
+            self._initialize()
+        except Exception:
+            self.db.close()
+            raise
+        self._checkpoint_cursor = None
+        self._event_seq = None
+        self._event_key = None
+        self._checkpoint_epoch = None
+
+    def _initialize(self):
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone():
+            self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, SCHEMA_VERSION):
-            self.db.close()
             raise ValueError("unsupported control database version {}".format(version))
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS telemetry (
@@ -61,10 +87,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS state (
                 name TEXT PRIMARY KEY, payload TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS telemetry_at ON telemetry (
+                COALESCE(json_extract(payload, '$.at'), 0)
+            );
             PRAGMA user_version=1;
         """)
-        self._checkpoint_cursor = None
-        self._event_seq = None
 
     def get(self, name):
         if name in ("snapshot", "checkpoint"):
@@ -101,28 +128,77 @@ class Store:
         return self.db.execute(
             "SELECT COALESCE(MAX(global_seq),0) FROM producers").fetchone()[0]
 
-    def read_events(self, after, limit=2000):
+    def read_events(self, after, limit=2000, through=None):
+        bound = " AND seq<=?" if through is not None else ""
+        args = (after, through, limit) if through is not None else (after, limit)
         return [(seq, json.loads(payload)) for seq, payload in self.db.execute(
-            "SELECT seq,payload FROM telemetry WHERE seq>? ORDER BY seq LIMIT ?",
-            (after, limit))]
+            "SELECT seq,payload FROM telemetry WHERE seq>?" + bound + " ORDER BY seq LIMIT ?",
+            args)]
+
+    def expire(self, now=None):
+        """Delete one bounded batch and atomically record the discarded sequence range."""
+        now = time.time() if now is None else now
+        cutoff = now - RETENTION_SECONDS + CLEANUP_INTERVAL
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            rows = self.db.execute(
+                "SELECT seq FROM telemetry WHERE COALESCE(json_extract(payload, '$.at'), 0)<=? "
+                "ORDER BY COALESCE(json_extract(payload, '$.at'), 0) LIMIT ?",
+                (cutoff, COMPACT_BATCH)).fetchall()
+            retention = self.get("retention") or {"through": 0, "deleted": 0}
+            if rows:
+                retention["through"] = max(retention["through"], max(row[0] for row in rows))
+                retention["deleted"] += len(rows)
+                self.db.executemany("DELETE FROM telemetry WHERE seq=?", rows)
+            retention.update(cleaned_at=now, hours=24)
+            self.db.execute("INSERT OR REPLACE INTO state VALUES('retention',?)", (encode(retention),))
+            for name, payload in self.db.execute(
+                    "SELECT name,payload FROM state WHERE name IN ('events','checkpoint','snapshot')"
+                    ).fetchall():
+                value = json.loads(payload)
+                if name == "checkpoint":
+                    prune_checkpoint(value, cutoff)
+                feed = value if name == "events" else value.get("events") if name == "snapshot" else None
+                if isinstance(feed, dict):
+                    feed["events"] = recent(feed.get("events", []), cutoff)
+                    feed["counts"] = dict(collections.Counter(e["kind"] for e in feed["events"]))
+                updated = encode(value)
+                if updated != payload:
+                    self.db.execute("UPDATE state SET payload=? WHERE name=?", (updated, name))
+        return len(rows)
+
+    def reclaim(self, pages=256):
+        """Release a bounded number of free pages; WAL checkpoints remain non-blocking."""
+        if self.db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+            self.db.execute("PRAGMA incremental_vacuum({})".format(int(pages))).fetchall()
+        return self.db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
 
     def publish(self, checkpoint, snapshot):
         # Event history is shared by snapshot/checkpoint. An idle heartbeat
         # writes only the compact publication, rather than rewriting the ring.
         publication = {key: value for key, value in snapshot.items() if key != "events"}
         records = [("snapshot", encode(publication))]
+        feed = snapshot["events"]
+        event_key = (feed["next"], len(feed["events"]),
+                     feed["events"][0].get("seq") if feed["events"] else None)
         if (self._checkpoint_cursor != checkpoint["cursor"]
-                or self._event_seq != snapshot["events"]["next"]):
+                or self._event_key != event_key
+                or self._checkpoint_epoch != checkpoint.get("retention_epoch")):
             saved = {key: value for key, value in checkpoint.items() if key != "events"}
             records.append(("checkpoint", encode(saved)))
-        if self._event_seq != snapshot["events"]["next"]:
+        if self._event_key != event_key:
             records.append(("events", encode(snapshot["events"])))
         with self.db:
             self.db.executemany("INSERT OR REPLACE INTO state VALUES(?,?)", records)
-            self.db.execute("DELETE FROM telemetry WHERE seq<=?",
-                            (checkpoint["cursor"],))
+            # Bound the write lock when recovering a large backlog. Remaining
+            # checkpointed rows are safe to compact in later publications.
+            self.db.execute("DELETE FROM telemetry WHERE seq IN "
+                            "(SELECT seq FROM telemetry WHERE seq<=? ORDER BY seq LIMIT ?)",
+                            (checkpoint["cursor"], COMPACT_BATCH))
         self._checkpoint_cursor = checkpoint["cursor"]
         self._event_seq = snapshot["events"]["next"]
+        self._event_key = event_key
+        self._checkpoint_epoch = checkpoint.get("retention_epoch")
 
     def close(self):
         self.db.close()

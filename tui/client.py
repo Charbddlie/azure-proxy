@@ -22,6 +22,8 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
+from proxy.retention import RETENTION_SECONDS, recent
+
 
 class Poller:
     """Fetches in the background; `snapshot()` returns the latest, never blocks.
@@ -47,6 +49,8 @@ class Poller:
         self._dropped = False
         self._fetched_at = 0.0
         self._error: Optional[str] = None
+        self._health_fetched_at = 0.0
+        self._health_error: Optional[str] = None
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -68,11 +72,16 @@ class Poller:
     # -- reading ----------------------------------------------------------
     def snapshot(self) -> dict:
         with self._lock:
+            now = time.time()
+            self._events = recent(self._events, now - RETENTION_SECONDS)
             return {"health": self._health, "routes": self._routes,
                     "events": list(self._events), "dropped": self._dropped,
                     "fetched_at": self._fetched_at, "error": self._error,
-                    "age": (time.time() - self._fetched_at
-                            if self._fetched_at else None)}
+                    "age": (max(0, now - self._fetched_at)
+                            if self._fetched_at else None),
+                    "health_error": self._health_error,
+                    "health_age": (max(0, now - self._health_fetched_at)
+                                   if self._health_fetched_at else None)}
 
     # -- polling ----------------------------------------------------------
     def _get(self, path: str) -> dict:
@@ -85,6 +94,18 @@ class Poller:
         while not self._stop.is_set():
             try:
                 health = self._get("/healthz")
+            except Exception as e:
+                with self._lock:
+                    self._health_error = self._error = "{}: {}".format(type(e).__name__, e)
+                self._wake.wait(self.interval)
+                self._wake.clear()
+                continue
+            # Serving reachability is independent of the statistics endpoints.
+            with self._lock:
+                self._health = health
+                self._health_fetched_at = time.time()
+                self._health_error = None
+            try:
                 routes = self._get("/routes")
                 feed = self._get("/events?since={}&limit={}".format(
                     self._cursor, self.event_limit))
@@ -93,7 +114,7 @@ class Poller:
                     self._error = "{}: {}".format(type(e).__name__, e)
             else:
                 with self._lock:
-                    self._health, self._routes = health, routes
+                    self._routes = routes
                     cursor = int(feed.get("next", self._cursor) or 0)
                     if cursor < self._cursor:
                         # The proxy restarted: sequence numbers begin again at

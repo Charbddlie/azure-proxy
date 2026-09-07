@@ -29,6 +29,8 @@ from fake_azure import (Behaviour, FakeAzure, dead_url, ratelimit,  # noqa: E402
                         ratelimit_throttled, sse, sse_rate_limited)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+from proxy.config import Route
 # The checkout's own interpreter, found relative to this file rather than by an
 # absolute path — so a moved or copied tree tests itself rather than whatever
 # happens to still be at the old location.
@@ -38,6 +40,13 @@ PYTHON = os.environ.get(
 MODEL = "test-model"
 DEPLOYMENT = "test-deployment"      # deliberately different, to catch rewriting
 RESPONSES_PATH = "openai/v1/responses"
+
+
+def serving_target(*args, **kwargs):
+    """Compile the routing fixture into the same Target that serving installs."""
+    from proxy.bridge import Target
+    from routing.engine import target_record
+    return Target(**target_record(Route(*args, **kwargs)))
 
 
 # --------------------------------------------------------------------------
@@ -1848,15 +1857,18 @@ def test_throttle_below_safe_rpm_attributes_the_difference_to_others():
 
 def _inline_telemetry(config):
     """Replay serving observations synchronously for stream boundary unit tests."""
+    import copy
     from routing.engine import Engine
     from routing.quota import QuotaTracker
     from proxy.bridge import Telemetry
 
-    config.chars_per_token = 4
+    routing_config = copy.copy(config)
+    routing_config.chars_per_token = 4
+    routing_config.load_window = getattr(config, "load_window", 60)
     engine = Engine.__new__(Engine)
     engine.pending, engine.catalog = {}, {}
     engine.now = time.time()
-    engine.quota = QuotaTracker(config, clock=lambda: engine.now)
+    engine.quota = QuotaTracker(routing_config, clock=lambda: engine.now)
 
     class Sink:
         def record(self, kind, **data):
@@ -1881,7 +1893,7 @@ def test_completed_stream_updates_safe_rpm_before_eof_or_client_disconnect():
             stream_retry_markers=[server.INBAND_RATE_LIMIT])
         observer, engine = _inline_telemetry(config)
         tracker = engine.quota
-        route = server.Route("alpha", "http://x/", "v", DEPLOYMENT,
+        route = serving_target("alpha", "http://x/", "v", DEPLOYMENT,
                              "max_completion_tokens", 0)
         first = observer.charge(route, 1)
         observer.note_success(route, first)
@@ -1949,7 +1961,7 @@ def test_incomplete_or_failed_stream_does_not_raise_safe_rpm():
                                  stream_retry_markers=[server.INBAND_RATE_LIMIT])
         observer, engine = _inline_telemetry(config)
         tracker = engine.quota
-        route = server.Route("alpha", "http://x/", "v", DEPLOYMENT,
+        route = serving_target("alpha", "http://x/", "v", DEPLOYMENT,
                              "max_completion_tokens", 0)
         entry = observer.charge(route, 1)
 
@@ -2126,7 +2138,7 @@ def test_rpm_window_config_accepts_legacy_name_and_prefers_new_name():
             config.capacity_state_file = None
             tracker = QuotaTracker(config)
             assert tracker.rpm_window == expected
-            route = server.Route("alpha", "http://x/", "v", "deployment",
+            route = Route("alpha", "http://x/", "v", "deployment",
                                  "max_completion_tokens", 0)
             assert tracker.charge(route, 1)[3] == 60.0 / expected
 
@@ -2882,7 +2894,7 @@ def test_a_removed_deployment_drains_with_its_existing_pin():
     """A published model table can retire a deployment while its sessions live."""
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import Route, SessionAffinity
+    from proxy.server import SessionAffinity
     # In-process, so the proxy's own logger would write into the test output.
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
@@ -2896,21 +2908,21 @@ def test_a_removed_deployment_drains_with_its_existing_pin():
         affinity_off_route = "strip"
 
     def route(name):
-        return Route(name, "http://x/", "v", DEPLOYMENT, "max_completion_tokens",
+        return serving_target(name, "http://x/", "v", DEPLOYMENT, "max_completion_tokens",
                      0, "openai/v1/responses")
 
     aff = SessionAffinity(Cfg())
     gone, live = route("gone"), route("live")
     aff.pin("s1", gone)
-    assert aff.pinned("s1", [gone, live]) is gone
+    assert aff.pinned("s1") is gone
     # The endpoint disappears from the model's route list.
-    assert aff.pinned("s1", [live]) is gone, "retirement must preserve the binding"
+    assert aff.pinned("s1") is gone, "retirement must preserve the binding"
     # Both the binding and its full route descriptor survive the update.
     assert aff.report()["live_sessions"] == 1, aff.report()
     # And it is still the binding if the endpoint comes back.
-    assert aff.pinned("s1", [gone, live]) is gone
+    assert aff.pinned("s1") is gone
     aff.pin("s1", live)
-    assert aff.pinned("s1", [live]) is live
+    assert aff.pinned("s1") is live
 
 
 def test_two_models_in_one_session_do_not_share_a_pin():
@@ -2928,7 +2940,7 @@ def test_two_models_in_one_session_do_not_share_a_pin():
     """
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import Route, SessionAffinity
+    from proxy.server import SessionAffinity
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
     class Cfg:
@@ -2945,7 +2957,7 @@ def test_two_models_in_one_session_do_not_share_a_pin():
             self.headers = headers
 
     def route(endpoint, deployment):
-        return Route(endpoint, "http://x/", "v", deployment,
+        return serving_target(endpoint, "http://x/", "v", deployment,
                      "max_completion_tokens", 0, "openai/v1/responses")
 
     aff = SessionAffinity(Cfg())
@@ -2962,9 +2974,9 @@ def test_two_models_in_one_session_do_not_share_a_pin():
     aff.pin(k_terra, b)
     # Neither model's route list contains the other's deployment, which is what
     # used to make each lookup discard the other's pin.
-    assert aff.pinned(k_sol, [a]) is a
-    assert aff.pinned(k_terra, [b]) is b
-    assert aff.pinned(k_sol, [a]) is a, "terra's turn unpinned sol"
+    assert aff.pinned(k_sol) is a
+    assert aff.pinned(k_terra) is b
+    assert aff.pinned(k_sol) is a, "terra's turn unpinned sol"
     assert aff.report()["live_sessions"] == 2, aff.report()
 
 
@@ -2993,7 +3005,7 @@ def test_a_subagent_starts_on_the_endpoint_its_parent_minted_state_on():
     """
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import Route, SessionAffinity
+    from proxy.server import SessionAffinity
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
     class Cfg:
@@ -3010,7 +3022,7 @@ def test_a_subagent_starts_on_the_endpoint_its_parent_minted_state_on():
             self.headers = headers
 
     def route(endpoint, deployment):
-        return Route(endpoint, "http://x/", "v", deployment,
+        return serving_target(endpoint, "http://x/", "v", deployment,
                      "max_completion_tokens", 0, "openai/v1/responses")
 
     aff = SessionAffinity(Cfg())
@@ -3031,14 +3043,14 @@ def test_a_subagent_starts_on_the_endpoint_its_parent_minted_state_on():
     aff.pin(aff.key(request, master), alpha_sol, family)
 
     # The worker has no pin of its own...
-    assert aff.pinned(aff.key(request, worker), [alpha_terra, beta_terra]) is None
+    assert aff.pinned(aff.key(request, worker)) is None
     # ...but its session does, and it names the endpoint, not the deployment.
     home, local = aff.home(family, [alpha_terra, beta_terra])
     assert home == "alpha", home
     assert local == [alpha_terra], local
 
     # The master's own slot is untouched by any of this.
-    assert aff.pinned(aff.key(request, master), [alpha_sol, beta_sol]) is alpha_sol
+    assert aff.pinned(aff.key(request, master)) is alpha_sol
 
     # An endpoint that does not serve the worker's model is not an error: the
     # caller strips and routes freely rather than refusing to route at all.
@@ -3053,7 +3065,7 @@ def test_a_subagent_starts_on_the_endpoint_its_parent_minted_state_on():
 def test_affinity_reports_session_counts_and_types_per_model():
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import Route, SessionAffinity
+    from proxy.server import SessionAffinity
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
     class Cfg:
@@ -3066,9 +3078,9 @@ def test_affinity_reports_session_counts_and_types_per_model():
         affinity_off_route = "strip"
 
     affinity = SessionAffinity(Cfg())
-    sol = Route("alpha", "http://x/", "v", "sol",
+    sol = serving_target("alpha", "http://x/", "v", "sol",
                 "max_completion_tokens", 0)
-    terra = Route("alpha", "http://x/", "v", "terra",
+    terra = serving_target("alpha", "http://x/", "v", "terra",
                   "max_completion_tokens", 0)
     affinity.pin("root\0model=gpt-5.6-sol", sol, "root", "codex")
     affinity.pin("worker\0model=gpt-5.6-terra", terra, "root", "subagent")
@@ -3363,7 +3375,7 @@ def test_affinity_evicts_by_ttl_and_count():
     """The map is bounded in both directions, or a long-lived proxy leaks."""
     sys.path.insert(0, ROOT)
     import logging
-    from proxy.server import Route, SessionAffinity
+    from proxy.server import SessionAffinity
     # In-process, so the proxy's own logger would write into the test output.
     logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
 
@@ -3376,17 +3388,17 @@ def test_affinity_evicts_by_ttl_and_count():
         affinity_on_conflict = "wait"
         affinity_off_route = "strip"
 
-    r = Route("alpha", "http://x/", "v", DEPLOYMENT, "max_completion_tokens", 0)
+    r = serving_target("alpha", "http://x/", "v", DEPLOYMENT, "max_completion_tokens", 0)
     aff = SessionAffinity(Cfg())
     for i in range(20):
         aff.pin("s{}".format(i), r)
     assert aff.report()["live_sessions"] <= 6, aff.report()
     # The most recent survives; the oldest is gone.
-    assert aff.pinned("s19", [r]) is r
-    assert aff.pinned("s0", [r]) is None
+    assert aff.pinned("s19") is r
+    assert aff.pinned("s0") is None
 
     Cfg.affinity_ttl = -1                   # everything is already stale
-    assert aff.pinned("s19", [r]) is None
+    assert aff.pinned("s19") is None
     assert aff.report()["live_sessions"] == 0
 
 

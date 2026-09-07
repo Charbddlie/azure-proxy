@@ -1,0 +1,100 @@
+{
+  "started_at": "20260907T153656Z",
+  "endpoint": "yifanyang-foundry-eastus2",
+  "url": "https://yifanyang-foundry-eastus2.cognitiveservices.azure.com/openai/v1/responses",
+  "scope": "https://cognitiveservices.azure.com/.default",
+  "routes": [
+    {
+      "deployment": "gpt-6-astra",
+      "model": "gpt-6-astra",
+      "model_version": "2026-09-03"
+    },
+    {
+      "deployment": "gpt-6-astra-2",
+      "model": "gpt-6-astra",
+      "model_version": "2026-09-03"
+    }
+  ],
+  "protocol": {
+    "direct_upstream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "reasoning_effort": "low",
+    "max_output_tokens": 512,
+    "concurrency": 1,
+    "request_limit": 14,
+    "replay": "original input + all unmodified output items + new user turn",
+    "negative_control": "one ciphertext character changed in a separate request"
+  },
+  "prior_request_count": 1,
+  "requests": [
+    {
+      "label": "round1:gpt-6-astra-2:mint",
+      "deployment": "gpt-6-astra-2",
+      "input_ciphers": [],
+      "timestamp": "2026-09-07T15:36:56.249269+00:00",
+      "http_status": 429,
+      "elapsed_seconds": 3.928,
+      "quota_headers": {
+        "retry-after": "14",
+        "x-ratelimit-remaining-requests": "332",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "333",
+        "x-ratelimit-remaining-tokens": "-78861",
+        "x-ratelimit-reset-tokens": "74",
+        "x-ratelimit-limit-tokens": "333000",
+        "retry-after-ms": "14209"
+      },
+      "response_status": null,
+      "response_model": null,
+      "error_code": "rate_limit_exceeded",
+      "error_type": "too_many_requests",
+      "incomplete_reason": null,
+      "usage": null,
+      "output_ciphers": [],
+      "answer_matches_expected": false,
+      "completed": false,
+      "outcome": "rate_limited"
+    },
+    {
+      "label": "round1:gpt-6-astra:mint",
+      "deployment": "gpt-6-astra",
+      "input_ciphers": [],
+      "timestamp": "2026-09-07T15:37:00.179291+00:00",
+      "http_status": 429,
+      "elapsed_seconds": 1.543,
+      "quota_headers": {
+        "retry-after": "3",
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-remaining-tokens": "-55205",
+        "x-ratelimit-reset-tokens": "63",
+        "x-ratelimit-limit-tokens": "1000000",
+        "retry-after-ms": "3312"
+      },
+      "response_status": null,
+      "response_model": null,
+      "error_code": "rate_limit_exceeded",
+      "error_type": "too_many_requests",
+      "incomplete_reason": null,
+      "usage": null,
+      "output_ciphers": [],
+      "answer_matches_expected": false,
+      "completed": false,
+      "outcome": "rate_limited"
+    }
+  ],
+  "skipped_rounds": [
+    {
+      "round": "round1:gpt-6-astra-2",
+      "reason": "mint not completed or no encrypted content"
+    }
+  ],
+  "stopped_reason": "Experiment stopped: both deployments rate limited",
+  "finished_at": "2026-09-07T15:37:01.722754+00:00",
+  "request_count": 2,
+  "total_request_count_with_prior_attempt": 3
+}

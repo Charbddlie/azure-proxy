@@ -129,7 +129,7 @@ azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目�
 ├── proxy/
 │   ├── __main__.py          serving 前台入口
 │   ├── server.py            转发、连接、会话亲和
-│   ├── bridge.py            内存映射与后台观测同步
+│   ├── bridge.py            Target 协议、内存映射与后台观测同步
 │   ├── config.py / state.py 共享配置和状态交换
 │   ├── manage.py / process.py 进程管理
 │   └── events.py            结构化事件定义
@@ -183,7 +183,8 @@ serving 使用 `.proxy.pid` 和 `proxy.log`，routing 使用 `.routing.pid` 和
 ### 职责与更新
 
 serving 持有 HTTP/SSE 连接、Azure token 和会话绑定，按内存中的映射执行转发。
-routing 根据配额计算各接口、各模型的当前目标和备用顺序，负责 RPM、容量学习和看板统计。
+routing 根据配额计算各接口、各模型的当前目标和备用顺序，生成完整上游 URL，
+负责 RPM、容量学习和看板统计。serving 启动时只解析自身所需设置。
 
 - 修改 routing 代码、`routing.balance`、`routing.balancing` 或重新探测部署后，执行
   `./restart.sh routing`。新映射由后台同步，已有连接与绑定继续使用原部署。
@@ -192,16 +193,40 @@ routing 根据配额计算各接口、各模型的当前目标和备用顺序，
 - 当部署从新映射移除时，新会话停止分配到该部署；已有会话保存完整部署信息，并按原 TTL 排空。
   上游本身的故障仍按既有重试和亲和策略处理。
 - 同一请求固定使用一代映射。routing 停止期间，已有会话和新请求都使用 serving 的最后有效映射。
+- 当同一部署的 URL 更新时，新会话使用新地址，已有绑定继续使用保存的目标记录。
+
+### 稳定的目标协议
+
+每个目标记录包含五个字段：
+
+| 字段 | serving 中的用途 |
+|---|---|
+| `endpoint`、`deployment` | 会话绑定、部署身份和请求 model 改写 |
+| `scope` | 选择 Azure token；空值使用默认 scope |
+| `targets` | 客户端接口路径到完整上游 URL 的映射 |
+| `routing_data` | 原样保存的 JSON 对象，随观测的 `route` 字段回传给 routing |
+
+四张模型路由表决定接口可用性与候选顺序。serving 校验目标身份、URL、scope 和
+协议版本；routing 负责解释 `routing_data` 的内部结构。新增可选元数据和统计字段
+可以随快照发布。报告通过 `/routes` 提供，现有健康字段从报告中取值；
+当可选展示值缺失时，`/healthz` 对应字段返回 `null`。
+
+映射快照版本为 2，数据库和统计 checkpoint 版本保持 1。配额观测携带
+`retry-after` 和 `x-ratelimit-*` 响应头。访问凭据及请求、响应正文均不进入交换数据库。
+重试、超时和会话生命周期参数继续在 serving 启动时生效。
 
 ### 状态交换与恢复
 
 `runtime/control.sqlite3` 使用 SQLite WAL，保存原始观测、统计检查点、消费游标和版本化快照。
 两个进程默认每 100ms 同步一次；serving 的转发路径只访问内存。
 空闲时 routing 每秒更新心跳，事件历史仅在发生变化时写入。
+当 SQLite 暂时被写锁占用时，routing 保留消费进度并重试，锁释放后继续发布；
+启动阶段也会重试锁冲突。其他数据库错误会明确报错退出。
 原始观测包含时间、部署、状态、配额头和 token 用量，请求与响应正文不进入交换数据库。
 
 routing 按事件发生时间恢复统计，完成追平后发布新映射。消费游标和检查点事务提交，
-重复重放不会重复记账；已完成检查点覆盖的原始记录会被清理。已学习容量继续导出到
+重复重放不会重复记账；每次发布最多清理 2,000 条已完成检查点覆盖的原始记录，
+限制积压恢复期间的写锁占用。已学习容量继续导出到
 `runtime/capacity.json`。当需要复制运行中的数据库时，应使用 SQLite backup API；
 WAL 模式的数据库包含尚未合并到主文件的记录。
 
@@ -211,11 +236,26 @@ serving 保持旧映射并显示告警。内存观测队列上限为 100,000 条
 `telemetry_dropped` 记录统计缺口，转发继续运行。
 内部协议采用版本检查，不兼容的进程或数据库升级需要维护窗口。
 
-### 首次从单进程迁移
+### 切换到 v2 目标快照
 
-首次替换旧 serving 需要维护窗口，旧进程的连接和内存绑定无法转交给新进程。
-先运行隔离测试，再安排 `./restart.sh all`。完成首次切换后，日常路由和统计更新使用
-`./restart.sh`。
+先完成下方隔离测试，再安排一次维护窗口：
+
+1. 使用当前版本的 `./stop.sh --timeout 120` 先排空 serving，再停止 routing。
+   当排空超时时，保留进程并延长等待；本流程不使用 `--force`。
+2. 用 SQLite backup API 备份 `runtime/control.sqlite3`，同时备份
+   `runtime/capacity.json`。
+3. 部署匹配版本代码，执行 `./start.sh`。routing 从原 checkpoint 和剩余观测恢复，
+   发布 v2 快照后启动 serving。
+4. 检查 `/healthz` 中的 routing 心跳、映射版本和积压，以及 `/routes` 中的统计连续性。
+   `mapping_version` 是快照 revision；协议版本记录在交换数据库的快照中。
+
+本次 serving 重启会清空内存会话绑定。在途请求通过排空完成，后续旧会话沿用现有
+丢失绑定处理策略。完成切换后，日常 routing 更新使用 `./restart.sh`，
+serving 的连接与会话绑定继续保留。
+
+回滚时先排空并停止两进程，恢复旧代码，再执行旧版 `./start.sh`。
+旧 routing 从保持兼容的 checkpoint 重新发布旧版快照，随后启动旧 serving。
+本次改造保留原有统计格式，正常回滚无需清空统计；备份保留用于故障恢复。
 
 测试全部使用临时配置和本地假上游：
 
@@ -268,10 +308,16 @@ python -m tui --url ...                 # 同上，少了下面那几项检查
 
 需要 `rich`，`requirements.txt` 里已经有了。
 
+顶部独立显示 `serving`、`routing` 的状态和 PID。serving 状态来自 `/healthz`
+是否可达；routing 状态来自心跳，超过 3 秒显示 `no heartbeat`，正常停止显示
+`stopped`。当 serving 不可达时，routing 显示 `unknown`，PID 标为上次记录。
+同时显示 routing 的心跳年龄和待处理观测数；页脚分别显示接口取数年龄（`fetch`）
+与统计快照年龄（`stats`），统计陈旧时标记 `stale`。
+
 **看板只读，不管服务的死活。** 它是独立进程，通过代理自己的 HTTP 面
 （`/healthz` `/routes` `/events`）取数，所以随开随关都不碰服务；关掉它所在的终端
 带走的只有看板。执行 `./restart.sh` 时 serving 持续可达；当 routing 重启造成
-统计暂时陈旧时，看板显示 `routing/statistics stale`，恢复后自动刷新。服务没在跑时 `tui.sh` 直接报错退出；一块开着却只会说
+统计暂时陈旧时，看板显示进程状态与 `stats … stale`，恢复后自动刷新。服务没在跑时 `tui.sh` 直接报错退出；一块开着却只会说
 「unreachable」的屏幕读起来像故障，而实际情况是根本没人让它跑。
 
 三个看板，`←` `→` 切换，`↑` `↓` 滚动：

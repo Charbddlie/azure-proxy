@@ -11,21 +11,33 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import urlsplit
 
-from .config import Route, TABLES
-from .state import SCHEMA_VERSION, Store
+from .config import TABLES
+from .state import Store
 
 log = logging.getLogger("azure-proxy")
 INTERVAL = max(0.001, float(os.environ.get("AZURE_PROXY_SYNC_INTERVAL", "0.1")))
 MAX_PENDING = 100000
-SNAPSHOT_FIELDS = (
-    "balance", "spill_threshold", "load_window", "rpm_window", "generated_at",
-    "endpoints", "image_deployments", "scopes",
-)
+SNAPSHOT_VERSION = 2
+SNAPSHOT_FIELDS = ("image_deployments", "scopes")
+TABLE_PATHS = dict(zip(TABLES, (
+    "/v1/chat/completions", "/v1/responses",
+    "/v1/images/generations", "/v1/images/edits")))
 
 
-def route_record(route):
-    return {key: getattr(route, key) for key in Route.__slots__}
+@dataclass(frozen=True)
+class Target:
+    """Installed deployment; nested data stays read-only for its lifetime."""
+    endpoint: str
+    deployment: str
+    scope: Optional[str]
+    targets: dict
+    routing_data: dict
+
+    def __repr__(self):
+        return "{}/{}".format(self.endpoint, self.deployment)
 
 
 class ConfigView:
@@ -53,19 +65,13 @@ class SnapshotMiddleware:
 
 
 def decode_snapshot(snapshot, base):
-    if not isinstance(snapshot, dict) or snapshot.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("incompatible routing snapshot")
-    if not isinstance(snapshot.get("revision"), int) or snapshot["revision"] < 1:
+    if not isinstance(snapshot, dict) or snapshot.get("schema_version") != SNAPSHOT_VERSION:
+        raise ValueError("incompatible routing snapshot; start matching routing first")
+    if type(snapshot.get("revision")) is not int or snapshot["revision"] < 1:
         raise ValueError("invalid routing revision")
     candidate = copy.copy(base)
     for key in SNAPSHOT_FIELDS:
         setattr(candidate, key, snapshot["config"][key])
-    if candidate.balance not in ("strict_priority", "priority_threshold", "capacity"):
-        raise ValueError("invalid routing balance mode")
-    for name in ("load_window", "rpm_window", "spill_threshold"):
-        value = getattr(candidate, name)
-        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-            raise ValueError("invalid routing window/threshold")
     if not isinstance(candidate.scopes, list) or not all(
             isinstance(scope, str) and scope for scope in candidate.scopes):
         raise ValueError("invalid credential scopes")
@@ -84,16 +90,25 @@ def decode_snapshot(snapshot, base):
                 raise ValueError("invalid model mapping")
             routes = []
             for record in records:
-                route = Route(**record)
+                route = Target(endpoint=record["endpoint"], deployment=record["deployment"],
+                               scope=record.get("scope"), targets=record["targets"],
+                               routing_data=record["routing_data"])
                 if not all(isinstance(v, str) and v for v in
-                           (route.endpoint, route.url, route.deployment)):
+                           (route.endpoint, route.deployment)):
                     raise ValueError("incomplete route descriptor")
-                if not route.url.startswith(("http://", "https://")):
-                    raise ValueError("invalid upstream URL")
-                if route.scope is not None and route.scope not in candidate.scopes:
+                if not isinstance(route.targets, dict) or TABLE_PATHS[table] not in route.targets:
+                    raise ValueError("missing upstream target")
+                for path, url in route.targets.items():
+                    if not isinstance(path, str) or not isinstance(url, str):
+                        raise ValueError("invalid upstream URL")
+                    parsed = urlsplit(url)
+                    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                        raise ValueError("invalid upstream URL")
+                if route.scope is not None and (
+                        not isinstance(route.scope, str) or route.scope not in candidate.scopes):
                     raise ValueError("route scope missing from snapshot scopes")
-                if table == "responses_routes" and not route.responses_path:
-                    raise ValueError("missing responses path")
+                if not isinstance(route.routing_data, dict):
+                    raise ValueError("invalid routing metadata")
                 routes.append(route)
             if len({str(route) for route in routes}) != len(routes):
                 raise ValueError("duplicate deployment in model mapping")
@@ -110,6 +125,7 @@ def decode_snapshot(snapshot, base):
             or not isinstance(routing.get("pid"), int)
             or not isinstance(routing.get("ready"), bool)):
         raise ValueError("invalid routing heartbeat")
+    candidate.routing_report = snapshot["report"]
     return candidate
 
 
@@ -238,42 +254,38 @@ class Telemetry:
 
     def charge(self, route, request_bytes, face=0, model=""):
         entry = Attempt(uuid.uuid4().hex, request_bytes)
-        self.bridge.record("dispatch", attempt=entry.id, route=route_record(route),
+        self.bridge.record("dispatch", attempt=entry.id, route=route.routing_data,
                            request_bytes=request_bytes, face=face, model=model)
         return entry
 
     def observed(self, route, status, headers, entry=None):
-        self.bridge.record("observed", route=route_record(route),
+        self.bridge.record("observed", route=route.routing_data,
                            attempt=entry.id if entry else None, status=status,
-                           headers={k: v for k, v in headers.items()
-                                    if k.lower() in {
-                                        "retry-after", "x-ratelimit-limit-requests",
-                                        "x-ratelimit-limit-tokens", "x-ratelimit-remaining-requests",
-                                        "x-ratelimit-remaining-tokens", "x-ratelimit-reset-requests",
-                                        "x-ratelimit-reset-tokens", "x-ratelimit-renewalperiod-requests",
-                                        "x-ratelimit-renewalperiod-tokens"}})
+                           headers={k.lower(): v for k, v in headers.items()
+                                    if k.lower() == "retry-after"
+                                    or k.lower().startswith("x-ratelimit-")})
 
     def demote(self, route, reason, retry_after=None, entry=None):
-        self.bridge.record("demote", route=route_record(route), reason=reason,
+        self.bridge.record("demote", route=route.routing_data, reason=reason,
                            retry_after=retry_after, attempt=entry.id if entry else None)
 
     def failed(self, route, reason, entry=None):
         self.demote(route, reason, entry=entry)
 
     def note_timeout(self, route, entry=None):
-        self.bridge.record("timeout", route=route_record(route),
+        self.bridge.record("timeout", route=route.routing_data,
                            attempt=entry.id if entry else None)
 
     def settle(self, route, entry, request_bytes, total_tokens):
         if entry and total_tokens and entry.usage != total_tokens:
             entry.usage = total_tokens
-            self.bridge.record("usage", route=route_record(route), attempt=entry.id,
+            self.bridge.record("usage", route=route.routing_data, attempt=entry.id,
                                request_bytes=request_bytes, total_tokens=total_tokens)
 
     def note_success(self, route, entry):
         if entry and not entry.success:
             entry.success = True
-            self.bridge.record("success", route=route_record(route), attempt=entry.id)
+            self.bridge.record("success", route=route.routing_data, attempt=entry.id)
 
     def finish(self, entry):
         if entry and not entry.finished:

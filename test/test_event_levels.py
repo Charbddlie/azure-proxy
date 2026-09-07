@@ -10,12 +10,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from run_tests import (Behaviour, DEPLOYMENT, FakeAzure, MODEL, Proxy, ROOT,
-                       _inline_telemetry, ask)
+                       _inline_telemetry, ask, serving_target)
 
 sys.path.insert(0, ROOT)
 import httpx
 from rich.console import Console
-from proxy.events import EVENT_LEVELS, KINDS, EventLog, event_level
+from proxy.bridge import ServingBridge
+from proxy.events import EVENT_LEVELS, KINDS, event_level
+from routing.engine import Engine
 from tui.app import Dashboard, _tabs
 from tui.boards import (DEFAULT_EVENT_FILTER, EVENT_FILTERS, _event_message,
                         filter_events, render_events)
@@ -96,11 +98,18 @@ class EventLevelTests(unittest.TestCase):
 
     def test_server_records_and_logs_the_same_canonical_level(self):
         from proxy import server
-        events = EventLog()
-        with patch.object(server, "events", events), patch.object(server.log, "log") as log:
+        bridge = ServingBridge("unused", None)
+        with patch.object(server, "bridge", bridge), patch.object(server.log, "log") as log:
             server._ev("timeout", "warning", "test I/O timeout")
         log.assert_called_once_with(logging.ERROR, "test I/O timeout")
-        self.assertEqual(events.since()[0][0]["level"], "error")
+        self.assertEqual(len(bridge.pending), 1)
+        event = bridge.pending[0]
+        self.assertEqual(event["level"], "error")
+        self.assertEqual(event["event_kind"], "timeout")
+        engine = Engine.__new__(Engine)
+        engine.event = Mock()
+        engine.consume(event)
+        engine.event.assert_called_once_with("timeout", "error", "test I/O timeout")
 
     def test_rate_refusals_are_warning_and_do_not_increment_timeouts(self):
         for status in (429, 200):
@@ -145,7 +154,7 @@ class EventLevelTests(unittest.TestCase):
             config = SimpleNamespace(timeout=0.1, capture_dir=None, stream_retry_markers=[],
                                      capacity_state_file=None, rpm_window=60, load_window=60)
             observer, engine = _inline_telemetry(config)
-            route = server.Route("alpha", "http://localhost/", "v", DEPLOYMENT, "max_tokens", 0)
+            route = serving_target("alpha", "http://localhost/", "v", DEPLOYMENT, "max_tokens", 0)
             entry = observer.charge(route, 10, 3)
             async def chunks():
                 yield b'event: response.output_text.delta\ndata: {"delta":"hi"}\n\n'
@@ -178,7 +187,7 @@ class EventLevelTests(unittest.TestCase):
             config.affinity_enabled = False
             config.timeout = 0.1
             observer, engine = _inline_telemetry(config)
-            route = server.Route("alpha", "http://localhost/", "v", DEPLOYMENT, "max_tokens", 0)
+            route = serving_target("alpha", "http://localhost/", "v", DEPLOYMENT, "max_tokens", 0)
             response = httpx.Response(200, stream=Stream())
             client = SimpleNamespace(build_request=Mock(return_value=httpx.Request("POST", "http://localhost")),
                                      send=AsyncMock(return_value=response))
@@ -187,7 +196,7 @@ class EventLevelTests(unittest.TestCase):
             with patch.multiple(server, cfg=config, telemetry=observer, client=client, tokens=tokens), \
                     patch.object(server, "_ev") as ev:
                 reply = await server._forward(request, {"model": MODEL}, [route],
-                                              server.Route.chat_target, MODEL, server.CHAT_FACE)
+                                              MODEL, server.CHAT_FACE)
                 self.assertEqual(reply.status_code, 504)
                 self.assertEqual(engine.quota.state(route).timeouts, 1)
                 self.assertEqual(engine.quota.state(route).rate_limited, 0)

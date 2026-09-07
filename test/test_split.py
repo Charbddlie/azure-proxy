@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import concurrent.futures
 import copy
+import io
 import json
 import os
 import sqlite3
@@ -12,16 +13,18 @@ import sys
 import time
 import unittest
 import urllib.request
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import mock_open, patch
 
 from run_tests import (Behaviour, CODEX_BODY, DEPLOYMENT, FakeAzure, MODEL,
                        PYTHON, ROOT, Proxy, ask, sse, who)
 
 sys.path.insert(0, ROOT)
-from proxy.bridge import ConfigView, ServingBridge, Telemetry, route_record
-from proxy.config import Config, Route
+from proxy.bridge import (SNAPSHOT_VERSION, TABLE_PATHS, ConfigView, ServingBridge,
+                          Target, Telemetry, decode_snapshot)
+from proxy.config import Config, Route, TABLES
 from proxy.state import Store
-from routing.engine import Engine
+from routing.engine import Engine, route_from_record, route_record, target_record
 
 
 @contextlib.contextmanager
@@ -77,7 +80,226 @@ def config_at(root):
         return Config()
 
 
+class ProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.route = Route("alpha", "http://localhost/", "v", DEPLOYMENT,
+                           "max_tokens", 0, "openai/v1/responses")
+        self.record = target_record(self.route)
+        self.snapshot = dict(
+            schema_version=SNAPSHOT_VERSION, revision=1,
+            config=dict(scopes=["test-scope"], image_deployments={}),
+            tables={name: {} for name in TABLES},
+            report={}, events={}, routing=dict(
+                heartbeat=time.time(), processed_seq=0, pid=1, ready=True))
+        self.snapshot["tables"]["routes"][MODEL] = [self.record]
+
+    def test_target_urls_match_existing_azure_and_foundry_conventions(self):
+        for url, scope in (("https://example/", None),
+                           ("https://example/api/projects/project/", "https://ai.azure.com/.default"),
+                           ("https://example/", "https://ai.azure.com/.default")):
+            with self.subTest(url=url, scope=scope):
+                route = Route("alpha", url, "v", DEPLOYMENT, "max_tokens", 0,
+                              "openai/v1/responses", scope=scope)
+                record = target_record(route)
+                self.assertEqual(record["targets"], {
+                    "/v1/chat/completions": route.chat_target(),
+                    "/v1/responses": route.responses_target(),
+                    "/v1/images/generations": route.image_target("generations"),
+                    "/v1/images/edits": route.image_target("edits")})
+                self.assertEqual(record["routing_data"], route_record(route))
+                snapshot = copy.deepcopy(self.snapshot)
+                snapshot["config"]["scopes"] += [scope] if scope else []
+                snapshot["tables"] = {table: {MODEL: [record]} for table in TABLES}
+                installed = decode_snapshot(snapshot, SimpleNamespace())
+                for table, face in TABLE_PATHS.items():
+                    self.assertEqual(getattr(installed, table)[MODEL][0].targets[face],
+                                     record["targets"][face])
+
+    def test_optional_metadata_round_trips_without_serving_interpretation(self):
+        metadata = {"future_algorithm": {"weights": [1, None, {"other": True}]}}
+        self.record["routing_data"].update(metadata)
+        self.record["future_optional_field"] = [1, 2]
+        self.snapshot["config"]["future_optional_field"] = {"v": 2}
+        self.snapshot["report"] = dict(balance="future-mode", metrics=metadata)
+        cfg = decode_snapshot(self.snapshot, SimpleNamespace())
+        target = cfg.routes[MODEL][0]
+        self.assertIsInstance(target, Target)
+        self.assertEqual(cfg.routing_report, self.snapshot["report"])
+        bridge = ServingBridge("unused", None)
+        telemetry = Telemetry(bridge)
+        entry = telemetry.charge(target, 10)
+        telemetry.observed(target, 200, {
+            "X-RateLimit-New-Quota": "42", "retry-after": "2",
+            "authorization": "secret", "set-cookie": "secret"}, entry)
+        telemetry.demote(target, "429", entry=entry)
+        telemetry.note_timeout(target, entry)
+        telemetry.settle(target, entry, 10, 23)
+        telemetry.note_success(target, entry)
+        telemetry.finish(entry)
+        for event in bridge.pending:
+            if "route" in event:
+                self.assertEqual(event["route"], self.record["routing_data"])
+        self.assertEqual(bridge.pending[1]["headers"], {
+            "x-ratelimit-new-quota": "42", "retry-after": "2"})
+        self.assertEqual(route_record(route_from_record(self.record["routing_data"])),
+                         route_record(self.route))
+        self.assertNotIn("targets", bridge.pending[0]["route"])
+        # Routing can replace its entire metadata shape without a serving update.
+        self.record["routing_data"] = {"new_schema": [{"opaque": None}]}
+        target = decode_snapshot(self.snapshot, SimpleNamespace()).routes[MODEL][0]
+        telemetry.charge(target, 10)
+        self.assertEqual(bridge.pending[-1]["route"], self.record["routing_data"])
+
+    def test_invalid_targets_preserve_the_installed_generation(self):
+        cfg = ConfigView(SimpleNamespace())
+        bridge = ServingBridge("unused", cfg)
+        bridge.install(self.snapshot)
+        installed = cfg.current
+        original = copy.deepcopy(self.snapshot)
+        for field, value in (
+                ("endpoint", ""), ("deployment", 3), ("scope", []),
+                ("scope", "unpublished-scope"), ("targets", {}),
+                ("targets", {"/v1/chat/completions": "file:///tmp/example"}),
+                ("targets", {"/v1/chat/completions": "https://"}),
+                ("routing_data", [])):
+            with self.subTest(field=field, value=value):
+                bad = copy.deepcopy(original)
+                bad["revision"] = 2
+                bad["tables"]["routes"][MODEL][0][field] = value
+                with self.assertRaises(ValueError):
+                    bridge.install(bad)
+                self.assertIs(cfg.current, installed)
+                self.assertIs(bridge.snapshot, self.snapshot)
+        duplicate = copy.deepcopy(original)
+        duplicate["revision"] = 2
+        duplicate["tables"]["routes"][MODEL].append(copy.deepcopy(self.record))
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            bridge.install(duplicate)
+        for version in (1, 999):
+            with self.assertRaisesRegex(ValueError, "incompatible"):
+                bridge.install(dict(original, schema_version=version, revision=2))
+        self.assertIs(cfg.current, installed)
+        self.assertEqual(self.snapshot, original)
+
+    def test_serving_configuration_skips_routing_owned_settings_and_files(self):
+        policy = dict(
+            server=dict(host="127.0.0.1", port=0),
+            routing=dict(retry_on_status=[], retry_on_transport_error=True,
+                         retry_on_timeout=False, request_timeout_seconds=30,
+                         max_attempts_per_request=4, backoff_initial_seconds=1,
+                         backoff_multiplier=2, backoff_jitter_seconds=0,
+                         balance={"new": "shape"}, balancing="routing-owned"),
+            request=dict(forward_headers=True),
+            auth=dict(scope="test-scope", refresh_margin_seconds=300))
+        with patch("builtins.open", mock_open(read_data=json.dumps(policy))) as opened:
+            cfg = Config(load_routes=False)
+        self.assertEqual(opened.call_count, 1)
+        self.assertTrue(opened.call_args.args[0].endswith("policy.yaml"))
+        self.assertFalse(hasattr(cfg, "balance"))
+        self.assertFalse(hasattr(cfg, "load_window"))
+        self.assertEqual(cfg.scopes, {"test-scope"})
+        self.assertEqual(cfg.timeout, 30)
+        policy["routing"]["balance"] = "strict_priority"
+        for name, value in (("load_window_seconds", 0), ("spill_threshold", -1),
+                            ("load_window_seconds", float("inf"))):
+            with self.subTest(name=name, value=value):
+                policy["routing"]["balancing"] = {name: value}
+                with patch("builtins.open", mock_open(read_data=json.dumps(policy))):
+                    self.assertEqual(Config(load_routes=False).timeout, 30)
+                files = [io.StringIO(json.dumps(doc)) for doc in
+                         (policy, {"endpoints": []}, {"models": {}})]
+                with patch("builtins.open", side_effect=files):
+                    with self.assertRaisesRegex(ValueError, "invalid routing window/threshold"):
+                        Config()
+
+
 class SplitTests(unittest.TestCase):
+    def test_updated_urls_and_opaque_reports_arrive_without_serving_restart(self):
+        with fixture() as (p, a, b):
+            self.assertEqual(turn(p, "existing")[0], 200)
+            old_path = a.requests[-1]["path"]
+            p.stop_routing()
+            with contextlib.closing(Store(p.home)) as store:
+                snapshot = store.get("snapshot")
+                for table in TABLES:
+                    for records in snapshot["tables"][table].values():
+                        for record in records:
+                            record["routing_data"]["future"] = {"nested": [1, 2]}
+                            record["targets"]["/v1/responses"] = b.url + "custom/responses"
+                snapshot["report"].update(balance="future-mode", future_metric={"value": 17})
+                snapshot["report"].pop("spill_threshold", None)
+                snapshot["revision"] += 1
+                with store.db:
+                    store.db.execute("UPDATE state SET payload=? WHERE name='snapshot'",
+                                     (json.dumps(snapshot),))
+                wait_for(lambda: p.get_raw("/healthz")[1]["routing"]["mapping_version"]
+                         == snapshot["revision"])
+                self.assertEqual(turn(p, "existing")[0], 200)
+                self.assertEqual(a.requests[-1]["path"], old_path)
+                self.assertEqual(turn(p, "new")[0], 200)
+                self.assertEqual(b.requests[-1]["path"], "/custom/responses")
+                health = p.get_raw("/healthz")[1]
+                self.assertEqual(health["pid"], p.proc.pid)
+                self.assertEqual(health["balance"], "future-mode")
+                self.assertIsNone(health["spill_threshold"])
+                self.assertEqual(p.get_raw("/routes")[1]["future_metric"], {"value": 17})
+                def observations():
+                    return [event for _, event in store.read_events(0, limit=10000)
+                            if event["kind"] == "dispatch"
+                            and "future" in event["route"]]
+                events = wait_for(observations)
+                self.assertEqual(events[-1]["route"]["future"], {"nested": [1, 2]})
+            p.start_routing()
+            wait_routing(p)
+            self.assertEqual(p.get("/routes")[1]["routes"]["alpha/" + DEPLOYMENT]["ok"], 3)
+
+    def test_v1_checkpoint_and_observations_recover_into_v2_snapshot(self):
+        with fixture() as (p, a, b):
+            p.proc.terminate()
+            p.proc.wait(timeout=10)
+            p.stop_routing()
+            config = config_at(p.home)
+            route = config.routes[MODEL][0]
+            key = str(route)
+            # Literal legacy descriptor and pending entry: independent of the v2 encoder.
+            legacy_route = dict(endpoint="alpha", url=a.url, api_version="v",
+                                deployment=DEPLOYMENT, limit_param="max_tokens", priority=0,
+                                responses_path="openai/v1/responses", model_version=None,
+                                capacity_requests=None, capacity_tokens=None,
+                                image_edits=False, scope=None)
+            pending = [time.time(), 1, 0, 1, "legacy-attempt"]
+            with contextlib.closing(Store(p.home)) as store:
+                checkpoint = dict(
+                    schema_version=1, cursor=store.highwater(), capacity={key: 7.0},
+                    pending={"legacy-attempt": dict(entry=pending, route=legacy_route)},
+                    catalog={key: dict(route=legacy_route, model=MODEL)},
+                    sessions={}, events=[], event_seq=0,
+                    states={key: dict(sent=[pending], safe_rpm=7.0, attempts=1)})
+                legacy_snapshot = dict(
+                    schema_version=1, revision=10, config={}, tables={}, report={},
+                    routing={}, events=dict(events=[], next=0, counts={}))
+                store.publish(checkpoint, legacy_snapshot)
+                batch = [dict(kind=kind, local_seq=index + 1, at=time.time(),
+                              attempt="legacy-attempt", route=legacy_route,
+                              request_bytes=10, total_tokens=42)
+                         for index, kind in enumerate(("usage", "success", "finish"))]
+                store.append("legacy-producer", batch)
+                with contextlib.closing(Engine(p.home, config)) as engine:
+                    snapshot = engine.step()
+                    self.assertEqual(snapshot["schema_version"], SNAPSHOT_VERSION)
+                    state = engine.quota.state(route)
+                    self.assertEqual((state.attempts, state.ok, state.safe_rpm), (1, 1, 7))
+                    self.assertEqual(state.token_samples, 1)
+                    self.assertEqual(state.sent[0][1], 42)
+                    self.assertFalse(engine.pending)
+                self.assertEqual(store.get("checkpoint")["schema_version"], 1)
+                self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 1)
+                store.append("legacy-producer", batch)
+                with contextlib.closing(Engine(p.home, config)) as engine:
+                    state = engine.step()["report"]["routes"][key]
+                    self.assertEqual((state["attempts"], state["ok"], state["capacity_rpm"]),
+                                     (1, 1, 7))
+
     def test_retired_family_catalog_preserves_a_child_models_encrypted_state(self):
         with fixture() as (p, a, b):
             p.stop_routing()

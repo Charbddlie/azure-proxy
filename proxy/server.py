@@ -17,33 +17,21 @@ import re
 import subprocess
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from azure.identity import AzureCliCredential
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .events import PROBLEM_KINDS, EventLog, event_level
-from .config import Config, Route, _as_number
+from .events import PROBLEM_KINDS, event_level
+from .config import Config, FACES, ROOT, TABLES, _as_number
 from .bridge import (Attempt, ConfigView, ServingBridge, SnapshotMiddleware,
-                     Telemetry)
-from .config import TABLES
+                     Target, Telemetry)
 from .process import ProcessClaim
-
-ROOT = os.environ.get(
-    "AZURE_PROXY_HOME",
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SETTINGS = os.path.join(ROOT, "settings")
-RUNTIME = os.path.join(ROOT, "runtime")
+from .retention import RETENTION_SECONDS, recent
 
 log = logging.getLogger("azure-proxy")
-
-# The structured half of the log. Every `_ev` call writes both, from the same
-# arguments — see proxy/events.py for why the dashboard cannot just read the
-# text. Sized for roughly an hour of a busy run at the volume `request` and
-# `response` events arrive.
-events = EventLog(capacity=2000)
 
 _EV_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO,
               "warning": logging.WARNING, "error": logging.ERROR}
@@ -65,12 +53,10 @@ def _ev(kind: str, level: str, msg: str, *args, **fields) -> None:
         message = msg % args if args else msg
     except Exception:           # pragma: no cover - defensive
         message = msg
-    events.record(kind, message, level=level, **fields)
-    if "bridge" in globals():
-        fields = {key: str(value) if isinstance(value, Route) else value
-                  for key, value in fields.items()}
-        bridge.record("event", event_kind=kind, message=message,
-                      level=level, fields=fields)
+    fields = {key: str(value) if isinstance(value, Target) else value
+              for key, value in fields.items()}
+    bridge.record("event", event_kind=kind, message=message,
+                  level=level, fields=fields)
 
 # This box is a shared account with a single ~/.azure, so the proxy keeps its
 # own credential directory and every operator action has to go through the
@@ -91,33 +77,6 @@ STRIP_RESPONSE_HEADERS = {
     "content-length", "content-encoding", "connection", "keep-alive",
     "transfer-encoding", "upgrade",
 }
-
-# The three ways a request's attempt order can be decided. See
-# `routing.balance` in settings/policy.yaml for what each one buys.
-BALANCE_MODES = ("strict_priority", "priority_threshold", "capacity")
-
-# The names these modes had before there were three of them. Kept working
-# because they are what an operator who read the old README will type, and
-# because a config that used to mean something specific should not silently
-# start meaning something else.
-BALANCE_ALIASES = {"priority": "strict_priority", "weighted": "capacity"}
-
-# The ways a request can arrive, as far as the ledger is concerned: the two text
-# faces times streamed or not, plus the image face. Quota does not care about the
-# distinction — one deployment ceiling serves all of them — but an operator does,
-# because they fail differently. Streamed Responses calls are the ones Azure
-# refuses with a 200 plus retry-after (see THROTTLE_HEADER), and they are the
-# ones session affinity pins. A load figure that cannot say which of them it is
-# made of cannot tell you which mechanism you are watching.
-#
-# The image face has no streamed twin here. gpt-image-* can stream partial
-# images, and such a call is relayed like any other stream, but it is one
-# request against a per-minute request ceiling either way, and the ledger has
-# nothing to gain from splitting it.
-#
-# The order is the display order, and the index is what goes in the ledger.
-# tui/bars.py and tui/theme.py carry the same list and must stay in step.
-FACES = ("chat", "chat_stream", "responses", "responses_stream", "image")
 
 # The paths the four handlers register under, which are also what `face` is
 # throughout: the string a log line shows and the thing face_code reads.
@@ -252,7 +211,6 @@ class SessionAffinity:
         # Cumulative, never reset: "did the fallback fire at all during my run"
         # is the question this answers, and it should be one read of /healthz
         # rather than a grep over a log that runs to tens of megabytes.
-        self._bound = {}
         self._catalog = {}
         self._stripped = 0
         self._inherited = 0
@@ -444,9 +402,6 @@ class SessionAffinity:
             while len(book) > self.cfg.affinity_max:
                 book.popitem(last=False)
 
-        for key in list(self._bound):
-            if key not in self._pins:
-                self._bound.pop(key, None)
         for key in list(self._catalog):
             if key not in self._family:
                 self._catalog.pop(key, None)
@@ -462,7 +417,7 @@ class SessionAffinity:
         return list(active) + [r for r in retained if str(r) not in {str(a) for a in active}]
 
     def home(self, family: Optional[str],
-             routes: List[Route]) -> Tuple[Optional[str], List[Route]]:
+             routes: List[Target]) -> Tuple[Optional[str], List[Target]]:
         """The endpoint this session's state lives on, and the way in.
 
         Used when the exact (conversation, model) slot is empty but the family
@@ -487,8 +442,7 @@ class SessionAffinity:
         self._family.move_to_end(family)
         return entry[0], [r for r in routes if r.endpoint == entry[0]]
 
-    def pinned(self, key: Optional[str],
-               routes: List[Route]) -> Optional[Route]:
+    def pinned(self, key: Optional[str]) -> Optional[Target]:
         """Use the retained descriptor while a bound deployment drains.
 
         Publishing a new model table leaves existing bindings intact. Expiry
@@ -501,22 +455,11 @@ class SessionAffinity:
         entry = self._pins.get(key)
         if entry is None:
             return None
-        route = self._bound.get(key)
-        if route is not None:
-            entry[1] = now
-            self._pins.move_to_end(key)
-            return route
-        for route in routes:
-            if str(route) == entry[0]:
-                entry[1] = now
-                self._pins.move_to_end(key)
-                return route
-        _ev("pin", "warning",
-            "session pinned to %s, which no longer serves this model; "
-            "routing without the pin", entry[0], route=entry[0], dropped=True)
-        return None
+        entry[1] = now
+        self._pins.move_to_end(key)
+        return entry[0]
 
-    def pin(self, key: Optional[str], route: Route,
+    def pin(self, key: Optional[str], route: Target,
             family: Optional[str] = None,
             session_type: str = "reasoning") -> None:
         """Record where this conversation's state now lives.
@@ -528,23 +471,18 @@ class SessionAffinity:
         """
         now = time.time()
         if key:
-            self._bound[key] = route
             entry = self._pins.get(key)
             if entry is None:
                 _ev("pin", "info", "session pinned to %s (%d live)", route,
                     len(self._pins) + 1, route=route, live=len(self._pins) + 1)
-                self._pins[key] = [str(route), now, session_type]
+                self._pins[key] = [route, now, session_type]
             else:
-                if entry[0] != str(route):
+                if str(entry[0]) != str(route):
                     _ev("pin", "warning",
                         "session moved from %s to %s; state minted on the old "
                         "one is no longer readable", entry[0], route,
-                        route=route, from_route=entry[0], moved=True)
-                entry[0], entry[1] = str(route), now
-                if len(entry) < 3:
-                    entry.append(session_type)
-                else:
-                    entry[2] = session_type
+                        route=route, from_route=str(entry[0]), moved=True)
+                entry[:] = [route, now, session_type]
             self._pins.move_to_end(key)
 
         if family:
@@ -589,8 +527,8 @@ class SessionAffinity:
         counts: Dict[str, int] = {}
         models: Dict[str, dict] = {}
         for key, entry in self._pins.items():
-            route, _ts = entry[:2]
-            session_type = entry[2] if len(entry) > 2 else "reasoning"
+            target, _ts, session_type = entry
+            route = str(target)
             routes[route] = routes.get(route, 0) + 1
             endpoint = route.split("/", 1)[0]
             counts[endpoint] = counts.get(endpoint, 0) + 1
@@ -774,9 +712,6 @@ def _setup_logging(level: str):
     log.propagate = False
 
 
-PIDFILE = os.path.join(ROOT, ".proxy.pid")
-
-
 _claim = None
 
 
@@ -852,6 +787,7 @@ def _az_account() -> Optional[str]:
 
 
 def _log_startup():
+    report = cfg.routing_report
     log.info("listening on http://%s:%s", cfg.host, cfg.port)
     log.info("az config dir: %s", cfg.az_config_dir or "~/.azure (shared!)")
     # The one deviation from passthrough, so say it out loud once. If a run
@@ -859,26 +795,7 @@ def _log_startup():
     # had its hands on the request body at all.
     log.info("responses compat rewrites: %s",
              "on" if cfg.responses_compat else "off (raw Azure validation)")
-    # The other thing that decides where a request lands. Anything but strict
-    # priority makes the answer to "which endpoint served this?" depend on state
-    # rather than on config, so it has to be visible at the top of the log
-    # rather than inferred from the traffic.
-    if cfg.balance_configured != cfg.balance:
-        if cfg.balance_configured in BALANCE_ALIASES:
-            log.info("routing.balance=%r is the old name for %s",
-                     cfg.balance_configured, cfg.balance)
-        else:
-            log.warning("routing.balance=%r is not a known mode; using %s",
-                        cfg.balance_configured, cfg.balance)
-    log.info("routing balance: %s", cfg.balance)
-    if cfg.balance == "priority_threshold":
-        log.info("spill threshold: %.0f%% of each route's own quota, "
-                 "measured over %.0fs of this proxy's own traffic",
-                 cfg.spill_threshold * 100, cfg.load_window)
-    if cfg.balance != "strict_priority" and cfg.static_weights:
-        log.info("cold-start weights: %s",
-                 ", ".join("{}={}".format(k, v)
-                           for k, v in sorted(cfg.static_weights.items())))
+    log.info("routing balance: %s", report.get("balance"))
 
     account = _az_account()
     if account is None:
@@ -894,9 +811,10 @@ def _log_startup():
     if status["have_token"]:
         log.info("token good for %.1fm", status["expires_in_seconds"] / 60)
 
-    for name, chat, responses, image in cfg.endpoints:
+    for endpoint in report.get("endpoints", []):
         log.info("endpoint %-28s chat=%-22s responses=%-14s image=%s",
-                 name, chat, responses, image)
+                 endpoint.get("name"), endpoint.get("chat"),
+                 endpoint.get("responses"), endpoint.get("image"))
     # One record for the whole of the above rather than fifteen. The startup
     # narration is a dozen lines because a person reading a log wants them
     # separately; an event stream wants the one line that says the proxy came
@@ -905,11 +823,12 @@ def _log_startup():
         "%d models on /v1/chat/completions, %d on /v1/responses, "
         "%d on /v1/images/*, probed at %s",
         len(cfg.routes), len(cfg.responses_routes), len(cfg.image_routes),
-        cfg.generated_at,
+        report.get("probed_at"),
         chat_models=len(cfg.routes), responses_models=len(cfg.responses_routes),
         image_models=len(cfg.image_routes),
-        balance=cfg.balance, endpoints=[e[0] for e in cfg.endpoints],
-        account=account, probed_at=cfg.generated_at)
+        balance=report.get("balance"),
+        endpoints=[e.get("name") for e in report.get("endpoints", [])],
+        account=account, probed_at=report.get("probed_at"))
 
 
 @app.on_event("startup")
@@ -940,6 +859,7 @@ async def _shutdown():
 
 @app.get("/healthz")
 async def healthz():
+    report = cfg.routing_report
     token = tokens.status()
     # Healthy means every scope in use has a live token, not just the default:
     # a dead ai.azure.com login would take the AI-Foundry routes down while the
@@ -954,11 +874,11 @@ async def healthz():
             "models": len(cfg.routes),
             "responses_models": len(cfg.responses_routes),
             "image_models": len(cfg.image_routes),
-            "probed_at": cfg.generated_at,
+            "probed_at": report.get("probed_at"),
             "az_config_dir": cfg.az_config_dir,
             "responses_compat": cfg.responses_compat,
-            "balance": cfg.balance,
-            "spill_threshold": cfg.spill_threshold,
+            "balance": report.get("balance"),
+            "spill_threshold": report.get("spill_threshold"),
             # For the dashboard header: where to say the proxy is listening,
             # how long it has been up, and over how long a window the load
             # figures on /routes are averaged. All three are already knowable
@@ -968,7 +888,7 @@ async def healthz():
             "port": cfg.port,
             "started_at": STARTED_AT,
             "uptime_seconds": round(time.time() - STARTED_AT, 1),
-            "load_window_seconds": cfg.load_window,
+            "load_window_seconds": report.get("load_window_seconds"),
             "session_affinity": affinity.report(),
             "token": token,
             "tokens": per_scope}
@@ -988,7 +908,7 @@ async def routes_report():
 async def events_feed(since: int = 0, limit: int = 500,
                       kind: Optional[str] = None):
     feed = (bridge.snapshot or {}).get("events", {})
-    held = feed.get("events", [])
+    held = recent(feed.get("events", []), time.time() - RETENTION_SECONDS)
     fresh = [event for event in held if event["seq"] > since]
     cursor = feed.get("next", 0)
     dropped = bool(since > 0 and held and held[0]["seq"] > since + 1)
@@ -1000,7 +920,8 @@ async def events_feed(since: int = 0, limit: int = 500,
         fresh = fresh[-limit:]
         dropped = True
     return {"events": fresh, "next": cursor, "dropped": dropped,
-            "counts": feed.get("counts", {}), "stats_stale": not bridge.status()["ok"]}
+            "counts": dict(collections.Counter(e["kind"] for e in held)),
+            "stats_stale": not bridge.status()["ok"]}
 
 
 @app.get("/v1/models")
@@ -1054,14 +975,14 @@ def _upstream_headers(incoming, token: str,
     return headers
 
 
-def _relay_headers(resp: httpx.Response, route: Route) -> dict:
+def _relay_headers(resp: httpx.Response, route: Target) -> dict:
     headers = {k: v for k, v in resp.headers.items()
                if k.lower() not in STRIP_RESPONSE_HEADERS}
     headers["x-azure-proxy-route"] = str(route)
     return headers
 
 
-def _relay(resp: httpx.Response, route: Route, request_bytes: int = 0,
+def _relay(resp: httpx.Response, route: Target, request_bytes: int = 0,
            entry: Optional[Attempt] = None,
            counted: bool = False) -> Response:
     body = resp.content
@@ -1355,7 +1276,7 @@ def _capture_request(face: str, request: Request, body: dict) -> None:
         log.warning("request capture failed: %s", e)
 
 
-def _capture_stream(route: Route, resp: httpx.Response, blob: bytes) -> None:
+def _capture_stream(route: Target, resp: httpx.Response, blob: bytes) -> None:
     """Write one raw upstream stream to disk, for diagnosis only.
 
     OFF unless `server.capture_dir` is set, and it must be left off: these files
@@ -1479,7 +1400,7 @@ async def _probe_stream_head(resp: httpx.Response) -> _StreamHead:
     return head
 
 
-def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
+def _relay_stream(resp: httpx.Response, route: Target, face: str, started: float,
                   head: _StreamHead, request_bytes: int = 0,
                   entry: Optional[Attempt] = None,
                   counted: bool = False,
@@ -1620,7 +1541,7 @@ def _relay_stream(resp: httpx.Response, route: Route, face: str, started: float,
                              media_type=resp.headers.get("content-type"))
 
 
-def _note_upstream_error(failure: Optional[Tuple[str, str]], route: Route,
+def _note_upstream_error(failure: Optional[Tuple[str, str]], route: Target,
                          face: str, model: Optional[str],
                          family: Optional[str], sent: int) -> None:
     """Write down an upstream refusal that arrived inside a 200.
@@ -1879,8 +1800,8 @@ def _multipart_model(blob: bytes) -> Optional[str]:
         return None
 
 
-async def _forward(request: Request, body: dict, routes: List[Route],
-                   target_of: Callable[[Route], str], requested: str,
+async def _forward(request: Request, body: dict, routes: List[Target],
+                   requested: str,
                    face: str, raw: Optional[bytes] = None,
                    content_type: str = "application/json",
                    image_tool: bool = False) -> Response:
@@ -1928,7 +1849,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
     family = affinity.family(request, body) if cfg.affinity_enabled else None
     sticky = bool(session) and not is_image and affinity.sticky(body)
     session_type = affinity.session_type(body) if sticky else ""
-    pinned = affinity.pinned(session, routes) if sticky else None
+    pinned = affinity.pinned(session) if sticky else None
     # This family has been found carrying ciphertext that could not be placed,
     # so it goes out stripped wherever it goes — the client resends the same
     # unreadable items every turn, so one stripped retry is not enough. No
@@ -2109,7 +2030,7 @@ async def _forward(request: Request, body: dict, routes: List[Route],
                 # unchanged: an images/edits multipart, whose boundary is already in
                 # the Content-Type header that came with it.
                 upstream = client.build_request(
-                    "POST", target_of(route), headers=attempt_headers,
+                    "POST", route.targets[face], headers=attempt_headers,
                     **({"content": raw} if raw is not None else {"json": payload}))
                 resp = await client.send(upstream, stream=True)
             except httpx.TimeoutException as e:
@@ -2313,7 +2234,7 @@ def _other_faces(requested: str, *tables) -> List[str]:
     return [name for name, table in tables if requested in table]
 
 
-def _image_404(requested: str, table: Dict[str, List[Route]], face: str,
+def _image_404(requested: str, table: Dict[str, List[Target]], face: str,
                code: str) -> JSONResponse:
     """The images faces' version of the 404 the text faces send."""
     elsewhere = _other_faces(requested,
@@ -2388,7 +2309,7 @@ async def chat_completions(request: Request):
                 requested, ", ".join(sorted(cfg.routes))),
             "model_not_found")
 
-    return await _forward(request, body, routes, Route.chat_target, requested,
+    return await _forward(request, body, routes, requested,
                           CHAT_FACE)
 
 
@@ -2459,8 +2380,8 @@ async def responses(request: Request):
                     routes=len(with_images), of=len(routes))
             routes = with_images
 
-    return await _forward(request, body, routes, Route.responses_target,
-                          requested, RESPONSES_FACE, image_tool=image_tool)
+    return await _forward(request, body, routes, requested,
+                          RESPONSES_FACE, image_tool=image_tool)
 
 
 # --------------------------------------------------------------------------
@@ -2479,9 +2400,7 @@ async def images_generations(request: Request):
         return _image_404(requested, cfg.image_routes, "images/generations",
                           "no_image_route")
 
-    return await _forward(request, body, routes,
-                          lambda r: r.image_target("generations"),
-                          requested, IMAGE_FACES["generations"])
+    return await _forward(request, body, routes, requested, IMAGE_FACES["generations"])
 
 
 @app.post("/v1/images/edits")
@@ -2523,6 +2442,5 @@ async def images_edits(request: Request):
                           "no_image_route")
 
     return await _forward(request, {"model": requested}, routes,
-                          lambda r: r.image_target("edits"),
                           requested, IMAGE_FACES["edits"],
                           raw=blob, content_type=content_type)

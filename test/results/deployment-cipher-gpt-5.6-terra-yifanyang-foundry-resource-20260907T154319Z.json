@@ -1,0 +1,610 @@
+{
+  "started_at": "20260907T154319Z",
+  "model": "gpt-5.6-terra",
+  "endpoint": "yifanyang-foundry-resource",
+  "url": "https://yifanyang-foundry-resource.services.ai.azure.com/api/projects/yifanyang-foundry/openai/v1/responses",
+  "scope": "https://ai.azure.com/.default",
+  "routes": [
+    {
+      "deployment": "gpt-5.6-terra",
+      "model": "gpt-5.6-terra",
+      "model_version": null
+    },
+    {
+      "deployment": "gpt-5.6-terra-dz",
+      "model": "gpt-5.6-terra",
+      "model_version": null
+    }
+  ],
+  "protocol": {
+    "direct_upstream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "reasoning_effort": "low",
+    "max_output_tokens": 512,
+    "concurrency": 1,
+    "request_limit": 16,
+    "repeats": 2,
+    "deployment_order": [
+      "gpt-5.6-terra",
+      "gpt-5.6-terra-dz"
+    ],
+    "retry_limit": 2,
+    "max_wait_seconds": 30,
+    "replay": "original input + all unmodified output items + new user turn",
+    "negative_control": "one ciphertext character changed in a separate request"
+  },
+  "requests": [
+    {
+      "label": "round1:gpt-5.6-terra:mint",
+      "deployment": "gpt-5.6-terra",
+      "input_ciphers": [],
+      "input_history_sha256": "954b99c0ef1ae0c6cbbb7ab82b586b95966f454891ca7c8d8f587def4af9fc25",
+      "timestamp": "2026-09-07T15:43:19.556646+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.814,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-remaining-tokens": "999977",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "1000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 30,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 44,
+        "output_tokens_details": {
+          "reasoning_tokens": 36
+        },
+        "total_tokens": 74
+      },
+      "output_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "963dd937459d13bddd5018de173ec808ba850365c769b98052790c1ce09b0ed7"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.6-terra:self",
+      "deployment": "gpt-5.6-terra",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "963dd937459d13bddd5018de173ec808ba850365c769b98052790c1ce09b0ed7"
+        }
+      ],
+      "input_history_sha256": "d68a15b838115b7f2c39655e53c970e8b5b86e8c13d5f73e04bf25b617ed1914",
+      "timestamp": "2026-09-07T15:43:22.371625+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 1.83,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-remaining-tokens": "999943",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "1000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 94,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 6,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 100
+      },
+      "output_ciphers": [],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.6-terra:cross_deployment",
+      "deployment": "gpt-5.6-terra-dz",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "963dd937459d13bddd5018de173ec808ba850365c769b98052790c1ce09b0ed7"
+        }
+      ],
+      "input_history_sha256": "d68a15b838115b7f2c39655e53c970e8b5b86e8c13d5f73e04bf25b617ed1914",
+      "timestamp": "2026-09-07T15:43:24.203900+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.046,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "332",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "333",
+        "x-ratelimit-remaining-tokens": "332943",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "333000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra-dz",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 94,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 6,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 100
+      },
+      "output_ciphers": [],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.6-terra:tampered_self",
+      "deployment": "gpt-5.6-terra",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "473f31f53a898bb4785ed8b22818c22a578732c863113b893bf08eb7643c21ec"
+        }
+      ],
+      "input_history_sha256": "10d78063a57b8e94b682879f028338ce9072f44f5887e06452c66041ec975665",
+      "timestamp": "2026-09-07T15:43:26.250446+00:00",
+      "http_status": 400,
+      "elapsed_seconds": 1.185,
+      "quota_headers": {},
+      "response_status": null,
+      "response_model": null,
+      "error_code": "invalid_encrypted_content",
+      "error_type": "invalid_request_error",
+      "incomplete_reason": null,
+      "usage": null,
+      "output_ciphers": [],
+      "answer_matches_expected": false,
+      "completed": false,
+      "outcome": "encrypted_content_rejected"
+    },
+    {
+      "label": "round1:gpt-5.6-terra-dz:mint",
+      "deployment": "gpt-5.6-terra-dz",
+      "input_ciphers": [],
+      "input_history_sha256": "954b99c0ef1ae0c6cbbb7ab82b586b95966f454891ca7c8d8f587def4af9fc25",
+      "timestamp": "2026-09-07T15:43:27.435946+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.038,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "332",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "333",
+        "x-ratelimit-remaining-tokens": "332977",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "333000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra-dz",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 30,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 44,
+        "output_tokens_details": {
+          "reasoning_tokens": 36
+        },
+        "total_tokens": 74
+      },
+      "output_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "5aabbc3cb7de30993811e45a6d8ce53ee92c1b631eb3b4c79c230b679e16b5cb"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.6-terra-dz:self",
+      "deployment": "gpt-5.6-terra-dz",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "5aabbc3cb7de30993811e45a6d8ce53ee92c1b631eb3b4c79c230b679e16b5cb"
+        }
+      ],
+      "input_history_sha256": "8439cc29017db87808c357acaac1c61151d6ed679a170916c721d677ce5c746e",
+      "timestamp": "2026-09-07T15:43:29.474623+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.074,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "332",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "333",
+        "x-ratelimit-remaining-tokens": "332943",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "333000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra-dz",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 94,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 6,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 100
+      },
+      "output_ciphers": [],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.6-terra-dz:cross_deployment",
+      "deployment": "gpt-5.6-terra",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "5aabbc3cb7de30993811e45a6d8ce53ee92c1b631eb3b4c79c230b679e16b5cb"
+        }
+      ],
+      "input_history_sha256": "8439cc29017db87808c357acaac1c61151d6ed679a170916c721d677ce5c746e",
+      "timestamp": "2026-09-07T15:43:31.549294+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 1.921,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-remaining-tokens": "999943",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "1000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 94,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 6,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 100
+      },
+      "output_ciphers": [],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round1:gpt-5.6-terra-dz:tampered_self",
+      "deployment": "gpt-5.6-terra-dz",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "1a4e8506102a8ed1355b96100de83ac9368c3c56f129b6315ddeec7560ee73b9"
+        }
+      ],
+      "input_history_sha256": "a45c1746f2a0970ac745ef2f0c95187807b1bc470d088cafca0f203977bea5ea",
+      "timestamp": "2026-09-07T15:43:33.470907+00:00",
+      "http_status": 400,
+      "elapsed_seconds": 1.269,
+      "quota_headers": {},
+      "response_status": null,
+      "response_model": null,
+      "error_code": "invalid_encrypted_content",
+      "error_type": "invalid_request_error",
+      "incomplete_reason": null,
+      "usage": null,
+      "output_ciphers": [],
+      "answer_matches_expected": false,
+      "completed": false,
+      "outcome": "encrypted_content_rejected"
+    },
+    {
+      "label": "round2:gpt-5.6-terra:mint",
+      "deployment": "gpt-5.6-terra",
+      "input_ciphers": [],
+      "input_history_sha256": "4e3b9a893bc56c8db40b08ea7c29b7b639c1d91bf5f4bc0f91a1c2a0b3fbcdfb",
+      "timestamp": "2026-09-07T15:43:34.740938+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.082,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-remaining-tokens": "999977",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "1000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 30,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 43,
+        "output_tokens_details": {
+          "reasoning_tokens": 35
+        },
+        "total_tokens": 73
+      },
+      "output_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "76ad186cc6fb1947e8620c5acef0617d1e1ba6061bba458b013b7254ee89e381"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.6-terra:cross_deployment",
+      "deployment": "gpt-5.6-terra-dz",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "76ad186cc6fb1947e8620c5acef0617d1e1ba6061bba458b013b7254ee89e381"
+        }
+      ],
+      "input_history_sha256": "ce6f1209affae1dcfabb03bbedabb1e04f7bd6121e6e2c0e49ebed5740ef002f",
+      "timestamp": "2026-09-07T15:43:36.824265+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 1.878,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "332",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "333",
+        "x-ratelimit-remaining-tokens": "332944",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "333000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra-dz",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 93,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 6,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 99
+      },
+      "output_ciphers": [],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.6-terra:self",
+      "deployment": "gpt-5.6-terra",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "76ad186cc6fb1947e8620c5acef0617d1e1ba6061bba458b013b7254ee89e381"
+        }
+      ],
+      "input_history_sha256": "ce6f1209affae1dcfabb03bbedabb1e04f7bd6121e6e2c0e49ebed5740ef002f",
+      "timestamp": "2026-09-07T15:43:38.702859+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.463,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-remaining-tokens": "999944",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "1000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 93,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 6,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 99
+      },
+      "output_ciphers": [],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.6-terra-dz:mint",
+      "deployment": "gpt-5.6-terra-dz",
+      "input_ciphers": [],
+      "input_history_sha256": "4e3b9a893bc56c8db40b08ea7c29b7b639c1d91bf5f4bc0f91a1c2a0b3fbcdfb",
+      "timestamp": "2026-09-07T15:43:41.167203+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.031,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "332",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "333",
+        "x-ratelimit-remaining-tokens": "332977",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "333000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra-dz",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 30,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 44,
+        "output_tokens_details": {
+          "reasoning_tokens": 36
+        },
+        "total_tokens": 74
+      },
+      "output_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "138ffa7fd4d7bde22dac85d361dc7a3f5c92a201b0fb531e480100c649c1cc57"
+        }
+      ],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.6-terra-dz:cross_deployment",
+      "deployment": "gpt-5.6-terra",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "138ffa7fd4d7bde22dac85d361dc7a3f5c92a201b0fb531e480100c649c1cc57"
+        }
+      ],
+      "input_history_sha256": "cf7a5dfa276a1b9645d92693be762ae2de5e73ffae6da927c13536a89afc7459",
+      "timestamp": "2026-09-07T15:43:43.199074+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 2.015,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-remaining-tokens": "999944",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "1000000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 94,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 6,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 100
+      },
+      "output_ciphers": [],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    },
+    {
+      "label": "round2:gpt-5.6-terra-dz:self",
+      "deployment": "gpt-5.6-terra-dz",
+      "input_ciphers": [
+        {
+          "length": 1060,
+          "sha256": "138ffa7fd4d7bde22dac85d361dc7a3f5c92a201b0fb531e480100c649c1cc57"
+        }
+      ],
+      "input_history_sha256": "cf7a5dfa276a1b9645d92693be762ae2de5e73ffae6da927c13536a89afc7459",
+      "timestamp": "2026-09-07T15:43:45.215090+00:00",
+      "http_status": 200,
+      "elapsed_seconds": 1.894,
+      "quota_headers": {
+        "x-ratelimit-remaining-requests": "332",
+        "x-ratelimit-reset-requests": "0",
+        "x-ratelimit-limit-requests": "333",
+        "x-ratelimit-remaining-tokens": "332944",
+        "x-ratelimit-reset-tokens": "0",
+        "x-ratelimit-limit-tokens": "333000"
+      },
+      "response_status": "completed",
+      "response_model": "gpt-5.6-terra-dz",
+      "error_code": null,
+      "error_type": null,
+      "incomplete_reason": null,
+      "usage": {
+        "input_tokens": 94,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 6,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 100
+      },
+      "output_ciphers": [],
+      "answer_matches_expected": true,
+      "completed": true,
+      "outcome": "completed"
+    }
+  ],
+  "finished_at": "2026-09-07T15:43:47.109686+00:00",
+  "request_count": 14,
+  "retry_count": 0
+}
