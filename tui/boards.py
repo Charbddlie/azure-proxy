@@ -23,6 +23,7 @@ from rich.table import Table
 from rich.text import Text
 
 from proxy.events import LEVELS, LEVEL_RANK, PROBLEM_KINDS, event_level
+from .event_text import kind_label, message as event_message
 
 from . import theme
 from .bars import capacity_bar, rpm_capacity
@@ -362,7 +363,7 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
     table.add_column(width=8, no_wrap=True)              # time
     table.add_column(width=1, no_wrap=True)              # mark
     table.add_column(width=level_width, no_wrap=True)    # severity
-    table.add_column(width=9, no_wrap=True)              # kind
+    table.add_column(width=10, no_wrap=True)             # kind
     table.add_column(width=where_width, no_wrap=True)    # where
     table.add_column(ratio=1, no_wrap=True)              # what happened
     if change_width:
@@ -385,7 +386,7 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
         row(Text(stamp, style=theme.DIM),
             Text(mark, style=colour),
             Text(label if level_width == 5 else label[0], style=colour),
-            Text(kind, style=colour),
+            Text(kind_label(event), style=colour),
             Text(truncate(where, where_width), style=theme.TEXT),
             _event_message(event),
             _event_change(event, change_width))
@@ -401,7 +402,7 @@ def _event_message(event: dict) -> Text:
     """What happened, in the proxy's own words."""
     level = event_level(event.get("kind", ""), event.get("level", "info"), event)
     style = _level_style(level)
-    return Text(event.get("message", ""), style=style,
+    return Text(event_message(event), style=style,
                 overflow="ellipsis", no_wrap=True)
 
 
@@ -422,25 +423,25 @@ def _event_change(event: dict, width: int) -> Text:
         other_rpm = event.get("other_rpm")
         capacity_rpm = event.get("capacity_rpm")
         if other_rpm is not None and capacity_rpm:
-            out.append("others ", style=theme.DIM)
+            out.append("外部 ", style=theme.DIM)
             out.append("{:.1f} RPM".format(other_rpm), style=theme.FOREIGN)
-            out.append(" / max {:.1f}".format(capacity_rpm), style=theme.DIM)
+            out.append(" / 最大 {:.1f}".format(capacity_rpm), style=theme.DIM)
             return out
         before, after = event.get("foreign_before"), event.get("foreign_after")
         if before is not None and after is not None:
-            out.append("others ", style=theme.DIM)
+            out.append("外部 ", style=theme.DIM)
             arrow = "→" if after > before else "="
             out.append("{:.0f}%{}{:.0f}%".format(before * 100, arrow,
                                                  after * 100),
                        style=theme.FOREIGN)
             ours = event.get("our_load")
             if ours is not None:
-                out.append(" (we {:.0f}%)".format(ours * 100), style=theme.DIM)
+                out.append("（本机 {:.0f}%）".format(ours * 100), style=theme.DIM)
             return out
 
     park = event.get("park_seconds")
     if park:
-        out.append("park {:.0f}s".format(park), style=theme.WARN)
+        out.append("降权 {:.0f} 秒".format(park), style=theme.WARN)
         penalty = event.get("penalty")
         if penalty is not None:
             out.append(" ×{:.2f}".format(penalty), style=theme.DIM)
@@ -448,6 +449,9 @@ def _event_change(event: dict, width: int) -> Text:
 
     to_route = event.get("to_route")
     if to_route:
+        if to_route == event.get("route"):
+            out.append("同一部署", style=theme.ACCENT)
+            return out
         out.append("→ ", style=theme.DIM)
         out.append(truncate(to_route, width - 2), style=theme.ACCENT)
         return out

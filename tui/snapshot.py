@@ -344,7 +344,8 @@ class Snapshot:
         routes_doc: dict = _rpm_fields(raw.get("routes") or {})
         self.routing = self.health.get("routing") or {}
         heartbeat_age = self.routing.get("heartbeat_age_seconds")
-        self.heartbeat_age = (max(0, heartbeat_age + (self.health_age or 0))
+        routing_fetch_age = raw.get("local_state_age") if self.health.get("local_status") else self.health_age
+        self.heartbeat_age = (max(0, heartbeat_age + (routing_fetch_age or 0))
                               if heartbeat_age is not None else None)
         updated_at = routes_doc.get("updated_at")
         self.stats_age = (max(0, time.time() - updated_at)

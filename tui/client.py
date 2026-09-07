@@ -35,11 +35,13 @@ class Poller:
     """
 
     def __init__(self, base_url: str, interval: float = 1.0,
-                 event_limit: int = 400, timeout: float = 4.0):
+                 event_limit: int = 400, timeout: float = 4.0, local_root=None):
         self.base_url = base_url.rstrip("/")
         self.interval = interval
         self.event_limit = event_limit
         self.timeout = timeout
+        self.local_root = local_root
+        self._local_fetched_at = 0
 
         self._lock = threading.Lock()
         self._health: Optional[dict] = None
@@ -137,6 +139,7 @@ class Poller:
                     "age": (max(0, now - self._fetched_at)
                             if self._fetched_at else None),
                     "health_error": self._health_error,
+                    "local_state_age": max(0, now - self._local_fetched_at) if self._local_fetched_at else None,
                     "health_age": (max(0, now - self._health_fetched_at)
                                    if self._health_fetched_at else None)}
 
@@ -152,8 +155,15 @@ class Poller:
             try:
                 health = self._get("/healthz")
             except Exception as e:
+                local = None
+                if self.local_root:
+                    from .local_status import read_status
+                    local = read_status(self.local_root)
                 with self._lock:
                     self._health_error = self._error = "{}: {}".format(type(e).__name__, e)
+                    if local:
+                        self._health = dict(self._health or {}, **local, local_status=True)
+                        self._local_fetched_at = time.time()
                 self._wake.wait(self.interval)
                 self._wake.clear()
                 continue

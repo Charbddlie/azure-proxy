@@ -5,6 +5,8 @@ import fcntl
 import logging
 import os
 import pty
+import pwd
+import re
 import select
 import struct
 import subprocess
@@ -40,6 +42,48 @@ class OperationsTests(unittest.TestCase):
             restart(30)
             self.assertEqual([c.args[0][3:5] for c in run.call_args_list],
                              [["restart", "routing"], ["restart", "serving"]])
+
+    def test_minimal_scheduler_environment_restores_account_home(self):
+        with patch.dict(os.environ, {"PATH": os.defpath}, clear=True), \
+                patch("tools.scheduled_restart.health", return_value={
+                    "ok": True, "supervisor": {"active": 123}, "routing": {"ok": True}}), \
+                patch("tools.scheduled_restart.subprocess.run") as run:
+            restart(30)
+            for call in run.call_args_list:
+                self.assertEqual(call.kwargs["env"]["HOME"], pwd.getpwuid(os.getuid()).pw_dir)
+            self.assertNotIn("HOME", os.environ)
+
+    def test_default_tui_script_starts_offline_and_recovers(self):
+        with fixture() as (p, a, b):
+            p.proc.terminate(); p.proc.wait(timeout=10)
+            master, slave = pty.openpty()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+            process = subprocess.Popen(["./tui.sh", "--interval", "0.1"],
+                                       cwd=ROOT, stdin=slave, stdout=slave, stderr=slave,
+                                       env=dict(p.env, TERM="xterm-256color"))
+            def capture(seconds):
+                data = b""
+                until = time.monotonic() + seconds
+                while time.monotonic() < until:
+                    if select.select([master], [], [], .1)[0]:
+                        data += os.read(master, 65536)
+                return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", data)
+            try:
+                offline = capture(1.2)
+                self.assertIsNone(process.poll(), offline.decode(errors="replace"))
+                self.assertIn(b"serving unreachable", offline)
+                self.assertIn(b"routing online", offline)
+                p.proc = subprocess.Popen([PYTHON, "-m", "proxy"], env=p.env,
+                                          stdout=p.log, stderr=subprocess.STDOUT)
+                p._await_health()
+                recovered = capture(.8)
+                self.assertIn(b"serving online", recovered)
+                os.write(master, b"q")
+                self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                if process.poll() is None:
+                    process.kill(); process.wait()
+                os.close(master); os.close(slave)
 
     def test_log_retention_is_limited_to_rotated_diagnostics(self):
         with tempfile.TemporaryDirectory() as root:

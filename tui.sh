@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Open the dashboard on the proxy that is already running.
+# Open the independent dashboard, including while serving is offline.
 #
 # This starts nothing and stops nothing. It is a read-only view over the
 # proxy's own HTTP surface (/healthz, /routes, /events), so it can be opened
@@ -35,13 +35,8 @@ done
 check_python
 require_rich
 
-if [[ -z $URL ]]; then
-    read_endpoint
-    # Only meaningful for the local proxy. A --url points somewhere this
-    # machine's pidfile knows nothing about, so there is nothing to check and
-    # the dashboard's own "unreachable" banner is the right place to find out.
-    require_online
-    URL="http://$HOST:$PORT"
+ARGS=(--interval "$INTERVAL")
+if [[ -n $URL ]]; then
+    ARGS+=(--url "$URL")
 fi
-
-exec $PYTHON -m tui --url "$URL" --interval "$INTERVAL"
+exec "$PYTHON" -m tui "${ARGS[@]}"

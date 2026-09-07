@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timedelta
 import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from proxy.manage import health, live_pid
+from proxy.manage import health
 from proxy.state import InstanceLock
 
 
@@ -23,9 +24,11 @@ def next_run(now, hour=1, minute=0):
 
 
 def restart(timeout, legacy_migration=False):
+    environment = dict(os.environ)
+    environment.setdefault("HOME", pwd.getpwuid(os.getuid()).pw_dir)
     def manage(action, role):
         subprocess.run([sys.executable, "-m", "proxy.manage", action, role,
-                        "--timeout", str(timeout)], cwd=ROOT, check=True)
+                        "--timeout", str(timeout)], cwd=ROOT, env=environment, check=True)
     before = health()
     if not before:
         raise RuntimeError("serving health check failed; scheduled restart cancelled")

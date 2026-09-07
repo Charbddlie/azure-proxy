@@ -980,10 +980,8 @@ def _relay_stream(resp: httpx.Response, route: Target, face: str, started: float
     not counted twice.
 
     A stream that ends in an `error` event is a failed turn wearing a 200, and
-    it is written down as one. `family` is the client session it belongs to: an
-    `invalid_encrypted_content` refusal is remembered against it, so every
-    later turn of that session goes out without the ciphertext this one was
-    refused for, whatever the routing decides.
+    it is written down as one. Upstream refusals preserve the family binding
+    and all encrypted content on subsequent requests.
     """
     if entry:
         entry.streaming = True

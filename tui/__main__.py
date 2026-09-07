@@ -25,7 +25,8 @@ def _default_url() -> str:
     try:
         import os
         import yaml
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        from proxy.config import ROOT
+        here = ROOT
         with open(os.path.join(here, "settings", "policy.yaml")) as f:
             server = (yaml.safe_load(f) or {}).get("server") or {}
         return "http://{}:{}".format(server.get("host", "127.0.0.1"),
@@ -45,7 +46,13 @@ def main(argv=None) -> int:
                         help="seconds between polls (default: 1)")
     args = parser.parse_args(argv)
 
-    run(args.url or _default_url(), interval=args.interval)
+    from proxy.config import ROOT
+    from urllib.parse import urlsplit
+    default = _default_url()
+    url = args.url or default
+    local = ROOT if url.rstrip("/") == default.rstrip("/") and urlsplit(url).hostname in (
+        "127.0.0.1", "localhost", "0.0.0.0", "::1") else None
+    run(url, interval=args.interval, local_root=local)
     return 0
 
 

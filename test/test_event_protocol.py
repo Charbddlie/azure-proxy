@@ -121,7 +121,7 @@ class EventProtocolTests(unittest.TestCase):
                 frame = dash.render()
                 self.assertLessEqual(len(console.render_lines(frame, console.options.update(height=None))), 24)
                 text = render(frame, width)
-                for label in ("serving online", "supervisor", "bindings durable", "轮询期间漏读", "确认提示"):
+                for label in ("serving online", "管理进程", "持久化正常", "轮询期间漏读", "确认提示"):
                     self.assertIn(label, text)
 
 

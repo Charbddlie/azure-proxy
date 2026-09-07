@@ -44,6 +44,18 @@ class ProcessStatusTests(unittest.TestCase):
         self.assertIn("routing online  PID 202", text)
         self.assertIn("heartbeat 0s ago", text)
 
+    def test_process_and_persistence_rows_use_requested_chinese_labels(self):
+        raw = healthy()
+        raw["health"]["routing"].update(telemetry_pending=0, telemetry_dropped=0)
+        raw["health"].update(supervisor=dict(ok=True, pid=1059128, active=1059139, draining=[]),
+                              affinity_store=dict(ok=True, pending=0))
+        for width in (60, 80, 120, 180):
+            text = render(_processes(self.snapshot(raw)), width)
+            self.assertIn("统计记录  待处理 0  待写入 0  已丢失 0", text)
+            self.assertIn("管理进程  在线  PID 1059128", text)
+            self.assertIn("接流进程  PID 1059139  等待旧请求结束的进程 0", text)
+            self.assertIn("会话绑定  持久化正常  待写入 0", text)
+
     def test_bad_credentials_do_not_mean_serving_is_offline(self):
         raw = healthy()
         raw["health"]["ok"] = False
@@ -59,7 +71,7 @@ class ProcessStatusTests(unittest.TestCase):
         self.assertIn("serving online", text)
         self.assertIn("routing no heartbeat  last PID 202", text)
         self.assertIn("heartbeat 24h ago", text)
-        self.assertIn("backlog 3,900,000", text)
+        self.assertIn("待处理 3,900,000", text)
         footer = render(_footer(Dashboard(None, Console()), snapshot, 0))
         self.assertIn("fetch 0s ago", footer)
         self.assertIn("stats 24h ago  stale", footer)
@@ -76,7 +88,7 @@ class ProcessStatusTests(unittest.TestCase):
         snapshot = self.snapshot(raw)
         text = render(_processes(snapshot))
         self.assertIn("routing degraded", text)
-        self.assertIn("dropped 12", text)
+        self.assertIn("已丢失 12", text)
         self.assertTrue(snapshot.stats_stale)
 
     def test_serving_unreachable_makes_routing_unknown(self):
@@ -185,6 +197,26 @@ class PollerStatusTests(unittest.TestCase):
         self.poll_once(poller, responses)
         self.assertIsNone(poller.snapshot()["health_error"])
         self.assertIsNone(poller.snapshot()["error"])
+
+
+class LocalStatusTests(unittest.TestCase):
+    def test_unavailable_local_state_is_read_only(self):
+        import os
+        import tempfile
+        from tui.local_status import read_status
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(read_status(root))
+            self.assertEqual(os.listdir(root), [])
+
+    def test_fresh_local_routing_status_is_independent_of_http_fetch_age(self):
+        raw = healthy()
+        raw["health"]["local_status"] = True
+        raw.update(health_age=100, health_error="connection refused", local_state_age=.1)
+        snapshot = Snapshot(raw)
+        self.assertAlmostEqual(snapshot.heartbeat_age, .3)
+        output = render(_processes(snapshot))
+        self.assertIn("serving unreachable", output)
+        self.assertIn("routing online", output)
 
     def test_polling_continues_without_manual_refresh(self):
         poller = Poller("http://unused", interval=0.01)

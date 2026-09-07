@@ -214,7 +214,7 @@ def _processes(snapshot: Snapshot) -> RichGroup:
 
     state = snapshot.routing
     routing = Text("routing ", style=theme.LABEL, no_wrap=True, overflow="ellipsis")
-    if status != "online" or not state:
+    if (status != "online" and not snapshot.health.get("local_status")) or not state:
         route_status, style = "unknown", theme.WARN
     elif state.get("ready") is False:
         route_status, style = "stopped", theme.CRIT
@@ -232,26 +232,29 @@ def _processes(snapshot: Snapshot) -> RichGroup:
     if snapshot.heartbeat_age is not None:
         routing.append("  heartbeat {} ago".format(_duration(snapshot.heartbeat_age)),
                        style=theme.DIM if route_status == "online" else theme.WARN)
-    telemetry = Text("telemetry backlog {:,}  pending {:,}  dropped {:,}".format(
-        state.get("backlog", 0), state.get("telemetry_pending", 0), state.get("telemetry_dropped", 0)),
+    def count(name):
+        value = state.get(name)
+        return "{:,}".format(value) if isinstance(value, int) else "?"
+    telemetry = Text("统计记录  待处理 {}  待写入 {}  已丢失 {}".format(
+        count("backlog"), count("telemetry_pending"), count("telemetry_dropped")),
         style=theme.WARN if state.get("backlog") or state.get("telemetry_dropped") else theme.DIM,
         no_wrap=True, overflow="ellipsis")
     supervisor = snapshot.health.get("supervisor") or {}
     owner = Text(no_wrap=True, overflow="ellipsis")
     if supervisor:
-        owner.append("supervisor {} PID {}".format(
-            "online" if supervisor.get("ok") and status == "online" else "unknown",
+        owner.append("管理进程  {}  PID {}".format(
+            "在线" if supervisor.get("ok") and (status == "online" or snapshot.health.get("local_status")) else "状态未知",
             supervisor.get("pid", "?")), style=theme.DIM)
-        workers = Text("active {}  draining {}".format(supervisor.get("active", "?"),
+        workers = Text("接流进程  PID {}  等待旧请求结束的进程 {}".format(supervisor.get("active", "?"),
             ",".join(map(str, supervisor.get("draining", []))) or "0"),
             style=theme.DIM, no_wrap=True, overflow="ellipsis")
         if supervisor.get("starting"):
-            workers.append("  starting {}".format(supervisor["starting"]), style=theme.WARN)
+            workers.append("  预热进程 PID {}".format(supervisor["starting"]), style=theme.WARN)
     storage = snapshot.health.get("affinity_store") or {}
     persistence = Text(no_wrap=True, overflow="ellipsis")
     if storage:
-        persistence.append("bindings {}  pending {}".format(
-            "durable" if storage.get("ok") else "unavailable", storage.get("pending", "?")),
+        persistence.append("会话绑定  {}  待写入 {}".format(
+            "持久化正常" if storage.get("ok") else "持久化异常", storage.get("pending", "?")),
             style=theme.OK if storage.get("ok") else theme.CRIT)
     return RichGroup(serving, routing, telemetry, *([owner, workers] if supervisor else []),
                      *([persistence] if storage else []))
@@ -408,7 +411,7 @@ def _read_keys(timeout: float) -> List[str]:
     return out
 
 
-def run(base_url: str, interval: float = 1.0) -> None:
+def run(base_url: str, interval: float = 1.0, local_root=None) -> None:
     """Poll `base_url` and draw until the user quits, or until asked to stop.
 
     SIGTERM and SIGINT are handled rather than left to the default so that both
@@ -420,7 +423,7 @@ def run(base_url: str, interval: float = 1.0) -> None:
 
     Nothing here stops the proxy — this process only ever reads.
     """
-    poller = Poller(base_url, interval=interval)
+    poller = Poller(base_url, interval=interval, local_root=local_root)
     poller.start()
     console = Console()
     dashboard = Dashboard(poller, console)

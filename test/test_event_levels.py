@@ -89,7 +89,7 @@ class EventLevelTests(unittest.TestCase):
             console.print(table)
             text = output.getvalue()
             self.assertEqual(count, 3)
-            self.assertIn("timeout", text)
+            self.assertIn("请求超时", text)
             self.assertNotIn("learned-capacity", text)
             if width == 120:
                 self.assertIn("WARN", text)

@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
-# Shared checks. Sourced by start.sh and start_tui.sh — never run alone.
-#
-# The two scripts want opposite answers to the same question. start.sh must
-# refuse to start a second proxy; start_tui.sh is only an observer and must
-# refuse to run when there is nothing to observe. Asking it in one place is
-# what keeps the two answers consistent.
+# Shared environment checks. The dashboard can start while serving is offline.
 
 # The interpreter lives in the checkout, so it travels with it. Every caller
 # has already cd'd to the repo root, which is what makes the relative path
@@ -59,20 +54,6 @@ refuse_if_online() {
     rm -f $PIDFILE
 }
 
-# The mirror, for the dashboard. It starts nothing, so an offline proxy is not
-# something it can work around — and a dashboard that came up anyway would
-# spend its first screen saying "unreachable" about a proxy that was never
-# asked to run, which reads like a fault rather than an instruction.
-require_online() {
-    if proxy_online; then
-        return 0
-    fi
-    echo "the proxy is not running — there is nothing to watch" >&2
-    echo "  (checked $PIDFILE and http://$HOST:$PORT/healthz)" >&2
-    echo >&2
-    echo "  ./start.sh     start it in the background, then run this again" >&2
-    exit 1
-}
 
 require_rich() {
     if ! $PYTHON -c "import rich" 2>/dev/null; then
@@ -209,4 +190,3 @@ wait_for_health() {
     done
     return 1
 }
-
