@@ -1,6 +1,6 @@
 """The capacity bar: learned safe RPM and who is spending it.
 
-    ███▓▓▒▒▥····················░░░░
+    ███▓▓▒▒▚····················░░░░
     └ ours ┘└────── free ──────┘└frn┘
 
 The ceiling is the largest RPM this proxy has completed without a rate limit.
@@ -9,8 +9,8 @@ the difference is concurrent traffic from others. The bar shows current RPM,
 that observed outside RPM, and the remaining part of the learned maximum.
 
 The `ours` part is subdivided by face — chat and Responses, streamed or not,
-and the images face — in the same colour, because they are slices of one number
-rather than five numbers. See tui/theme.py.
+and the images face — in the same green, distinguished by block textures.
+See tui/theme.py.
 
 An unknown ceiling draws as neither full nor empty. `load` returns None when
 the deployment has never answered, and None means *unknown*: a route that has
@@ -65,7 +65,7 @@ def capacity_bar(width: int, by_face: Optional[Dict[str, float]],
     cells = allocate(width, ours + [max(0.0, foreign), max(0.0, 1.0 - used)])
     for name, n in zip(FACES, cells):
         if n:
-            bar.append(theme.FACE_GLYPH.get(name, "█") * n, style=theme.OURS)
+            bar.append(theme.FACE_GLYPH[name] * n, style=theme.OURS)
     if cells[len(FACES) + 1]:
         bar.append(theme.FREE_GLYPH * cells[len(FACES) + 1], style=theme.FREE)
     # Outside usage stays anchored to the right; reclaiming it opens space

@@ -507,14 +507,45 @@ class TerminalInputTests(unittest.TestCase):
 
 
 class CapacityBarTests(unittest.TestCase):
-    def test_stream_and_image_use_distinct_single_cell_striped_blocks(self):
-        for face, glyph in (("responses_stream", "▥"), ("image", "▤")):
-            self.assertEqual(theme.FACE_GLYPH[face], glyph)
+    def test_faces_restore_original_glyphs_and_shared_green(self):
+        console = Console(file=io.StringIO())
+        key = legend()
+        expected = dict(chat="█", chat_stream="▓", responses="▒", responses_stream="▚", image="▞")
+        self.assertEqual(theme.FACE_GLYPH, expected)
+        style = console.get_style(theme.OURS)
+        for face in FACES:
+            glyph = expected[face]
             self.assertEqual(cell_len(glyph), 1)
-            self.assertEqual(capacity_bar(10, {face: 1}).plain, glyph * 10)
-            self.assertIn(glyph + theme.FACE_LABEL[face], legend().plain)
+            bar = capacity_bar(10, {face: 1})
+            self.assertEqual(bar.plain, glyph * 10)
+            self.assertEqual(bar.cell_len, 10)
+            self.assertEqual(bar.get_style_at_offset(console, 0), style)
+            self.assertIsNone(bar.get_style_at_offset(console, 0).bgcolor)
+            offset = key.plain.index(theme.FACE_LABEL[face]) - 1
+            self.assertEqual(key.get_style_at_offset(console, offset), style)
+            self.assertIsNone(key.get_style_at_offset(console, offset + 1).bgcolor)
         self.assertEqual(len(set(theme.FACE_GLYPH.values())), len(FACES))
         self.assertNotIn(theme.FOREIGN_GLYPH, theme.FACE_GLYPH.values())
+
+    def test_faces_do_not_change_the_terminal_background(self):
+        console = Console(file=io.StringIO())
+        for face in FACES:
+            bar = capacity_bar(10, {face: .2}, .2)
+            self.assertEqual(bar.plain, theme.FACE_GLYPH[face] * 2 + "·" * 6 + "░░")
+            self.assertEqual(bar.get_style_at_offset(console, 1), console.get_style(theme.OURS))
+            for offset in range(10):
+                self.assertIsNone(bar.get_style_at_offset(console, offset).bgcolor)
+
+    def test_streaming_block_emits_only_the_original_green(self):
+        output = io.StringIO()
+        console = Console(file=output, width=20, force_terminal=True,
+                          color_system="truecolor", no_color=False)
+        console.print(capacity_bar(4, {"chat_stream": 1}))
+        ansi = output.getvalue()
+        self.assertIn("38;2;127;160;138", ansi)
+        self.assertNotIn("48;2;", ansi)
+        self.assertIn("▓" * 4, ansi)
+        self.assertIn("\x1b[0m", ansi)
 
     def test_others_recedes_from_left_and_keeps_right_edge(self):
         for foreign, free in ((.6, 2), (.4, 4), (.2, 6), (0, 8)):
@@ -854,7 +885,7 @@ class PinnedCardTests(unittest.TestCase):
                 count = re.search(r"\b{}\b".format(pins[route.key]), main)
                 self.assertIsNotNone(count)
                 pin_edges.append(cell_len(main[:count.end()]))
-                bar = re.search(r"[█▓▒▥▤░·]+", main)
+                bar = re.search(r"[█▓▒▚▞░·]+", main)
                 self.assertIsNotNone(bar)
                 bar_edges.append((cell_len(main[:bar.start()]), cell_len(main[:bar.end()])))
                 self.assertTrue(main[:bar.start()].endswith("23 "))

@@ -7,11 +7,8 @@ throttled endpoint has nothing louder to be.
 
 Two rules the rest of the package follows:
 
-**One hue per quantity, not per category.** The four faces (chat, chat-stream,
-responses, responses-stream) are four slices of ONE number — what this proxy is
-taking from a deployment — so they share a colour and differ only in glyph.
-Giving them four colours would read as four independent bars that happen to
-touch, which is the wrong mental model: they compete for a single ceiling.
+**One hue per quantity.** Request faces share the same sage green and use
+different block textures to distinguish chat, Responses, streaming and images.
 
 **Colour states, not values.** The severity colours are applied to the
 percentage and the panel border, never to the bar body. The bar's job is to
@@ -69,21 +66,16 @@ def severity(total_load):
 
 # -- glyphs ----------------------------------------------------------------
 #
-# Ordered heaviest to lightest within `ours` so that a stacked bar reads as a
-# gradient rather than as noise, and so they are still distinguishable at one
-# cell each. All of them are drawn in OURS.
+# Distinct single-cell block textures, all drawn in the original OURS green.
 #
-# The keys are the FACES names from proxy/server.py. They must stay in step;
-# the bar falls back to the last glyph for a name it does not know rather than
-# dropping the segment, because a segment silently missing from a bar is worse
-# than one drawn with the wrong texture.
+# Keys match the face names used by snapshots and the capacity bar.
 
 FACE_GLYPH = {
     "chat": "█",
     "chat_stream": "▓",
     "responses": "▒",
-    "responses_stream": "▥",
-    "image": "▤",
+    "responses_stream": "▚",
+    "image": "▞",
 }
 FACE_LABEL = {
     "chat": "chat",
