@@ -73,7 +73,7 @@ class Poller:
         self._wake.set()
 
     def refresh_now(self) -> None:
-        """Skip the rest of the interval. Bound to `r`."""
+        """Wake the background poller before its next scheduled fetch."""
         self._wake.set()
 
     def acknowledge_gap(self):

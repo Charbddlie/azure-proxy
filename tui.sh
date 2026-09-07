@@ -13,7 +13,7 @@
 #   ./restart.sh   restart routing after editing its policy or re-probing
 #
 # `python -m tui --attach` is the same thing without the checks below, and
-# takes --url for a proxy on another host or port.
+# takes --url for another proxy and --scroll-lines N for wheel sensitivity.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -21,11 +21,13 @@ source ./preflight.sh
 
 INTERVAL=1.0
 URL=""
+SCROLL_LINES=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --url)      URL="$2"; shift ;;
         --interval) INTERVAL="$2"; shift ;;
+        --scroll-lines) SCROLL_LINES="$2"; shift ;;
         -h|--help)  sed -n '2,18p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -38,5 +40,8 @@ require_rich
 ARGS=(--interval "$INTERVAL")
 if [[ -n $URL ]]; then
     ARGS+=(--url "$URL")
+fi
+if [[ -n $SCROLL_LINES ]]; then
+    ARGS+=(--scroll-lines "$SCROLL_LINES")
 fi
 exec "$PYTHON" -m tui "${ARGS[@]}"

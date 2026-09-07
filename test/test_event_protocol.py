@@ -87,7 +87,11 @@ class EventProtocolTests(unittest.TestCase):
             self.assertIsNotNone(poller.snapshot()["gap"])
             Dashboard(poller, Console()).key("r")
             self.assertIsNotNone(poller.snapshot()["gap"])
-            Dashboard(poller, Console()).key("c")
+            dashboard = Dashboard(poller, Console(file=io.StringIO()))
+            dashboard.board = 2
+            dashboard.render()
+            y, x, _, _ = next(r for r in dashboard._button_regions if r[3] == "acknowledge_gap")
+            dashboard.key("\x1b[<0;{};{}M".format(x, y))
             self.assertIsNone(poller.snapshot()["gap"])
             self.assertEqual(poller.snapshot()["missed_events"], 2200)
 
@@ -114,15 +118,17 @@ class EventProtocolTests(unittest.TestCase):
                               affinity_store=dict(ok=True, pending=2))
         raw["events"] = feed(1, 100)["events"]
         for width in (60, 80, 120, 180):
-            for board in (0, 1, 2):
+            for board in (0, 1, 2, 3):
                 console = Console(file=io.StringIO(), width=width, height=24)
                 dash = Dashboard(SimpleNamespace(snapshot=lambda: raw), console)
                 dash.board = board
                 frame = dash.render()
                 self.assertLessEqual(len(console.render_lines(frame, console.options.update(height=None))), 24)
                 text = render(frame, width)
-                for label in ("serving online", "管理进程", "持久化正常", "轮询期间漏读", "确认提示"):
-                    self.assertIn(label, text)
+                self.assertIn("serving  routing", text)
+                for label in ("serving online", "管理进程", "持久化正常", "轮询期间漏读"):
+                    self.assertEqual(label in text, board == 3)
+                self.assertEqual("确认提示" in text, board == 2)
 
 
 if __name__ == "__main__":

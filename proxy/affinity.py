@@ -85,6 +85,9 @@ class AffinityStore:
                 activity REAL NOT NULL, expires REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS bindings_expiry ON bindings(expires);
             CREATE INDEX IF NOT EXISTS bindings_descriptor ON bindings(descriptor);
+            CREATE TABLE IF NOT EXISTS binding_models (
+                family TEXT NOT NULL REFERENCES bindings(family), model TEXT NOT NULL,
+                PRIMARY KEY(family, model));
             PRAGMA user_version=1;
         """)
         self.last_flush = self.clock()
@@ -119,12 +122,24 @@ class AffinityStore:
             if winner:
                 return winner
             now = self.clock()
+            self.db.execute("DELETE FROM binding_models WHERE family=?", (family,))
             self.db.execute("INSERT OR IGNORE INTO descriptors VALUES(?,?,?)",
                             (descriptor, identity, encoded))
             self.db.execute("INSERT OR REPLACE INTO bindings VALUES(?,?,?,?,?)",
                             (family, endpoint, descriptor, now, now + self.ttl))
         self.error = None
         return dict(endpoint=endpoint, identity=identity, catalog=catalog, expires=now + self.ttl, created=True)
+
+    def note_model(self, family, model):
+        """Remember each model used by an unexpired endpoint-bound family once."""
+        with self.lock:
+            if self.db.execute("SELECT 1 FROM binding_models WHERE family=? AND model=?",
+                               (family, model)).fetchone():
+                return
+            with self.db:
+                self.db.execute("INSERT OR IGNORE INTO binding_models "
+                                "SELECT family,? FROM bindings WHERE family=? AND expires>?",
+                                (model, family, self.clock()))
 
     def touch(self, family, expires):
         with self.lock:
@@ -153,6 +168,9 @@ class AffinityStore:
 
     def cleanup(self):
         with self.lock, self.db:
+            self.db.execute("DELETE FROM binding_models WHERE family IN "
+                            "(SELECT family FROM bindings WHERE expires<=? LIMIT 500)",
+                            (self.clock(),))
             self.db.execute("DELETE FROM bindings WHERE family IN "
                             "(SELECT family FROM bindings WHERE expires<=? LIMIT 500)",
                             (self.clock(),))
@@ -169,10 +187,24 @@ class AffinityStore:
 
     def report(self):
         with self.lock:
+            now = self.clock()
             counts = dict(self.db.execute("SELECT endpoint,COUNT(*) FROM bindings "
-                                         "WHERE expires>? GROUP BY endpoint", (self.clock(),)))
+                                         "WHERE expires>? GROUP BY endpoint", (now,)))
+            models = {}
+            for model, endpoint, count in self.db.execute(
+                    "SELECT m.model,b.endpoint,COUNT(*) FROM binding_models m "
+                    "JOIN bindings b ON b.family=m.family WHERE b.expires>? "
+                    "GROUP BY m.model,b.endpoint", (now,)):
+                entry = models.setdefault(model, dict(total=0, endpoints={}))
+                entry["total"] += count
+                entry["endpoints"][endpoint] = count
+            unattributed = self.db.execute(
+                "SELECT COUNT(*) FROM bindings b WHERE b.expires>? AND NOT EXISTS "
+                "(SELECT 1 FROM binding_models m WHERE m.family=b.family)", (now,)).fetchone()[0]
             return dict(enabled=True, mode="endpoint", ttl_seconds=self.ttl,
                         live_sessions=sum(counts.values()), sessions_per_endpoint=counts,
+                        sessions_per_model=models, model_tracking=True,
+                        unattributed_sessions=unattributed,
                         persistence=dict(ok=self.error is None, error=self.error,
                                          pending=len(self.dirty), last_flush=self.last_flush))
 
@@ -285,6 +317,11 @@ class SessionAffinity:
         request.state.affinity_family = family if binding else None
         request.state.affinity_binding = binding
         if binding:
+            try:
+                await asyncio.to_thread(self.store.note_model, family, body["model"])
+            except (sqlite3.Error, OSError) as exc:
+                # Display statistics can catch up on a later request.
+                self.store.error = type(exc).__name__
             self.active[family] += 1
             if binding.get("created") and self.emit:
                 self.emit("pin", "info", "family bound to endpoint %s", binding["endpoint"],

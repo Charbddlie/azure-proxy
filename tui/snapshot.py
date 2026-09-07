@@ -419,6 +419,15 @@ class Snapshot:
         return ((self.affinity.get("sessions_per_model") or {}).get(model)
                 or {"total": 0, "types": {}})
 
+    def pinned(self, model: str, endpoint: Optional[str] = None) -> Optional[int]:
+        """Unique families for a model, optionally restricted to one endpoint."""
+        entry = (self.affinity.get("sessions_per_model") or {}).get(model) or {}
+        if endpoint is None:
+            return entry.get("total", 0 if self.affinity.get("model_tracking") else None)
+        if "endpoints" in entry:
+            return entry["endpoints"].get(endpoint, 0)
+        return 0 if self.affinity.get("model_tracking") else None
+
     # -- what is worth showing --------------------------------------------
     def is_legacy(self, name: str) -> bool:
         """Is this an old model, by version rather than by date.

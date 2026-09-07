@@ -12,7 +12,7 @@ it; the proxy itself is managed by start.sh / stop.sh / restart.sh.
 import argparse
 import sys
 
-from .app import run
+from .app import DEFAULT_SCROLL_LINES, run
 
 
 def _default_url() -> str:
@@ -35,6 +35,37 @@ def _default_url() -> str:
         return "http://127.0.0.1:8811"
 
 
+def _scroll_lines(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise argparse.ArgumentTypeError("scroll lines must be a positive integer")
+    try:
+        value = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("scroll lines must be a positive integer")
+    if value < 1:
+        raise argparse.ArgumentTypeError("scroll lines must be a positive integer")
+    return value
+
+
+def _default_scroll_lines() -> int:
+    import os
+    import yaml
+    from proxy.config import ROOT
+    try:
+        with open(os.path.join(ROOT, "settings", "policy.yaml")) as file:
+            policy = yaml.safe_load(file) or {}
+    except OSError:
+        return DEFAULT_SCROLL_LINES
+    except yaml.YAMLError:
+        raise argparse.ArgumentTypeError("cannot read tui.scroll_lines from settings/policy.yaml")
+    settings = policy.get("tui", {}) if isinstance(policy, dict) else {}
+    if settings is None:
+        settings = {}
+    if not isinstance(settings, dict):
+        raise argparse.ArgumentTypeError("tui settings must be a mapping")
+    return _scroll_lines(settings.get("scroll_lines", DEFAULT_SCROLL_LINES))
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m tui", description=__doc__.splitlines()[0])
@@ -44,7 +75,13 @@ def main(argv=None) -> int:
                         help="proxy base URL (default: from settings/policy.yaml)")
     parser.add_argument("--interval", type=float, default=1.0,
                         help="seconds between polls (default: 1)")
+    parser.add_argument("--scroll-lines", type=_scroll_lines, default=None,
+                        help="lines per wheel event (default: tui.scroll_lines in settings/policy.yaml, or 2)")
     args = parser.parse_args(argv)
+    try:
+        scroll_lines = args.scroll_lines if args.scroll_lines is not None else _default_scroll_lines()
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     from proxy.config import ROOT
     from urllib.parse import urlsplit
@@ -52,7 +89,7 @@ def main(argv=None) -> int:
     url = args.url or default
     local = ROOT if url.rstrip("/") == default.rstrip("/") and urlsplit(url).hostname in (
         "127.0.0.1", "localhost", "0.0.0.0", "::1") else None
-    run(url, interval=args.interval, local_root=local)
+    run(url, interval=args.interval, local_root=local, scroll_lines=scroll_lines)
     return 0
 
 

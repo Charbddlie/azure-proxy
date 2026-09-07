@@ -2017,23 +2017,31 @@ def test_stream_completion_waits_for_the_terminal_event_delimiter():
         assert watch.completed
 
 
-def test_tui_explains_a_throttle_before_the_first_completed_sample():
-    """A refusal is an observation even when it proves no safe lower bound."""
+def test_tui_shows_usage_without_a_completed_sample_notice():
+    """Usage flanks the bar even before a safe ceiling is learned."""
     sys.path.insert(0, ROOT)
-    from tui.boards import _detail
+    from io import StringIO
+    from rich.console import Console
+    from tui.boards import _route_rows
     from tui.snapshot import RouteView
 
     route = RouteView("alpha/deployment", MODEL, None, {
         "endpoint": "alpha",
         "deployment": "deployment",
         "capacity_rpm": None,
+        "current_rpm": 1.0,
         "last_status": "429",
         "rate_limited": 1,
         "last_throttle_rpm": 1.0,
     })
-    text = _detail(route, 80, 20).plain
-    assert "尚无完成样本" in text, text
-    assert "1.0 RPM 时限流" in text, text
+    output = StringIO()
+    Console(file=output, width=80, color_system=None).print(
+        _route_rows([route], 80, {route.key: "deployment"}, {}, True))
+    text = output.getvalue()
+    assert "尚无完成样本" not in text, text
+    assert len(text.splitlines()) == 1, text
+    assert text.split()[1:3] == ["·", "1"], text
+    assert text.split()[-2] == "0", text
 
 
 def test_legacy_qps_capacity_is_converted_to_rpm():
@@ -2141,7 +2149,7 @@ def test_rpm_window_config_accepts_legacy_name_and_prefers_new_name():
 def test_routes_and_dashboard_use_rpm_names():
     sys.path.insert(0, ROOT)
     from tui.bars import legend
-    from tui.boards import _detail
+    from tui.boards import _usage_number
     from tui.snapshot import Snapshot
 
     a = FakeAzure("alpha").start()
@@ -2162,7 +2170,7 @@ def test_routes_and_dashboard_use_rpm_names():
             snapshot = Snapshot({"routes": report})
             view = snapshot.sources[0].routes[0]
             assert view.rpm_load == 1.0
-            assert "RPM" in _detail(view, 100, 0).plain
+            assert _usage_number(view.current_rpm) == "2"
             assert "RPM" in legend().plain
             _status, feed = p.get("/events")
             capacities = [e for e in feed["events"] if e["kind"] == "capacity"]
@@ -2176,7 +2184,7 @@ def test_routes_and_dashboard_use_rpm_names():
 
 def test_dashboard_reads_legacy_qpm_snapshots_as_rpm():
     sys.path.insert(0, ROOT)
-    from tui.boards import _detail, _event_change
+    from tui.boards import _usage_number, _event_change
     from tui.snapshot import RouteView, Snapshot
 
     data = {"current_qpm": 2.0, "capacity_qpm": 4.0, "other_qpm": 1.0,
@@ -2194,7 +2202,7 @@ def test_dashboard_reads_legacy_qpm_snapshots_as_rpm():
     assert view.rpm_load == 0.75
     assert view.rpm_other_load == 0.25
     assert view.rpm_load_by_face == {"chat": 0.5}
-    assert "RPM" in _detail(view, 100, 0).plain
+    assert _usage_number(view.current_rpm) == "2"
     assert "QPM" not in snapshot.events[0]["message"]
     assert "1.0 RPM" in _event_change(snapshot.events[0], 100).plain
     # New fields win during a mixed-version rollout; input stays untouched.
@@ -2215,10 +2223,10 @@ def test_dashboard_rightmost_column_shows_maximum_rpm():
     from tui.boards import _source_card, _model_card
     from tui.snapshot import Snapshot
 
-    assert rpm_capacity(None).plain == "—"
-    assert rpm_capacity(0.0).plain == "0.0 RPM"
-    assert rpm_capacity(2.5).plain == "2.5 RPM"
-    assert rpm_capacity(12000).plain == "12k RPM"
+    assert rpm_capacity(None).plain == "MAX RPM: —"
+    assert rpm_capacity(0.0).plain == "MAX RPM: 0.0"
+    assert rpm_capacity(2.5).plain == "MAX RPM: 2.5"
+    assert rpm_capacity(12000).plain == "MAX RPM: 12k"
     table = {}
     for deployment, capacity in (("small", 2.5), ("medium", 999.5),
                                   ("large", 12000), ("unknown", None)):
@@ -2242,7 +2250,7 @@ def test_dashboard_rightmost_column_shows_maximum_rpm():
                 assert "%" not in rendered, rendered
                 lines = rendered.splitlines()
                 assert all(cell_len(line) <= width for line in lines), rendered
-                for value in ("2.5 RPM", "999.5 RPM", "12k RPM", "—"):
+                for value in ("2.5", "999.5", "12k", "—"):
                     assert any(line.rstrip(" │").endswith(value) for line in lines), \
                         (value, width, detail, rendered)
 

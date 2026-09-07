@@ -1,7 +1,7 @@
 """The capacity bar: learned safe RPM and who is spending it.
 
-    ███▓▓▒▒▚░░░░····················
-    └── ours ──┘└frn┘└──── free ────┘
+    ███▓▓▒▒▥····················░░░░
+    └ ours ┘└────── free ──────┘└frn┘
 
 The ceiling is the largest RPM this proxy has completed without a rate limit.
 It only grows and survives restarts. If a later limit arrives below that value,
@@ -66,27 +66,30 @@ def capacity_bar(width: int, by_face: Optional[Dict[str, float]],
     for name, n in zip(FACES, cells):
         if n:
             bar.append(theme.FACE_GLYPH.get(name, "█") * n, style=theme.OURS)
+    if cells[len(FACES) + 1]:
+        bar.append(theme.FREE_GLYPH * cells[len(FACES) + 1], style=theme.FREE)
+    # Outside usage stays anchored to the right; reclaiming it opens space
+    # toward our traffic on the left.
     if cells[len(FACES)]:
         bar.append(theme.FOREIGN_GLYPH * cells[len(FACES)],
                    style=theme.FOREIGN)
-    if cells[len(FACES) + 1]:
-        bar.append(theme.FREE_GLYPH * cells[len(FACES) + 1], style=theme.FREE)
     return bar
 
 
-def rpm_capacity(value: Optional[float]) -> Text:
+def rpm_capacity(value: Optional[float], label: bool = True) -> Text:
     """The learned maximum beside a capacity bar, in requests per minute."""
+    out = Text("MAX RPM: " if label else "", style=theme.DIM, no_wrap=True)
     if value is None:
-        return Text("—", style=theme.DIM)
-    label = ("{:.1f} RPM".format(value) if value < 1000
-             else si(value, " RPM"))
-    return Text(label, style=theme.LABEL)
+        out.append("—", style=theme.DIM)
+    else:
+        label = "{:.1f}".format(value) if value < 1000 else si(value)
+        out.append(label, style=theme.ACCENT)
+    return out
 
 
 def legend() -> Text:
     """The key. Shown once in the footer, not once per bar."""
     out = Text()
-    out.append("current ", style=theme.LABEL)
     for name in FACES:
         out.append(theme.FACE_GLYPH[name], style=theme.OURS)
         out.append("{} ".format(theme.FACE_LABEL[name]), style=theme.DIM)

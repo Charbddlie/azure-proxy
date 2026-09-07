@@ -14,11 +14,13 @@ one heading it must look equally busy under the other.
 
 from typing import List, Optional
 
+import math
 import time
 
 from rich.console import Group as RichGroup
 from rich.cells import cell_len
 from rich.panel import Panel
+from rich.segment import Segment, SegmentLines
 from rich.table import Table
 from rich.text import Text
 
@@ -26,28 +28,19 @@ from proxy.events import LEVELS, LEVEL_RANK, PROBLEM_KINDS, event_level
 from .event_text import kind_label, message as event_message
 
 from . import theme
-from .bars import capacity_bar, rpm_capacity
+from .bars import capacity_bar, rpm_capacity, si
 from .layout import column_widths, rows, truncate
 from .snapshot import Group, RouteView, Snapshot
 
-BOARDS = ("sources", "models", "events")
-BOARD_TITLES = {"sources": "源", "models": "模型", "events": "事件流"}
+BOARDS = ("sources", "models", "events", "proxy")
+BOARD_TITLES = {"sources": "源", "models": "模型", "events": "事件流", "proxy": "proxy 状态"}
 
-# Below this a card cannot hold a name, a bar and a capacity on one line, so
-# the grid stops adding columns and lets the cards get wider instead.
 MIN_CARD = 46
+CARD_WIDTH_SCALE = 1.5
+ROW_GAP = 1
+CARD_SIDE_PADDING = 2
 
-# How much of a card's inner width the bar may take. The rest is the row label
-# and the capacity, both of which have a floor — a bar that grew until the
-# name beside it was three letters would be a very precise picture of something
-# unidentifiable.
-BAR_SHARE = 0.45
 BAR_MIN = 8
-
-
-def _bar_width(inner: int, label_width: int, capacity_width: int) -> int:
-    spare = inner - label_width - capacity_width - 2  # two column gaps
-    return max(BAR_MIN, min(int(inner * BAR_SHARE), spare))
 
 
 # --------------------------------------------------------------------------
@@ -91,168 +84,124 @@ def _labels(routes: List[RouteView], kind: str) -> dict:
 
 
 def _route_rows(routes: List[RouteView], width: int, labels: dict,
-                suffix: dict, detail: bool):
-    """The body of a card: one row per route, plus a detail line if it fits.
+                pins: dict, detail: bool):
+    """Names, pins, our usage, bars, outside usage and ceilings share one row."""
+    capacities = {route.key: rpm_capacity(route.capacity_rpm, label=False) for route in routes}
+    pin_cells = {key: _pinned_value(value) for key, value in pins.items()}
+    ours = {route.key: Text(_usage_number(route.current_rpm), style=theme.OURS) for route in routes}
+    others = {route.key: Text(_usage_number(route.other_rpm), style=theme.FOREIGN) for route in routes}
+    capacity_width = max([4] + [text.cell_len for text in capacities.values()])
+    pin_width = max([2] + [text.cell_len for text in pin_cells.values()])
+    ours_width = max([1] + [text.cell_len for text in ours.values()])
+    others_width = max([1] + [text.cell_len for text in others.values()])
+    available = max(2, width - pin_width - capacity_width - ours_width - others_width - 5)
+    bar_min = min(BAR_MIN, available - 1)
+    desired_label_width = max([10] + [cell_len(labels.get(route.key, route.key)) for route in routes])
+    label_width = max(1, min(desired_label_width, 36, available - bar_min))
+    bar_width = available - label_width
 
-    Takes the rows to draw rather than the group they came from, because the
-    two cards choose their rows differently — a source card drops idle legacy
-    deployments, a model card shows every source it has. Passing the group
-    would put that choice in here, twice.
+    table = Table.grid(padding=(0, 1))
+    table.add_column(width=label_width, no_wrap=True)
+    table.add_column(width=pin_width, justify="right", no_wrap=True)
+    table.add_column(width=ours_width, justify="right", no_wrap=True)
+    table.add_column(width=bar_width, no_wrap=True)
+    table.add_column(width=others_width, justify="right", no_wrap=True)
+    table.add_column(width=capacity_width, justify="right", no_wrap=True)
 
-    The bar row is a three-column grid; the detail line is NOT part of it. A
-    long cell in a `Table.grid` grows its column and pushes the fixed-width
-    ones off the end — the capacity column vanished entirely the first time
-    this was one table — so the wide line gets its own full-width row and is
-    truncated to the card by hand.
-
-    `detail` is dropped first when the terminal gets short, before anything is
-    truncated. The bar and the maximum RPM are the card; the second line is
-    commentary on them.
-    """
-    capacities = {route.key: rpm_capacity(route.capacity_rpm) for route in routes}
-    capacity_width = max([8] + [cell_len(text.plain)
-                                for text in capacities.values()])
-    label_width = max(10, min(22, width - BAR_MIN - capacity_width - 2))
-    bar_width = _bar_width(width, label_width, capacity_width)
-
-    lines = []
-    for route in Snapshot.sorted_routes(routes):
+    for index, route in enumerate(Snapshot.sorted_routes(routes)):
+        if index:
+            for _ in range(ROW_GAP):
+                table.add_row(*(Text("") for _ in range(6)))
         label = labels.get(route.key, route.key)
-        tail = suffix.get(route.key, "")
-        if tail:
-            label = "{} {}".format(label, tail)
-        row = Table.grid(padding=(0, 1), expand=True)
-        row.add_column(width=label_width, no_wrap=True)
-        row.add_column(width=bar_width, no_wrap=True)
-        row.add_column(justify="right", width=capacity_width, no_wrap=True)
-        row.add_row(Text(truncate(label, label_width),
-                         style=theme.TEXT if route.busy else theme.LABEL),
-                    capacity_bar(bar_width, route.rpm_load_by_face,
-                                 route.rpm_other_load),
-                    capacities[route.key])
-        lines.append(row)
-        if detail:
-            # Indented to start where the bar starts, so the numbers sit under
-            # the picture they describe rather than under the name.
-            lines.append(_detail(route, width, label_width + 1))
-    return RichGroup(*lines)
+        label_style = theme.TEXT if route.busy else theme.LABEL
+        table.add_row(Text(truncate(label, label_width), style=label_style),
+                      pin_cells.get(route.key, _pinned_value(None)),
+                      ours[route.key],
+                      capacity_bar(bar_width, route.rpm_load_by_face, route.rpm_other_load),
+                      others[route.key],
+                      capacities[route.key])
+    return table
 
 
-def _detail(route: RouteView, width: int, indent: int) -> Text:
-    """Current, outside and learned-safe RPM for one route."""
-    indent = max(0, min(indent, width - 12))
-    out = Text(" " * indent, style=theme.DIM, no_wrap=True)
-    budget = width - indent
-
-    def room(text: str) -> bool:
-        # Cells, not characters: the fixed clauses below are Chinese, which is
-        # two columns per glyph, and measuring them with len() would let the
-        # line run a clause past the edge of the card.
-        return cell_len(out.plain) - indent + cell_len(text) <= budget
-
-    if route.capacity_rpm is None:
-        out.append("尚无完成样本", style=theme.DIM)
-        if route.data.get("last_status") == "timeout":
-            rpm = route.data.get("last_timeout_rpm")
-            clause = ("· {:.1f} RPM 时超时".format(rpm)
-                      if rpm is not None else "· 最近超时")
-            if room(" " + clause):
-                out.append(" " + clause, style=theme.CRIT)
-        elif route.data.get("rate_limited", 0) > 0:
-            rpm = route.data.get("last_throttle_rpm")
-            clause = ("· {:.1f} RPM 时限流".format(rpm)
-                      if rpm is not None else "· 已限流")
-            if room(" " + clause):
-                out.append(" " + clause, style=theme.WARN)
-        return out
-
-    out.append("当前 ", style=theme.DIM)
-    out.append("{:.1f}".format(route.current_rpm), style=theme.OURS)
-    out.append(" · others ", style=theme.DIM)
-    out.append("{:.1f}".format(route.other_rpm), style=theme.FOREIGN)
-    clause = " · 最大安全 {:.1f} RPM".format(route.capacity_rpm or 0.0)
-    if room(clause):
-        out.append(clause, style=theme.DIM)
-
-    if route.parked > 0 and room(" parked 00s"):
-        out.append("  parked {:.0f}s".format(route.parked), style=theme.CRIT)
-    return out
+def _pinned_value(count):
+    return Text(str(count) if count else "·",
+                style=theme.PINNED, no_wrap=True)
 
 
-def _source_card(group: Group, width: int, detail: bool, pinned: int,
+def _card_title(group):
+    title = Text(group.name, style=theme.TITLE)
+    if group.kind == "source" and group.priority is not None:
+        title.append(" p{}".format(group.priority), style=theme.DIM)
+    return title
+
+
+def _card_summary(group, details, pinned):
+    maximum = rpm_capacity(group.capacity_rpm if any(
+        r.capacity_rpm is not None for r in group.routes) else None)
+    summary = Text("{} pinned".format(pinned if pinned else "·"),
+                   style=theme.PINNED, no_wrap=True, overflow="ellipsis")
+    if details.plain:
+        if summary.plain:
+            summary.append(" · ", style=theme.DIM)
+        summary.append(details)
+    row = Table.grid(padding=(0, 1), expand=True)
+    row.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    row.add_column(width=maximum.cell_len, justify="right", no_wrap=True)
+    row.add_row(summary, maximum)
+    return row
+
+
+def _row_pins(routes, snapshot, model=None):
+    """Each deployment displays the shared endpoint/model binding count."""
+    return {route.key: snapshot.pinned(model or route.model or route.deployment, route.endpoint)
+            for route in routes}
+
+
+def _usage_number(value):
+    return (si(value) if abs(value) >= 1000 else "{:.1f}".format(value)).replace(".0", "")
+
+
+def _source_card(group: Group, width: int, detail: bool, pinned: Optional[int],
                  snapshot: Snapshot, show_all: bool) -> Panel:
     rows_shown = snapshot.visible_routes(group.routes, show_all)
 
-    title = Text()
-    title.append(group.name, style=theme.TITLE)
-    if group.priority is not None:
-        title.append(" p{}".format(group.priority), style=theme.DIM)
+    title = _card_title(group)
 
     subtitle = Text()
-    subtitle.append("{}/{} 在用".format(group.active, len(group.routes)),
-                    style=theme.LABEL if group.active else theme.DIM)
-    if group.capacity_rpm:
-        subtitle.append(" · 最大安全 {:.1f} RPM".format(group.capacity_rpm),
-                        style=theme.DIM)
-    if pinned:
-        # Sessions carrying encrypted reasoning cannot be moved off the endpoint
-        # that produced it. A source with pins is one the balancer has less say
-        # over than its weights suggest, which is worth seeing next to them.
-        subtitle.append(" · {} pinned".format(pinned), style=theme.ACCENT)
-    if group.troubled:
-        subtitle.append(" · {} demoted".format(group.troubled),
-                        style=theme.WARN)
     hidden = len(group.routes) - len(rows_shown)
     if hidden:
-        # Said here as well as in the footer, because `x/y 在用` above counts
-        # every deployment on the endpoint: without this the header's total
-        # would disagree with the rows underneath it and look like a bug.
-        subtitle.append(" · 隐藏 {} 旧".format(hidden), style=theme.DIM)
+        subtitle.append("隐藏 {} 旧".format(hidden), style=theme.DIM)
+    if group.troubled:
+        subtitle.append((" · " if subtitle.plain else "") + "{} demoted".format(group.troubled),
+                        style=theme.WARN)
 
-    body = _route_rows(rows_shown, width - 4, _labels(rows_shown, "source"),
-                       {}, detail)
-    return Panel(RichGroup(subtitle, body), title=title, width=width,
+    body = _route_rows(rows_shown, width - 2 - 2 * CARD_SIDE_PADDING, _labels(rows_shown, "source"),
+                       _row_pins(rows_shown, snapshot), detail)
+    return Panel(RichGroup(_card_summary(group, subtitle, pinned),
+                           *([Text("")] if rows_shown else []), body),
+                 title=title, width=width,
                  border_style=theme.severity(
                      _load_or_none(group.peak_rpm_load)),
-                 padding=(0, 1))
+                 padding=(0, CARD_SIDE_PADDING, 1, CARD_SIDE_PADDING))
 
 
 def _model_card(group: Group, width: int, detail: bool,
                 snapshot: Snapshot) -> Panel:
-    title = Text()
-    title.append(group.name, style=theme.TITLE)
+    title = _card_title(group)
 
     subtitle = Text()
-    sessions = snapshot.model_sessions(group.name)
-    total_sessions = sessions.get("total") or 0
-    if snapshot.affinity.get("mode") == "endpoint":
-        subtitle.append("{} deployments".format(len(group.routes)), style=theme.LABEL)
-    else:
-        subtitle.append("{} session".format(total_sessions),
-                        style=theme.ACCENT if total_sessions else theme.DIM)
-    types = sessions.get("types") or {}
-    if types:
-        subtitle.append(" · " + "/".join(
-            "{} {}".format(name, count)
-            for name, count in sorted(types.items())), style=theme.LABEL)
-    subtitle.append(" · {} 个源".format(len({route.endpoint for route in group.routes})), style=theme.LABEL)
-    if group.faces:
-        subtitle.append(" · {}".format("+".join(group.faces)), style=theme.DIM)
-    if group.capacity_rpm:
-        subtitle.append(" · 最大安全 {:.1f} RPM".format(group.capacity_rpm),
-                        style=theme.DIM)
-    if group.released:
-        subtitle.append(" · {}".format(group.released), style=theme.DIM)
     if group.troubled:
-        subtitle.append(" · {} demoted".format(group.troubled),
+        subtitle.append("{} demoted".format(group.troubled),
                         style=theme.WARN)
 
-    body = _route_rows(group.routes, width - 4, _labels(group.routes, "model"),
-                       {}, detail)
-    return Panel(RichGroup(subtitle, body), title=title, width=width,
+    body = _route_rows(group.routes, width - 2 - 2 * CARD_SIDE_PADDING, _labels(group.routes, "model"),
+                       _row_pins(group.routes, snapshot, group.name), detail)
+    return Panel(RichGroup(_card_summary(group, subtitle, snapshot.pinned(group.name)),
+                           *([Text("")] if group.routes else []), body),
+                 title=title, width=width,
                  border_style=theme.severity(
                      _load_or_none(group.peak_rpm_load)),
-                 padding=(0, 1))
+                 padding=(0, CARD_SIDE_PADDING, 1, CARD_SIDE_PADDING))
 
 
 def _load_or_none(value: float) -> Optional[float]:
@@ -279,6 +228,47 @@ def _grid(cards, widths, gap: int = 2) -> Table:
     return table
 
 
+class _SourceColumns:
+    """Pack measured source cards into balanced, independently flowing columns."""
+
+    def __init__(self, groups, widths, detail, snapshot, show_all):
+        self.groups, self.widths, self.detail = groups, widths, detail
+        self.snapshot, self.show_all = snapshot, show_all
+
+    def __rich_console__(self, console, options):
+        widths = self.widths
+        pins = self.snapshot.affinity.get("sessions_per_endpoint") or {}
+
+        def render_card(group, width):
+            count = pins.get(group.name, 0 if "sessions_per_endpoint" in self.snapshot.affinity else None)
+            card = _source_card(group, width, self.detail, count, self.snapshot, self.show_all)
+            return console.render_lines(card, options.update(width=width, height=None))
+
+        measured = [(group, render_card(group, min(widths))) for group in self.groups]
+        measured.sort(key=lambda item: -len(item[1]))
+        columns = [[] for _ in widths]
+        for group, lines in measured:
+            column = min(range(len(widths)), key=lambda i: len(columns[i]))
+            width = widths[column]
+            if width != min(widths):
+                lines = render_card(group, width)
+            if columns[column]:
+                columns[column].append([Segment(" " * width)])
+            columns[column].extend(lines)
+        yield _grid([SegmentLines(lines, new_lines=True) for lines in columns], widths)
+
+
+def _card_widths(width, snapshot, show_all):
+    """Widen the shared source/model grid, then fit whole columns to the terminal."""
+    reference = snapshot.sources or snapshot.visible_groups(snapshot.models, show_all)
+    min_card = max(MIN_CARD, min(80, max((cell_len(g.name) + 20 for g in reference), default=MIN_CARD)))
+    original = column_widths(width, len(reference), min_card)
+    if not original:
+        return original
+    target = math.ceil(sum(original) / len(original) * CARD_WIDTH_SCALE)
+    return column_widths(width, len(reference), target)
+
+
 def render_groups(groups: List[Group], width: int, height: int, offset: int,
                   sort: str, snapshot: Snapshot, kind: str,
                   show_all: bool = False):
@@ -288,23 +278,15 @@ def render_groups(groups: List[Group], width: int, height: int, offset: int,
     if not ordered:
         return Text("no routes — has the probe been run?", style=theme.DIM), 0
 
-    widths = column_widths(width, len(ordered), MIN_CARD)
+    widths = _card_widths(width, snapshot, show_all)
     per_row = len(widths)
-    # A detail line doubles a card's height. Worth it when there is room, and
-    # the first thing to go when there is not — the bars stay legible either way.
-    card_rows = -(-len(ordered) // per_row)
-    detail = height >= card_rows * 3 + 4 or per_row <= 2
+    if kind == "source":
+        return _SourceColumns(ordered, widths, False, snapshot, show_all), len(ordered)
 
-    pins = (snapshot.affinity or {}).get("sessions_per_endpoint") or {}
     cards = []
     for index, group in enumerate(ordered):
         card_width = widths[index % per_row]
-        if kind == "source":
-            cards.append(_source_card(group, card_width, detail,
-                                      pins.get(group.name, 0),
-                                      snapshot, show_all))
-        else:
-            cards.append(_model_card(group, card_width, detail, snapshot))
+        cards.append(_model_card(group, card_width, False, snapshot))
 
     banded = rows(cards, per_row)
     visible = banded[offset:]
@@ -317,7 +299,7 @@ def render_groups(groups: List[Group], width: int, height: int, offset: int,
 # --------------------------------------------------------------------------
 
 EVENT_FILTERS = ("DEBUG+", "INFO+", "WARNING+", "ERROR")
-DEFAULT_EVENT_FILTER = LEVEL_RANK["warning"]
+DEFAULT_EVENT_FILTER = LEVEL_RANK["info"]
 EVENT_KIND_FILTERS = ("全部类型", "问题类型", "他人流量")
 
 
@@ -343,34 +325,29 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
     "what just went wrong", and a stream that scrolls under the cursor cannot
     be read at all. Nothing auto-follows; the top is always now.
 
-    The rightmost column is fixed and is what the event CHANGED — the revised
-    estimate of other tenants, the parking window, the endpoint failed over to.
-    It has its own column rather than living at the end of the message because
-    when it was part of the message it was the first thing truncated away, and
-    it is the most important thing on the line: the message says what happened,
-    this says what the proxy now believes differently.
+    Request direction and state changes share a bounded context column. The route
+    already identifies the deployment; events without a route fall back to the
+    requested model. Column widths stay stable while scrolling, and extra room
+    on wide terminals goes to the trailing explanation.
     """
     shown = list(reversed(filter_events(events, filter_mode, kind_mode)))
 
     if not shown and not dropped:
-        return Text("没有匹配事件（f 切换等级，t 切换类型）", style=theme.DIM), 0
+        return Text("没有匹配事件", style=theme.DIM), 0
 
-    change_width = 26 if width >= 100 else 0
-    where_width = min(34, max(12, width // 4))
     level_width = 5 if width >= 90 else 1
+    # Keep the explanation close to the route, including on wide terminals.
+    fixed_width = 8 + 1 + level_width + 10 + 5
+    message_width = max(12, min(48, width // 4))
+    context_width = min(52, max(1, width - fixed_width - message_width))
 
     table = Table.grid(padding=(0, 1), expand=True)
     table.add_column(width=8, no_wrap=True)              # time
     table.add_column(width=1, no_wrap=True)              # mark
     table.add_column(width=level_width, no_wrap=True)    # severity
     table.add_column(width=10, no_wrap=True)             # kind
-    table.add_column(width=where_width, no_wrap=True)    # where
+    table.add_column(width=context_width, no_wrap=True)  # direction / state / route
     table.add_column(ratio=1, no_wrap=True)              # what happened
-    if change_width:
-        table.add_column(width=change_width, no_wrap=True)   # what changed
-
-    def row(*cells):
-        table.add_row(*(cells if change_width else cells[:6]))
 
     for event in shown[offset:offset + max(1, height)]:
         kind = event.get("kind", "?")
@@ -379,17 +356,12 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
         colour = _level_style(level)
         label = "WARN" if level == "warning" else level.upper()
         stamp = time.strftime("%H:%M:%S", time.localtime(event.get("at", 0)))
-        where = event.get("route") or event.get("endpoint") or ""
-        model = event.get("model")
-        if model and model not in where:
-            where = "{} {}".format(where, model).strip()
-        row(Text(stamp, style=theme.DIM),
+        table.add_row(Text(stamp, style=theme.DIM),
             Text(mark, style=colour),
             Text(label if level_width == 5 else label[0], style=colour),
             Text(kind_label(event), style=colour),
-            Text(truncate(where, where_width), style=theme.TEXT),
-            _event_message(event),
-            _event_change(event, change_width))
+            _event_context(event, context_width),
+            _event_message(event))
     return table, len(shown)
 
 
@@ -404,6 +376,25 @@ def _event_message(event: dict) -> Text:
     style = _level_style(level)
     return Text(event_message(event), style=style,
                 overflow="ellipsis", no_wrap=True)
+
+
+def _event_context(event: dict, width: int) -> Text:
+    """Show the destination once, or the current route with its revised state."""
+    out = Text(no_wrap=True, overflow="ellipsis")
+    target = event.get("to_route")
+    if target:
+        out.append("↻ " if target == event.get("route") else "→ ", style=theme.DIM)
+        out.append(target, style=theme.ACCENT)
+        return out
+
+    route = event.get("route") or event.get("endpoint") or event.get("model") or ""
+    out.append(route, style=theme.TEXT)
+    change = _event_change(event, width)
+    if change.plain:
+        if route:
+            out.append(" · ", style=theme.DIM)
+        out.append(change)
+    return out
 
 
 def _event_change(event: dict, width: int) -> Text:

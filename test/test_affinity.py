@@ -1,6 +1,7 @@
 """Endpoint affinity, atomic first dispatch, recovery and failure invariants."""
 
 import concurrent.futures
+import asyncio
 import copy
 import json
 import multiprocessing
@@ -11,6 +12,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from run_tests import (CODEX_BODY, MODEL, DEPLOYMENT, Proxy, FakeAzure,
                        Behaviour, codex_turn, sticky_ask, PYTHON)
@@ -29,6 +31,72 @@ def bind_in_process(root, endpoint, queue):
 
 
 class StoreTests(unittest.TestCase):
+    def test_model_counts_are_unique_per_family_endpoint_and_persist(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = AffinityStore(root)
+            for family, endpoint in (("one", "alpha"), ("two", "alpha"), ("three", "beta")):
+                store.bind(digest(family), endpoint, endpoint, {})
+            for family, model in (("one", "sol"), ("one", "sol"), ("one", "terra"),
+                                  ("two", "terra"), ("three", "sol")):
+                store.note_model(digest(family), model)
+            store.note_model(digest("missing"), "sol")
+            expected = dict(sol=dict(total=2, endpoints=dict(alpha=1, beta=1)),
+                            terra=dict(total=2, endpoints=dict(alpha=2)))
+            self.assertEqual(store.report()["live_sessions"], 3)
+            self.assertEqual(store.report()["sessions_per_model"], expected)
+            store.close()
+            store = AffinityStore(root)
+            self.assertEqual(store.report()["sessions_per_model"], expected)
+            self.assertEqual(store.report()["unattributed_sessions"], 0)
+            store.close()
+
+    def test_expiry_rebinding_and_cleanup_retire_old_model_counts(self):
+        with tempfile.TemporaryDirectory() as root:
+            now = [1000]
+            store = AffinityStore(root, ttl=10, clock=lambda: now[0])
+            family = digest("family")
+            store.bind(family, "alpha", "alpha", {})
+            store.note_model(family, "sol")
+            now[0] += 11
+            self.assertEqual(store.report()["sessions_per_model"], {})
+            store.bind(family, "beta", "beta", {})
+            self.assertEqual(store.report()["sessions_per_model"], {})
+            store.note_model(family, "terra")
+            self.assertEqual(store.report()["sessions_per_model"],
+                             dict(terra=dict(total=1, endpoints=dict(beta=1))))
+            now[0] += 11
+            store.cleanup()
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM binding_models").fetchone()[0], 0)
+            store.close()
+
+    def test_existing_binding_database_adds_model_tracking_without_guessing(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = AffinityStore(root)
+            family = digest("existing")
+            store.bind(family, "alpha", "alpha", {"tables": {"routes": {"sol": [], "terra": []}}})
+            store.db.execute("DROP TABLE binding_models")
+            store.close()
+            store = AffinityStore(root)
+            self.assertEqual(store.get(family)["endpoint"], "alpha")
+            self.assertEqual(store.report()["sessions_per_model"], {})
+            self.assertEqual(store.report()["unattributed_sessions"], 1)
+            store.note_model(family, "sol")
+            self.assertEqual(store.report()["sessions_per_model"],
+                             dict(sol=dict(total=1, endpoints=dict(alpha=1))))
+            store.close()
+
+    def test_model_statistics_write_failure_does_not_reject_bound_request(self):
+        affinity = SessionAffinity(SimpleNamespace(affinity_keys=["header:session-id"]), "unused")
+        affinity.store = Mock()
+        affinity.store.note_model.side_effect = sqlite3.OperationalError("locked")
+        binding = dict(endpoint="alpha")
+        request = SimpleNamespace(headers={"session-id": "family"}, state=SimpleNamespace())
+        with patch.object(affinity, "resolve", return_value=(["target"], binding)):
+            routes = asyncio.run(affinity.prepare(request, dict(model="sol"), "routes"))
+        self.assertEqual(routes, ["target"])
+        self.assertEqual(request.state.affinity_binding, binding)
+        self.assertEqual(affinity.store.error, "OperationalError")
+
     def test_concurrent_processes_commit_one_winner(self):
         with tempfile.TemporaryDirectory() as root:
             AffinityStore(root).close()
@@ -162,6 +230,13 @@ class AffinityIntegrationTests(unittest.TestCase):
                 self.assertEqual(result[2]["x-azure-proxy-route"], "alpha/" + DEPLOYMENT)
             self.assertEqual(a.requests[-2]["body"]["input"], items)
             self.assertEqual(b.hits, 0)
+            for path in ("/healthz", "/routes"):
+                report = p.get(path)[1]["session_affinity"]
+                self.assertEqual(report["sessions_per_model"]["child"],
+                                 dict(total=1, endpoints=dict(alpha=1)))
+                self.assertEqual(report["sessions_per_model"][MODEL],
+                                 dict(total=1, endpoints=dict(alpha=1)))
+                self.assertEqual(report["live_sessions"], 1)
 
     def test_upstream_refusal_never_taints_or_mutates_state(self):
         failure = {"error": {"code": "invalid_encrypted_content", "message": "unchanged upstream error"}}

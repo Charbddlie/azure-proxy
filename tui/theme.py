@@ -40,6 +40,7 @@ OK = "#86a98e"
 WARN = "#c2a06a"            # muted amber
 CRIT = "#b57f83"            # muted rose
 ACCENT = "#8d9bc4"          # periwinkle: selection, the active board
+PINNED = "#bdcfea"          # pale blue: bound families, lighter than RPM values
 
 # -- severity --------------------------------------------------------------
 #
@@ -81,8 +82,8 @@ FACE_GLYPH = {
     "chat": "█",
     "chat_stream": "▓",
     "responses": "▒",
-    "responses_stream": "▚",
-    "image": "▞",
+    "responses_stream": "▥",
+    "image": "▤",
 }
 FACE_LABEL = {
     "chat": "chat",

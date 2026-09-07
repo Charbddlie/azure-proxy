@@ -1,29 +1,28 @@
-"""The dashboard itself: header, board, footer, and the keys that move between.
+"""Dashboard with line scrolling, clickable tabs, and responsive input.
 
-Two clocks, deliberately different. Data is fetched once a second on the poller's
-thread — the numbers behind it move on the scale of a load window, and polling
-faster would only make the proxy answer questions about itself. The screen
-repaints four times a second, which is what makes a keystroke feel immediate
-rather than something that happens up to a second later.
-
-Input is read with `select` on a raw stdin in the same loop as the repaint, not
-on a thread. A thread would have to hand keystrokes across, and the only thing
-it would buy is the ability to block on read — which is exactly what must not
-happen, because the screen has to keep repainting while nothing is being typed.
+The poller fetches data once a second. Idle refreshes keep ages current at 4 Hz;
+input requests an immediate frame, coalesced at up to 60 Hz. Rendered card lines
+are cached between data/layout changes so scrolling only slices the viewport.
 """
 
 import os
+import json
+import re
 import select
 import signal
 import sys
 import termios
+import time
 import tty
+from contextlib import contextmanager
+from collections import OrderedDict
 from typing import List
 
 from rich.console import Console, Group as RichGroup
 from rich.live import Live
 from rich.rule import Rule
-from rich.segment import SegmentLines
+from rich.segment import Segment, SegmentLines
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
@@ -32,63 +31,75 @@ from .bars import legend
 from .boards import (BOARD_TITLES, BOARDS, DEFAULT_EVENT_FILTER, EVENT_FILTERS,
                      EVENT_KIND_FILTERS, filter_events, render_events, render_groups)
 from .client import Poller
-from .snapshot import SORTS, Snapshot
+from .snapshot import Snapshot
 
 REDRAW_HZ = 4.0
+INPUT_HZ = 60.0
+DEFAULT_SCROLL_LINES = 2
+EVENT_ROW_CACHE_SIZE = 1024
+MOUSE_EVENT = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 
 
 class Dashboard:
 
-    def __init__(self, poller: Poller, console: Console):
+    def __init__(self, poller: Poller, console: Console, scroll_lines: int = DEFAULT_SCROLL_LINES):
+        if isinstance(scroll_lines, bool) or not isinstance(scroll_lines, int) or scroll_lines < 1:
+            raise ValueError("scroll_lines must be a positive integer")
         self.poller = poller
         self.console = console
+        self.scroll_lines = scroll_lines
         self.board = 0
-        self.offset = [0, 0, 0]         # one scroll position per board
-        self.sort = 0
+        self.offset = [0] * len(BOARDS)  # one scroll position per board
         self.filter = DEFAULT_EVENT_FILTER
         self.kind_filter = 0
         self.show_all = False
         self.quit = False
-        self._extent = [0, 0, 0]        # scrollable rows, from the last render
+        self._extent = [0] * len(BOARDS)  # valid viewport positions, from the last render
+        self._body_height = 1
+        self._tab_regions = []         # (row, first column, exclusive end, board), 1-based
+        self._button_regions = []
+        self._card_cache = {}
+        self._event_rows = OrderedDict()
+        self._can_acknowledge = False
 
-    # -- keys -------------------------------------------------------------
+    # -- input ------------------------------------------------------------
     def key(self, seq: str) -> None:
-        if seq in ("q", "Q", "\x03"):           # Ctrl-C arrives as a byte here
+        mouse = MOUSE_EVENT.fullmatch(seq)
+        if mouse:
+            button, x, y = map(int, mouse.groups()[:3])
+            if mouse.group(4) == "M":
+                if button & ~28 == 64:         # wheel up, including modifiers
+                    self._scroll(-self.scroll_lines)
+                elif button & ~28 == 65:
+                    self._scroll(self.scroll_lines)
+                elif button == 0:             # left press; releases/drags do nothing
+                    for row, start, end, board in self._tab_regions:
+                        if y == row and start <= x < end:
+                            self.board = board
+                            break
+                    for row, start, end, action in self._button_regions:
+                        if y == row and start <= x < end:
+                            self._activate_button(action)
+                            break
+        elif seq == "\x03":
             self.quit = True
-        elif seq in ("\x1b[C", "l", "\t"):
-            self.board = (self.board + 1) % len(BOARDS)
-        elif seq in ("\x1b[D", "h"):
-            self.board = (self.board - 1) % len(BOARDS)
-        elif seq in ("\x1b[B", "j"):
-            self._scroll(1)
-        elif seq in ("\x1b[A", "k"):
-            self._scroll(-1)
-        elif seq in ("\x1b[6~", " "):
-            self._scroll(10)
-        elif seq == "\x1b[5~":
-            self._scroll(-10)
-        elif seq in ("g", "\x1b[H"):
-            self.offset[self.board] = 0
-        elif seq in ("G", "\x1b[F"):
-            self.offset[self.board] = max(0, self._extent[self.board] - 1)
-        elif seq == "s":
-            self.sort = (self.sort + 1) % len(SORTS)
-        elif seq == "f":
+
+    def _activate_button(self, action: str) -> None:
+        if action == "cycle_level" and self.board == 2:
             self.filter = (self.filter + 1) % len(EVENT_FILTERS)
             self.offset[2] = 0
-        elif seq == "t":
+        elif action == "cycle_kind" and self.board == 2:
             self.kind_filter = (self.kind_filter + 1) % len(EVENT_KIND_FILTERS)
             self.offset[2] = 0
-        elif seq == "a":
+        elif action == "toggle_legacy" and self.board in (0, 1):
             self.show_all = not self.show_all
             # The list just got longer or shorter under the cursor. Keeping the
             # old offset would leave it pointing at a row that is no longer
             # there, which reads as the board having jumped on its own.
             self.offset[0] = self.offset[1] = 0
-        elif seq == "r":
-            self.poller.refresh_now()
-        elif seq == "c":
+        elif action == "acknowledge_gap" and self.board == 2 and self._can_acknowledge:
             self.poller.acknowledge_gap()
+            self._can_acknowledge = False
 
     def _scroll(self, delta: int) -> None:
         limit = max(0, self._extent[self.board] - 1)
@@ -97,30 +108,65 @@ class Dashboard:
 
     # -- rendering --------------------------------------------------------
     def render(self):
-        snapshot = Snapshot(self.poller.snapshot())
+        raw = self.poller.snapshot()
+        snapshot = Snapshot(raw)
+        self._can_acknowledge = bool(snapshot.gap)
         width = self.console.width
-        header = RichGroup(_header(snapshot), _processes(snapshot), _event_notice(snapshot),
+        header = RichGroup(_top_bar(snapshot, width, getattr(self.poller, "base_url", None)),
+                           Text(""),
                            _tabs(self.board, snapshot, self.show_all, self.filter,
                                  self.kind_filter), Rule(style=theme.BORDER))
         footer = _footer(self, snapshot, self._extent[self.board])
         options = self.console.options.update(height=None)
-        header_height = len(self.console.render_lines(header, options, pad=False))
+        header_lines = self.console.render_lines(header, options)
+        self._tab_regions = _hit_regions(header_lines, "tab")
+        header_height = len(header_lines)
         footer_height = len(self.console.render_lines(footer, options, pad=False))
         chrome_height = header_height + footer_height
         body_height = max(1, self.console.height - chrome_height)
 
         def render_body(height):
             if self.board == 2:
-                return render_events(
-                    snapshot.events, width, height, self.offset[2],
-                    self.filter, snapshot.dropped, self.kind_filter)
-            if self.board == 1:
-                return render_groups(
-                    snapshot.models, width, height, self.offset[1],
-                    SORTS[self.sort], snapshot, "model", self.show_all)
-            return render_groups(
-                snapshot.sources, width, height, self.offset[0],
-                SORTS[self.sort], snapshot, "source", self.show_all)
+                shown = list(reversed(filter_events(snapshot.events, self.filter, self.kind_filter)))
+                count = len(shown)
+                extent = max(0, count - height) + 1 if count else 0
+                self.offset[2] = min(self.offset[2], max(0, extent - 1))
+                if not shown:
+                    body, _ = render_events([], width, height, 0, self.filter,
+                                            snapshot.dropped, self.kind_filter)
+                    return self.console.render_lines(body, options.update(height=height)), extent
+                lines = []
+                for event in shown[self.offset[2]:self.offset[2] + height]:
+                    key = (width, json.dumps(event, sort_keys=True, ensure_ascii=False))
+                    if key not in self._event_rows:
+                        row, _ = render_events([event], width, 1, 0, 0, False)
+                        self._event_rows[key] = self.console.render_lines(row, options.update(height=1))[0]
+                        if len(self._event_rows) > EVENT_ROW_CACHE_SIZE:
+                            self._event_rows.popitem(last=False)
+                    self._event_rows.move_to_end(key)
+                    lines.append(self._event_rows[key])
+                lines += [[Segment(" " * width)]] * (height - len(lines))
+                return lines, extent
+
+            if self.board == 3:
+                lines = self.console.render_lines(_proxy_status(snapshot), options)
+                return self._viewport(lines, height, width)
+
+            # Poller replaces published route documents. Keep their rendered
+            # lines until the data or layout changes, independently per board.
+            cache_key = (raw.get("routes"), snapshot.affinity, width, height,
+                         self.show_all)
+            cached = self._card_cache.get(self.board)
+            if cached is None or cached[0] != cache_key:
+                body, _ = render_groups(
+                    snapshot.models if self.board == 1 else snapshot.sources,
+                    width, height, 0, "activity", snapshot,
+                    "model" if self.board == 1 else "source", self.show_all)
+                lines = self.console.render_lines(body, options)
+                self._card_cache[self.board] = (cache_key, lines)
+            else:
+                lines = cached[1]
+            return self._viewport(lines, height, width)
 
         body, extent = render_body(body_height)
         footer = _footer(self, snapshot, extent)
@@ -131,26 +177,95 @@ class Dashboard:
             body, extent = render_body(body_height)
             footer = _footer(self, snapshot, extent)
         self._extent[self.board] = extent
+        self._body_height = body_height
 
-        # Bound the scrollable cards so process status and freshness remain visible.
-        body = SegmentLines(self.console.render_lines(body, options.update(height=body_height)),
+        footer_lines = self.console.render_lines(footer, options)
+        self._button_regions = _hit_regions(
+            footer_lines[:max(0, self.console.height - header_height - body_height)],
+            "action", header_height + body_height + 1)
+        return SegmentLines((header_lines + body + footer_lines)[:self.console.height],
                             new_lines=True)
-        return RichGroup(header, body, footer)
+
+    def _viewport(self, lines, height, width):
+        extent = max(0, len(lines) - height) + 1
+        self.offset[self.board] = min(self.offset[self.board], extent - 1)
+        start = self.offset[self.board]
+        visible = lines[start:start + height]
+        visible += [[Segment(" " * width)]] * (height - len(visible))
+        return visible, extent
 
     # -- loop -------------------------------------------------------------
     def run(self) -> None:
-        interval = 1.0 / REDRAW_HZ
-        with Live(self.render(), console=self.console, screen=True,
-                  refresh_per_second=REDRAW_HZ, transient=False) as live:
+        reader = _InputReader()
+        with _mouse_tracking(self.console), Live(
+                self.render(), console=self.console, screen=True,
+                auto_refresh=False, transient=False) as live:
+            next_refresh = time.monotonic() + 1.0 / REDRAW_HZ
+            next_frame = 0.0
+            dirty = False
             while not self.quit:
-                for seq in _read_keys(interval):
+                now = time.monotonic()
+                deadline = next_frame if dirty else next_refresh
+                keys = reader.read(max(0.0, deadline - now))
+                for seq in keys:
                     self.key(seq)
-                live.update(self.render())
+                dirty = dirty or bool(keys)
+                now = time.monotonic()
+                if self.quit:
+                    break
+                if (dirty or now >= next_refresh) and now >= next_frame:
+                    next_frame = now + 1.0 / INPUT_HZ
+                    live.update(self.render(), refresh=True)
+                    next_refresh = time.monotonic() + 1.0 / REDRAW_HZ
+                    dirty = False
 
 
 # --------------------------------------------------------------------------
 # chrome
 # --------------------------------------------------------------------------
+
+def _hit_regions(lines, metadata, first_row=1):
+    regions = []
+    for y, line in enumerate(lines, first_row):
+        x = 1
+        for segment in line:
+            end = x + segment.cell_length
+            value = segment.style.meta.get(metadata) if segment.style else None
+            if value is not None:
+                regions.append((y, x, end, value))
+            x = end
+    return regions
+
+
+def _freshness(snapshot: Snapshot) -> Text:
+    out = Text(no_wrap=True, overflow="ellipsis")
+    age = snapshot.age
+    out.append("fetch {}".format(_duration(age) + " ago" if age is not None else "—"),
+               style=theme.CRIT if snapshot.error else theme.WARN if age is not None and age >= 5 else theme.DIM)
+    out.append("  stats {}".format(_duration(snapshot.stats_age) + " ago"
+                                  if snapshot.stats_age is not None else "—"),
+               style=theme.WARN if snapshot.stats_stale else theme.DIM)
+    if snapshot.stats_stale:
+        out.append("  stale", style=theme.WARN)
+    return out
+
+
+def _top_bar(snapshot: Snapshot, width=120, base_url=None):
+    brand = Text("azure-proxy", style="bold " + theme.TITLE, no_wrap=True, overflow="ellipsis")
+    if not isinstance(base_url, str):
+        host, port = snapshot.health.get("host"), snapshot.health.get("port")
+        base_url = "{}:{}".format(host, port) if host else ""
+    if base_url:
+        brand.append("  " + base_url.split("://", 1)[-1], style=theme.LABEL)
+    inline_status = brand.cell_len + 18 <= width - 28
+    if inline_status:
+        brand.append("  ")
+        brand.append(_status_line(snapshot))
+    table = Table.grid(padding=(0, 2), expand=True)
+    table.add_column(width=min(brand.cell_len, max(11, width - 28)), no_wrap=True)
+    table.add_column(ratio=1, justify="right", no_wrap=True)
+    table.add_row(brand, _freshness(snapshot))
+    return table if inline_status else RichGroup(table, _status_line(snapshot))
 
 def _header(snapshot: Snapshot) -> Table:
     health = snapshot.health
@@ -192,9 +307,8 @@ def _header(snapshot: Snapshot) -> Table:
     return table
 
 
-def _processes(snapshot: Snapshot) -> RichGroup:
-    """HTTP proves serving reachability; routing liveness comes from its heartbeat."""
-    serving = Text("serving ", style=theme.LABEL, no_wrap=True, overflow="ellipsis")
+def _process_states(snapshot: Snapshot):
+    """One status policy for both the compact indicators and detailed view."""
     if snapshot.health_error:
         status, style = "unreachable", theme.CRIT
     elif not snapshot.health:
@@ -203,17 +317,8 @@ def _processes(snapshot: Snapshot) -> RichGroup:
         status, style = "unconfirmed", theme.WARN
     else:
         status, style = "online", theme.OK
-    serving.append(status, style=style)
-    pid = snapshot.health.get("pid")
-    if pid is not None:
-        serving.append("  {}PID {}".format("" if status == "online" else "last ", pid),
-                       style=theme.DIM)
-    uptime = snapshot.health.get("uptime_seconds")
-    if uptime is not None:
-        serving.append("  up {}".format(_duration(uptime)), style=theme.DIM)
-
+    serving_state = (status, style)
     state = snapshot.routing
-    routing = Text("routing ", style=theme.LABEL, no_wrap=True, overflow="ellipsis")
     if (status != "online" and not snapshot.health.get("local_status")) or not state:
         route_status, style = "unknown", theme.WARN
     elif state.get("ready") is False:
@@ -224,7 +329,47 @@ def _processes(snapshot: Snapshot) -> RichGroup:
         route_status, style = "degraded", theme.WARN
     else:
         route_status, style = "online", theme.OK
-    routing.append(route_status, style=style)
+    return serving_state, (route_status, style)
+
+
+def _status_line(snapshot: Snapshot) -> Text:
+    serving, routing = _process_states(snapshot)
+    out = Text(no_wrap=True, overflow="ellipsis")
+    out.append("serving", style=serving[1])
+    out.append("  ")
+    out.append("routing", style=routing[1])
+    return out
+
+
+def _proxy_status(snapshot: Snapshot):
+    affinity = snapshot.affinity
+    pins = Text("会话绑定统计  {} pinned".format(affinity.get("live_sessions", "?")),
+                style=theme.LABEL)
+    if not affinity.get("model_tracking"):
+        pins.append("  源 × 模型明细等待 serving 升级", style=theme.DIM)
+    elif affinity.get("unattributed_sessions"):
+        pins.append("  {} 个既有会话的模型明细随后续请求补齐".format(
+            affinity["unattributed_sessions"]), style=theme.DIM)
+    errors = [Text("取数异常  " + snapshot.error, style=theme.CRIT)] if snapshot.error else []
+    return RichGroup(_header(snapshot), _processes(snapshot), pins, *errors, _event_notice(snapshot))
+
+
+def _processes(snapshot: Snapshot) -> RichGroup:
+    """HTTP proves serving reachability; routing liveness comes from its heartbeat."""
+    (status, serving_style), (route_status, routing_style) = _process_states(snapshot)
+    serving = Text("serving ", style=theme.LABEL, no_wrap=True, overflow="ellipsis")
+    serving.append(status, style=serving_style)
+    pid = snapshot.health.get("pid")
+    if pid is not None:
+        serving.append("  {}PID {}".format("" if status == "online" else "last ", pid),
+                       style=theme.DIM)
+    uptime = snapshot.health.get("uptime_seconds")
+    if uptime is not None:
+        serving.append("  up {}".format(_duration(uptime)), style=theme.DIM)
+
+    state = snapshot.routing
+    routing = Text("routing ", style=theme.LABEL, no_wrap=True, overflow="ellipsis")
+    routing.append(route_status, style=routing_style)
     pid = state.get("pid")
     if pid is not None:
         routing.append("  {}PID {}".format(
@@ -263,7 +408,7 @@ def _processes(snapshot: Snapshot) -> RichGroup:
 def _event_notice(snapshot):
     if snapshot.gap:
         labels = {"buffer_overwrite": "缓冲覆盖", "limit": "返回限额截断",
-                  "retention": "保留期清理", "legacy_unknown": "旧协议，原因未知"}
+                  "retention": "保留期清理", "legacy_unknown": "原因未知"}
         count = snapshot.gap.get("count")
         return Text("轮询期间漏读 {} 条事件：{}".format(
             count if count is not None else "未知数量",
@@ -285,84 +430,63 @@ def _tabs(active: int, snapshot: Snapshot, show_all: bool,
                          else "{}/{}".format(visible_models,
                                              len(snapshot.models))),
               "events": "{}/{}".format(len(filter_events(snapshot.events, filter_mode, kind_mode)),
-                                         len(snapshot.events))}
+                                         len(snapshot.events)), "proxy": ""}
     for index, name in enumerate(BOARDS):
-        label = " {} {} ".format(BOARD_TITLES[name], counts[name])
+        label = " {}{} ".format(BOARD_TITLES[name], " " + counts[name] if counts[name] else "")
         if index == active:
-            out.append(label, style="reverse {}".format(theme.ACCENT))
+            style = Style(color=theme.ACCENT, reverse=True, meta={"tab": index})
         else:
-            out.append(label, style=theme.DIM)
+            style = Style(color=theme.DIM, meta={"tab": index})
+        out.append(label, style=style)
         out.append(" ")
-    sessions = (snapshot.affinity or {}).get("live_sessions")
-    if sessions:
-        out.append("  {} endpoint-bound families".format(sessions), style=theme.ACCENT)
     return out
 
 
-def _footer(dash: "Dashboard", snapshot: Snapshot, extent: int) -> Table:
-    table = Table.grid(padding=(0, 2), expand=True)
-    table.add_column(ratio=1)
-    table.add_column(justify="right")
+def _footer(dash: "Dashboard", snapshot: Snapshot, extent: int):
+    keys = Text(no_wrap=True, overflow="ellipsis")
 
-    keys = Text()
-    keys.append("←/→", style=theme.ACCENT)
-    keys.append(" 看板  ", style=theme.DIM)
-    keys.append("↑/↓", style=theme.ACCENT)
-    keys.append(" 滚动  ", style=theme.DIM)
+    def button(label, action):
+        if keys.plain:
+            keys.append(" ")
+        keys.append("[{}]".format(label), style=Style(
+            color=theme.TEXT, bgcolor=theme.BORDER, meta={"action": action}))
+
     if dash.board == 2:
-        keys.append("f", style=theme.ACCENT)
-        keys.append(" {}  ".format(EVENT_FILTERS[dash.filter]), style=theme.DIM)
-        keys.append("t", style=theme.ACCENT)
-        keys.append(" {}  ".format(EVENT_KIND_FILTERS[dash.kind_filter]), style=theme.DIM)
-    else:
-        keys.append("s", style=theme.ACCENT)
-        keys.append(" {}  ".format(SORTS[dash.sort]), style=theme.DIM)
-        # Never silent. A board that leaves models out has to say how many and
-        # which key brings them back, or it reads as a complete picture that
-        # happens to be missing the model you came to look for.
+        button("等级: " + EVENT_FILTERS[dash.filter], "cycle_level")
+        button("类型: " + EVENT_KIND_FILTERS[dash.kind_filter], "cycle_kind")
+    elif dash.board in (0, 1):
         hidden = snapshot.hidden_models()
-        keys.append("a", style=theme.ACCENT)
         if dash.show_all:
-            keys.append(" 全部旧模型  ", style=theme.DIM)
-        elif hidden:
-            keys.append(" 隐藏 {} 个旧模型  ".format(hidden), style=theme.DIM)
+            button("收起旧模型", "toggle_legacy")
         else:
-            keys.append(" 无旧模型  ", style=theme.DIM)
-    keys.append("r", style=theme.ACCENT)
-    keys.append(" 刷新  ", style=theme.DIM)
-    keys.append("q", style=theme.ACCENT)
-    keys.append(" 退出", style=theme.DIM)
-    keys.append("  c 确认提示", style=theme.DIM)
+            button("显示旧模型 {}".format(hidden), "toggle_legacy")
+    if dash.board == 2 and snapshot.gap:
+        button("确认提示", "acknowledge_gap")
 
-    state = Text()
+    state = Text(no_wrap=True, overflow="ellipsis")
     if extent > 1:
         state.append("{}/{}  ".format(dash.offset[dash.board] + 1, extent),
                      style=theme.DIM)
-    age = snapshot.age
-    if snapshot.error:
-        state.append(snapshot.error[:40], style=theme.CRIT)
-    elif age is not None:
-        state.append("fetch {} ago".format(_duration(age)),
-                     style=theme.DIM if age < 5 else theme.WARN)
-    if snapshot.stats_age is not None:
-        state.append("  stats {} ago".format(_duration(snapshot.stats_age)),
-                     style=theme.WARN if snapshot.stats_stale else theme.DIM)
-    if snapshot.stats_stale:
-        state.append("  stale", style=theme.WARN)
     if snapshot.missed_events or snapshot.unknown_gaps:
         state.append("  漏读累计 {}{}".format(snapshot.missed_events,
             " + {} 次数量未知".format(snapshot.unknown_gaps) if snapshot.unknown_gaps else ""), style=theme.WARN)
 
-    if dash.console.width < 100:
-        compact = Text("←→ 看板  ↑↓ 滚动  r 刷新  c 确认提示  q 退出", style=theme.DIM,
-                       no_wrap=True, overflow="ellipsis")
-        state.no_wrap, state.overflow = True, "ellipsis"
-        return RichGroup(compact, state)
-
-    table.add_row(legend() if dash.board != 2 else keys, state)
-    if dash.board != 2:
-        table.add_row(keys, Text(""))
-    return table
+    explanation = Text(no_wrap=True, overflow="ellipsis")
+    if state.plain:
+        explanation.append(state)
+    if dash.board in (0, 1):
+        if explanation.plain:
+            explanation.append("  ")
+        explanation.append(legend())
+    width = dash.console.width
+    keys.truncate(width, overflow="ellipsis")
+    gap = 2 if keys.plain and explanation.plain else 0
+    explanation.truncate(max(0, width - keys.cell_len - gap), overflow="ellipsis")
+    line = Text(no_wrap=True, overflow="ellipsis")
+    line.append(keys)
+    line.append(" " * max(0, width - keys.cell_len - explanation.cell_len))
+    line.append(explanation)
+    return RichGroup(line, Text(""))
 
 
 def _duration(seconds: float) -> str:
@@ -380,42 +504,72 @@ def _duration(seconds: float) -> str:
 # raw input
 # --------------------------------------------------------------------------
 
-def _read_keys(timeout: float) -> List[str]:
-    """Whatever was typed inside `timeout`, as whole sequences.
+class _InputReader:
+    """Preserve partial terminal sequences across reads, including SGR mouse."""
 
-    Arrow keys arrive as three or four bytes (ESC [ A, ESC [ 5 ~). Reading one
-    byte at a time and dispatching on it would turn every arrow press into an
-    escape plus two stray letters, so the whole burst is read and split.
-    """
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    if not ready:
-        return []
+    def __init__(self):
+        self.buffer = ""
+
+    def read(self, timeout: float) -> List[str]:
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not ready:
+            return []
+        try:
+            data = os.read(sys.stdin.fileno(), 4096)
+        except OSError:
+            return []
+        return self.feed(data.decode("utf-8", "ignore")) if data else ["\x03"]
+
+    def feed(self, data: str) -> List[str]:
+        self.buffer += data
+        out = []
+        while self.buffer:
+            if self.buffer[0] != "\x1b":
+                out.append(self.buffer[0])
+                self.buffer = self.buffer[1:]
+                continue
+            if len(self.buffer) == 1:
+                break
+            if self.buffer[1] not in ("[", "O"):
+                self.buffer = self.buffer[1:]
+                continue
+            end = 2
+            while end < len(self.buffer) and " " <= self.buffer[end] <= "?":
+                end += 1
+            if end == len(self.buffer):
+                if end > 64:
+                    self.buffer = ""  # bound malformed/incomplete reports
+                break
+            if "@" <= self.buffer[end] <= "~":
+                out.append(self.buffer[:end + 1])
+                self.buffer = self.buffer[end + 1:]
+            else:
+                self.buffer = self.buffer[end:]
+        return out
+
+
+@contextmanager
+def _mouse_tracking(console: Console):
+    """Enable click/wheel reports while the TUI owns the terminal."""
+    enabled = console.is_terminal and not console.is_dumb_terminal and sys.stdin.isatty()
+    stream = console.file
     try:
-        data = os.read(sys.stdin.fileno(), 1024).decode("utf-8", "ignore")
-    except OSError:
-        return []
-
-    out: List[str] = []
-    i = 0
-    while i < len(data):
-        if data[i] == "\x1b" and i + 1 < len(data) and data[i + 1] == "[":
-            j = i + 2
-            while j < len(data) and not ("A" <= data[j] <= "Z"
-                                         or data[j] == "~"):
-                j += 1
-            out.append(data[i:j + 1])
-            i = j + 1
-        else:
-            out.append(data[i])
-            i += 1
-    return out
+        if enabled:
+            stream.write("\x1b[?1000h\x1b[?1006h")
+            stream.flush()
+        yield
+    finally:
+        if enabled:
+            stream.write("\x1b[?1000l\x1b[?1006l")
+            stream.flush()
 
 
-def run(base_url: str, interval: float = 1.0, local_root=None) -> None:
+def run(base_url: str, interval: float = 1.0, local_root=None,
+        scroll_lines: int = DEFAULT_SCROLL_LINES) -> None:
     """Poll `base_url` and draw until the user quits, or until asked to stop.
 
     SIGTERM and SIGINT are handled rather than left to the default so that both
-    turn into the same orderly exit as pressing `q`. What that buys is the
+    turn into an orderly exit. What that buys is the
     `finally` below: a viewer killed from another terminal still puts the tty
     back the way it found it, and a shell left in cbreak mode by a dashboard
     that died on the spot is a more annoying thing to inherit than whatever it
@@ -424,9 +578,9 @@ def run(base_url: str, interval: float = 1.0, local_root=None) -> None:
     Nothing here stops the proxy — this process only ever reads.
     """
     poller = Poller(base_url, interval=interval, local_root=local_root)
-    poller.start()
     console = Console()
-    dashboard = Dashboard(poller, console)
+    dashboard = Dashboard(poller, console, scroll_lines=scroll_lines)
+    poller.start()
 
     fd = sys.stdin.fileno()
     saved = None

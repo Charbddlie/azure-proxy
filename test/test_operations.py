@@ -8,6 +8,7 @@ import pty
 import pwd
 import re
 import select
+import signal
 import struct
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ import termios
 import time
 import unittest
 from unittest.mock import patch
+from rich.cells import cell_len
 
 from proxy.logfiles import handler, prune_logs
 from tools.scheduled_restart import next_run, restart
@@ -58,7 +60,7 @@ class OperationsTests(unittest.TestCase):
             p.proc.terminate(); p.proc.wait(timeout=10)
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
-            process = subprocess.Popen(["./tui.sh", "--interval", "0.1"],
+            process = subprocess.Popen(["./tui.sh", "--interval", "0.1", "--scroll-lines", "4"],
                                        cwd=ROOT, stdin=slave, stdout=slave, stderr=slave,
                                        env=dict(p.env, TERM="xterm-256color"))
             def capture(seconds):
@@ -69,6 +71,16 @@ class OperationsTests(unittest.TestCase):
                         data += os.read(master, 65536)
                 return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", data)
             try:
+                # Process details live on the fourth tab.
+                startup = b""
+                deadline = time.monotonic() + 5
+                while "proxy 状态".encode() not in startup and time.monotonic() < deadline:
+                    startup += capture(.1)
+                self.assertIn("proxy 状态".encode(), startup)
+                y, tabs = next((i + 1, line) for i, line in enumerate(startup.decode().splitlines())
+                               if "proxy 状态" in line)
+                x = cell_len(tabs[:tabs.index("proxy 状态")]) + 1
+                os.write(master, "\x1b[<0;{};{}M".format(x, y).encode())
                 offline = capture(1.2)
                 self.assertIsNone(process.poll(), offline.decode(errors="replace"))
                 self.assertIn(b"serving unreachable", offline)
@@ -79,6 +91,9 @@ class OperationsTests(unittest.TestCase):
                 recovered = capture(.8)
                 self.assertIn(b"serving online", recovered)
                 os.write(master, b"q")
+                capture(.15)
+                self.assertIsNone(process.poll())
+                process.send_signal(signal.SIGINT)
                 self.assertEqual(process.wait(timeout=5), 0)
             finally:
                 if process.poll() is None:
@@ -119,7 +134,7 @@ class OperationsTests(unittest.TestCase):
                             captured += os.read(master, 65536)
                     self.assertGreater(len(captured), start)
                     self.assertIsNone(process.poll())
-                os.write(master, b"q")
+                process.send_signal(signal.SIGINT)
                 self.assertEqual(process.wait(timeout=5), 0)
                 self.assertEqual(termios.tcgetattr(slave), original)
                 self.assertIn(b"serving", captured)

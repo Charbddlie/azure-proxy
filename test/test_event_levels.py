@@ -57,25 +57,26 @@ class EventLevelTests(unittest.TestCase):
 
     def test_default_threshold_filters_legacy_events_without_mutating_them(self):
         selected = filter_events(EVENTS, DEFAULT_EVENT_FILTER)
-        self.assertEqual([e["seq"] for e in selected], [4, 5, 7])
+        self.assertEqual([e["seq"] for e in selected], [2, 3, 4, 5, 6, 7])
         self.assertEqual(EVENTS[3]["level"], "info")
         self.assertEqual(EVENTS[4]["level"], "warning")
         self.assertEqual(len(filter_events(EVENTS, 0)), len(EVENTS))
         self.assertEqual([e["seq"] for e in filter_events(EVENTS, 3)], [5, 7])
         self.assertEqual([e["seq"] for e in filter_events(EVENTS, 1, 2)], [3])
-        self.assertFalse(filter_events(EVENTS, DEFAULT_EVENT_FILTER, 2))
+        self.assertEqual([e["seq"] for e in filter_events(EVENTS, DEFAULT_EVENT_FILTER, 2)], [3])
 
-    def test_keyboard_cycles_levels_and_types_independently(self):
+    def test_buttons_cycle_levels_and_types_independently(self):
         dashboard = Dashboard(None, Console(file=io.StringIO()))
-        self.assertEqual(EVENT_FILTERS[dashboard.filter], "WARNING+")
+        dashboard.board = 2
+        self.assertEqual(EVENT_FILTERS[dashboard.filter], "INFO+")
         dashboard.offset[2] = 99
-        dashboard.key("f")
-        self.assertEqual(EVENT_FILTERS[dashboard.filter], "ERROR")
+        dashboard._activate_button("cycle_level")
+        self.assertEqual(EVENT_FILTERS[dashboard.filter], "WARNING+")
         self.assertEqual(dashboard.offset[2], 0)
         for _ in range(3):
-            dashboard.key("f")
+            dashboard._activate_button("cycle_level")
         self.assertEqual(dashboard.filter, DEFAULT_EVENT_FILTER)
-        dashboard.key("t")
+        dashboard._activate_button("cycle_kind")
         self.assertEqual(dashboard.kind_filter, 1)
         self.assertEqual(dashboard.filter, DEFAULT_EVENT_FILTER)
 
@@ -88,13 +89,13 @@ class EventLevelTests(unittest.TestCase):
             table, count = render_events(EVENTS, width, 10, 0, DEFAULT_EVENT_FILTER, False)
             console.print(table)
             text = output.getvalue()
-            self.assertEqual(count, 3)
+            self.assertEqual(count, 6)
             self.assertIn("请求超时", text)
             self.assertNotIn("learned-capacity", text)
             if width == 120:
                 self.assertIn("WARN", text)
                 self.assertIn("ERROR", text)
-        self.assertIn("3/7", _tabs(2, Snapshot({"events": EVENTS}), False).plain)
+        self.assertIn("6/7", _tabs(2, Snapshot({"events": EVENTS}), False).plain)
 
     def test_server_records_and_logs_the_same_canonical_level(self):
         from proxy import server
