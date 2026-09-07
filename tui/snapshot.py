@@ -333,7 +333,11 @@ class Snapshot:
         self.age = raw.get("age")
         self.health_error = raw.get("health_error", self.error)
         self.health_age = raw.get("health_age", self.age)
-        self.dropped = raw.get("dropped", False)
+        self.gap = raw.get("gap")
+        self.dropped = bool(self.gap)
+        self.missed_events = raw.get("missed_events", 0)
+        self.unknown_gaps = raw.get("unknown_gaps", 0)
+        self.history_notice = raw.get("history_notice")
         self.health: dict = raw.get("health") or {}
         self.events: List[dict] = [_rpm_fields(e)
                                    for e in (raw.get("events") or [])]

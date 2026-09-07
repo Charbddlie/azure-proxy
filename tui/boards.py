@@ -224,14 +224,17 @@ def _model_card(group: Group, width: int, detail: bool,
     subtitle = Text()
     sessions = snapshot.model_sessions(group.name)
     total_sessions = sessions.get("total") or 0
-    subtitle.append("{} session".format(total_sessions),
-                    style=theme.ACCENT if total_sessions else theme.DIM)
+    if snapshot.affinity.get("mode") == "endpoint":
+        subtitle.append("{} deployments".format(len(group.routes)), style=theme.LABEL)
+    else:
+        subtitle.append("{} session".format(total_sessions),
+                        style=theme.ACCENT if total_sessions else theme.DIM)
     types = sessions.get("types") or {}
     if types:
         subtitle.append(" · " + "/".join(
             "{} {}".format(name, count)
             for name, count in sorted(types.items())), style=theme.LABEL)
-    subtitle.append(" · {} 个源".format(len(group.routes)), style=theme.LABEL)
+    subtitle.append(" · {} 个源".format(len({route.endpoint for route in group.routes})), style=theme.LABEL)
     if group.faces:
         subtitle.append(" · {}".format("+".join(group.faces)), style=theme.DIM)
     if group.capacity_rpm:
@@ -367,13 +370,6 @@ def render_events(events: List[dict], width: int, height: int, offset: int,
 
     def row(*cells):
         table.add_row(*(cells if change_width else cells[:6]))
-
-    if dropped:
-        row(Text(""), Text("!", style=theme.WARN),
-            Text("WARN" if level_width == 5 else "W", style=theme.WARN),
-            Text("gap", style=theme.WARN), Text(""),
-            Text("events were dropped: the ring turned over faster than this "
-                 "reader read it", style=theme.WARN), Text(""))
 
     for event in shown[offset:offset + max(1, height)]:
         kind = event.get("kind", "?")

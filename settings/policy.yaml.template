@@ -342,124 +342,16 @@ routing:
   # So: a conversation carrying that state is pinned to the endpoint that
   # produced it and is never moved.
   session_affinity:
-    enabled: true
-
-    # A request is sticky if its `include` array holds one of these. codex sends
-    # this from its FIRST turn, which is what makes the pin correct: it has to
-    # happen on the turn that CREATES the blob, not the one that returns it, or
-    # the blob is already on the wrong endpoint by the time anyone could notice.
-    #
-    # This is also what keeps affinity from taxing everyone. The chat face and
-    # mini-swe-agent never ask for encrypted reasoning, so they are never
-    # pinned and keep the full run of the balancer.
-    sticky_include:
-      - reasoning.encrypted_content
-
-    # Where the conversation id comes from, first match wins. Measured off real
-    # codex 0.149 traffic through harbor (2026-08-20) — all four of these carry
-    # the same value and hold it constant for every turn of a trial:
-    #
-    #   session-id: 01a0216b-cf47-7542-95ad-7d524fbb1582   (header)
-    #   thread-id:  01a0216b-…                             (header)
-    #   prompt_cache_key: 01a0216b-…                       (body)
-    #   client_metadata.session_id: 01a0216b-…             (body)
-    #
-    # The body is behind the headers so a client that sends one but not the
-    # other still works. Note codex sends `session-id`, NOT `x-session-id` —
-    # that one is kept last for Harbor, which is where the name in
-    # `forward_headers` came from.
-    #
-    # `session-id` is first on purpose, and it is the one field of the four that
-    # a subagent shares with its parent. Measured on 2026-08-25, when a codex
-    # master spawns a worker the worker sends the master's `session-id` and its
-    # OWN `thread-id`. Both facts are used, at two levels:
-    #
-    #   conversation + model   the ROUTE pin. Each thread's own reasoning is
-    #                          minted where that thread landed, and one session
-    #                          can run two models at once — a sol pin and a
-    #                          terra pin must not share a slot, or each turn
-    #                          overwrites the other's and both end up somewhere
-    #                          that cannot decrypt them.
-    #   conversation alone     the ENDPOINT pin, consulted when the route pin is
-    #                          empty. codex seeds a worker's first turn with an
-    #                          `agent_message` carrying its PARENT's ciphertext,
-    #                          so a worker that is balanced independently is
-    #                          asking an endpoint to read a blob minted on
-    #                          another one. That is the whole of the subagent
-    #                          bug: `invalid_encrypted_content`, reported by the
-    #                          client as "stream disconnected before completion:
-    #                          Encrypted function output content could not be
-    #                          decrypted or decoded", intermittently — it
-    #                          succeeded whenever the balancer happened to pick
-    #                          the parent's endpoint.
-    #
-    # The endpoint pin costs a session the spread it used to get across
-    # resources: master and workers now share one. That is the trade affinity
-    # has already made everywhere else, and the deployments under one endpoint
-    # are still balanced between, so a second SKU there is still a second quota.
+    # One family stays on one endpoint. Deployments are sampled per request.
+    # Bindings commit before first dispatch and survive serving restarts.
+    ttl_seconds: 172800
+    wait_attempts: 4
+    max_wait_seconds: 30
     keys:
       - header:session-id
       - body:prompt_cache_key
       - body:client_metadata.session_id
       - header:x-session-id
-
-    # What to do when the pinned endpoint is throttled.
-    #
-    #   wait     re-attempt the SAME endpoint after its Retry-After. Slower, and
-    #            correct.
-    #   switch   fail over like anything else. Faster, and it guarantees a
-    #            decryption error on the next turn — which is a lost trial, not
-    #            a slow one. Here only as an escape hatch.
-    #
-    # `wait` is right because the alternative is not "fast instead of slow", it
-    # is "fast and broken". A throttle is a few seconds (measured Retry-After:
-    # 1-8s); a decryption failure ends the run.
-    on_conflict: wait
-
-    # How many extra times to re-attempt a pinned endpoint before giving the
-    # upstream's error back to the caller. codex then does its own
-    # "Reconnecting… 1/5" and the next request pins to the same place, so this
-    # budget compounds with the client's rather than replacing it.
-    wait_attempts: 4
-
-    # Cap on any single wait, so a pinned endpoint that never recovers returns
-    # an error instead of hanging. Retry-After has been seen at 1-8s.
-    max_wait_seconds: 30
-
-    # What to send on a turn that could NOT be kept on the endpoint that minted
-    # its state — because the pin has expired, because a re-probe took that
-    # deployment away, because `on_conflict: switch` moved it, or because the
-    # previous turn came back refused.
-    #
-    #   strip  take the ciphertext out of `input`, wherever it sits: a
-    #          top-level `reasoning` item, and an `encrypted_content` entry
-    #          inside another item's `content` — which is where codex puts the
-    #          message a parent hands its subagent. The turn loses the model's
-    #          own account of how it got here and answers from the conversation
-    #          alone.
-    #   send   forward it and let Azure reject the call.
-    #
-    # `strip` because the two outcomes are not "accurate vs degraded": a
-    # rejected call is `invalid_encrypted_content`, which codex reports as a
-    # failed turn and does not recover from. One turn reasoning from a slightly
-    # shorter context is a cost the run absorbs; a failed turn ends it.
-    #
-    # This is a backstop, not the mechanism. Keeping the session on its own
-    # endpoint is what `on_conflict`, the route pin and the endpoint pin are
-    # for, so every turn this fires on leaves a trace: a `stripped` event
-    # (counted in `problems`, so the dashboard's filter shows it), a WARNING in
-    # the log, and a running total in /healthz under
-    # `session_affinity.stripped_turns` — the one to read after a run to find
-    # out whether it happened at all. A stream of them means affinity is not
-    # holding, and that is the thing to fix. Read it next to `rejected_turns`,
-    # which should be 0: that one counts the turns an endpoint actually refused,
-    # i.e. the ones stripping did not get to in time.
-    off_route: strip
-
-    # A pin outlives a whole trial and no longer. Bounded so a long-lived proxy
-    # does not accumulate them.
-    ttl_seconds: 3600
-    max_sessions: 4096
 
   # off the live service on 2026-08-20 by pushing endpoint-a past its TPM
   # ceiling — 5 of 8 concurrent requests came back like this:

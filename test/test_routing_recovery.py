@@ -110,7 +110,7 @@ class RetryLoopTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
-    def test_replays_demotions_separated_by_a_day(self):
+    def test_expired_demotions_are_excluded_from_replay(self):
         with fixture() as (p, a, b):
             p.sync()
             p.stop_routing()
@@ -124,7 +124,7 @@ class RecoveryTests(unittest.TestCase):
                           for i, at in enumerate((now - 86400, now))]
                 writer.append("long-gap-test", events)
                 report = engine.step()["report"]["routes"][str(route)]
-                self.assertEqual(report["rate_limited"], 2)
+                self.assertEqual(report["rate_limited"], 1)
                 self.assertAlmostEqual(engine.quota.state(route).penalty,
                                        engine.config.demote_multiplier)
             finally:
@@ -170,7 +170,7 @@ class RecoveryTests(unittest.TestCase):
         with fixture() as (p, a, b):
             p.sync()
             pid = p.routing_proc.pid
-            serving_pid = p.proc.pid
+            serving_pid = p.get_raw("/healthz")[1]["pid"]
             db = sqlite3.connect(os.path.join(p.home, "runtime", "control.sqlite3"))
             db.execute("BEGIN IMMEDIATE")
             try:

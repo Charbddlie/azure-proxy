@@ -135,7 +135,7 @@ class ProcessStatusTests(unittest.TestCase):
             for i in range(20)}
         raw["events"] = [dict(seq=i, at=999, kind="timeout", level="error", message="timeout")
                          for i in range(50)]
-        for width in (60, 80, 120):
+        for width in (60, 80, 120, 180):
             for board in (0, 1, 2):
                 with self.subTest(width=width, board=board):
                     console = Console(file=io.StringIO(), width=width, height=24)
@@ -155,7 +155,7 @@ class ProcessStatusTests(unittest.TestCase):
 class PollerStatusTests(unittest.TestCase):
     def poll_once(self, poller, responses):
         def get(path):
-            value = responses[path]
+            value = responses.get(path, responses.get(path.split("&initial=")[0]))
             if isinstance(value, Exception) or path.startswith("/events"):
                 poller.stop()
             if isinstance(value, Exception):

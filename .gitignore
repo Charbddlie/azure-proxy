@@ -3,6 +3,9 @@
 .routing.pid
 proxy.log
 routing.log
+proxy.log.*
+routing.log.*
+preflight-bak*/
 __pycache__/
 *.pyc
 

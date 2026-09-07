@@ -21,8 +21,8 @@ api-version 也根本不提供这个接口——所以一个 chat 能用的模�
 | codex 0.149.0 | responses 面，**只走流式**；`store: false`，每轮重发完整 `input`；`include: ["reasoning.encrypted_content"]` |
 | mini-swe-agent | `litellm.responses()`，responses 面，**默认非流式** |
 
-所以流式和非流式都要支持。**服务端会话状态一概不做**——没有调用方用
-`previous_response_id`。
+流式和非流式均受支持。携带加密内容、请求加密推理输出、使用
+`previous_response_id` 或显式 `store:true` 的请求会固定绑定 endpoint。
 
 但 `store: false` 的意思是「服务端别存」，**不等于「这个请求是自包含的」**。codex 拿回
 去又发回来的加密 reasoning 就是跨轮状态，只不过由客户端背着走——而且**绑定在产出它的
@@ -123,12 +123,15 @@ azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目�
 │   ├── sources.json         每个 endpoint 的状态与存活部署
 │   ├── models.json          模型名 → 路由（按故障切换顺序），带每个部署的配额
 │   ├── capacity.json        routing 导出的最大安全 RPM
-│   └── control.sqlite3      映射、原始观测与统计检查点（含 WAL 附属文件）
+│   ├── control.sqlite3      映射、原始观测与统计检查点（含 WAL 附属文件）
+│   └── affinity.sqlite3     独立 48 小时 endpoint 绑定（含 WAL 附属文件）
 ├── probe/
 │   └── probe.py
 ├── proxy/
 │   ├── __main__.py          serving 前台入口
-│   ├── server.py            转发、连接、会话亲和
+│   ├── supervisor.py / worker.py 监听所有权、预热、接流和排空
+│   ├── affinity.py          原子绑定、持久化、续期和恢复
+│   ├── server.py            转发和连接
 │   ├── bridge.py            Target 协议、内存映射与后台观测同步
 │   ├── config.py / state.py 共享配置和状态交换
 │   ├── manage.py / process.py 进程管理
@@ -159,7 +162,7 @@ azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目�
 
 ## 运行
 
-serving 和 routing 是两个独立进程，看板保持独立只读。
+serving 由持有监听 socket 的 supervisor 和 worker 组成；routing 独立运行，看板保持独立只读。
 两个服务进程使用同一系统账号和同一份本地运行目录；SQLite WAL 需要本地文件系统。
 
 | 命令 | 行为 |
@@ -167,12 +170,12 @@ serving 和 routing 是两个独立进程，看板保持独立只读。
 | `./start.sh` | 先启动 routing 并生成映射，再启动 serving |
 | `./start.sh serving` / `./start.sh routing` | 启动指定进程 |
 | `./restart.sh` | 默认只重启 routing，等待 serving 接受新映射 |
-| `./restart.sh serving` / `./restart.sh all` | 显式重启 serving 或两个进程 |
+| `./restart.sh serving` / `./restart.sh all` | 预热新 worker 后滚动接流；all 先升级 routing |
 | `./stop.sh routing` | 停止 routing，serving 继续使用缓存映射 |
 | `./stop.sh` | 先排空并停止 serving，再停止 routing |
 | `./tui.sh` | 打开看板 |
 
-serving 使用 `.proxy.pid` 和 `proxy.log`，routing 使用 `.routing.pid` 和
+serving supervisor 使用 `.proxy.pid`，所有 worker 日志汇入 `proxy.log`；routing 使用 `.routing.pid` 和
 `routing.log`。每个角色有独立的单实例锁。重复启动返回错误。
 停止默认等待 30 秒；当请求仍在排空时，命令返回错误并保留进程。
 可以通过 `--timeout 120` 延长等待；`--force` 明确允许超时后强制结束。
@@ -187,21 +190,22 @@ routing 根据配额计算各接口、各模型的当前目标和备用顺序，
 负责 RPM、容量学习和看板统计。serving 启动时只解析自身所需设置。
 
 - 修改 routing 代码、`routing.balance`、`routing.balancing` 或重新探测部署后，执行
-  `./restart.sh routing`。新映射由后台同步，已有连接与绑定继续使用原部署。
+  `./restart.sh routing`。新映射由后台同步，已有连接继续使用原快照，会话保持原 endpoint。
 - 修改 serving 的转发代码、监听地址、认证、请求兼容处理、超时重试或
   `routing.session_affinity` 设置后，需要安排 serving 重启。
 - 当部署从新映射移除时，新会话停止分配到该部署；已有会话保存完整部署信息，并按原 TTL 排空。
   上游本身的故障仍按既有重试和亲和策略处理。
 - 同一请求固定使用一代映射。routing 停止期间，已有会话和新请求都使用 serving 的最后有效映射。
-- 当同一部署的 URL 更新时，新会话使用新地址，已有绑定继续使用保存的目标记录。
+- 当同名 endpoint 的资源地址或认证 scope 改变时，旧绑定返回身份冲突。绑定保持不变。
 
 ### 稳定的目标协议
 
-每个目标记录包含五个字段：
+目标记录字段：
 
 | 字段 | serving 中的用途 |
 |---|---|
-| `endpoint`、`deployment` | 会话绑定、部署身份和请求 model 改写 |
+| `endpoint`、`deployment` | endpoint 绑定、独立部署身份和请求 model 改写 |
+| `selection_weight` | endpoint 内 deployment 的选择权重；serving 每请求抽样 |
 | `scope` | 选择 Azure token；空值使用默认 scope |
 | `targets` | 客户端接口路径到完整上游 URL 的映射 |
 | `routing_data` | 原样保存的 JSON 对象，随观测的 `route` 字段回传给 routing |
@@ -218,7 +222,7 @@ routing 根据配额计算各接口、各模型的当前目标和备用顺序，
 ### 状态交换与恢复
 
 `runtime/control.sqlite3` 使用 SQLite WAL，保存原始观测、统计检查点、消费游标和版本化快照。
-两个进程默认每 100ms 同步一次；serving 的转发路径只访问内存。
+进程默认每 100ms 同步一次；serving 使用内存路由，每个有会话标识的请求同时核对独立绑定数据库。
 空闲时 routing 每秒更新心跳，事件历史仅在发生变化时写入。
 当 SQLite 暂时被写锁占用时，routing 保留消费进度并重试，锁释放后继续发布；
 启动阶段也会重试锁冲突。其他数据库错误会明确报错退出。
@@ -236,33 +240,39 @@ serving 保持旧映射并显示告警。内存观测队列上限为 100,000 条
 `telemetry_dropped` 记录统计缺口，转发继续运行。
 内部协议采用版本检查，不兼容的进程或数据库升级需要维护窗口。
 
-### 切换到 v2 目标快照
+### 首次迁移与滚动重启
 
-先完成下方隔离测试，再安排一次维护窗口：
+首次迁移安排在旧会话结束后。旧版内存绑定无法完整导出，首次切换后仍携带旧状态的
+会话会收到绑定缺失错误。先执行 `./restart.sh routing` 升级权重和遥测协议，再排空
+旧 serving 并 `./start.sh serving`。旧版服务运行时，`restart.sh serving` 会明确提示首次迁移要求。
 
-1. 使用当前版本的 `./stop.sh --timeout 120` 先排空 serving，再停止 routing。
-   当排空超时时，保留进程并延长等待；本流程不使用 `--force`。
-2. 用 SQLite backup API 备份 `runtime/control.sqlite3`，同时备份
-   `runtime/capacity.json`。
-3. 部署匹配版本代码，执行 `./start.sh`。routing 从原 checkpoint 和剩余观测恢复，
-   发布 v2 快照后启动 serving。
-4. 检查 `/healthz` 中的 routing 心跳、映射版本和积压，以及 `/routes` 中的统计连续性。
-   `mapping_version` 是快照 revision；协议版本记录在交换数据库的快照中。
+新版 `restart.sh serving` 先恢复绑定和快照、并行预热各 scope 认证，通过独立就绪通道
+确认后开启新接流并排空旧 worker。旧 SSE 持续到结束。预热失败时保留旧 worker，
+命令返回失败；已有 worker 排空时拒绝第二次切换。修改监听地址或端口需要 stop/start。
 
-本次 serving 重启会清空内存会话绑定。在途请求通过排空完成，后续旧会话沿用现有
-丢失绑定处理策略。完成切换后，日常 routing 更新使用 `./restart.sh`，
-serving 的连接与会话绑定继续保留。
+`/healthz` 返回 supervisor PID、active/starting/draining worker、预热与切换耗时及绑定存储健康。
+遥测启动和退出只清理对应 producer；会话数由共享数据库统计。日志诊断、清理和压缩
+在启动关键路径之外运行。管理脚本启动的日志按小时轮换并保留 24 小时，遥测和事件
+历史按 24 小时清理；独立的 `affinity.sqlite3` 保留最近活动 48 小时的绑定。
+备份数据库请使用 SQLite backup API。回退版本必须继续保留固定 endpoint 和完整加密状态。
 
-回滚时先排空并停止两进程，恢复旧代码，再执行旧版 `./start.sh`。
-旧 routing 从保持兼容的 checkpoint 重新发布旧版快照，随后启动旧 serving。
-本次改造保留原有统计格式，正常回滚无需清空统计；备份保留用于故障恢复。
+### 北京时间 01:00 定时重启
+
+```bash
+./.venv/bin/python tools/scheduled_restart.py            # 下一次北京时间 01:00，执行一次
+./.venv/bin/python tools/scheduled_restart.py --dry-run  # 查看时刻
+./.venv/bin/python tools/scheduled_restart.py --daily    # 每日执行
+```
+
+脚本先重启 routing，再滚动切换 serving，并验证健康接口。首次旧版迁移需在旧会话
+结束后显式使用 `--legacy-migration`，等待在途请求排空后 stop/start；超时会报错。
+脚本需由 tmux、at 或系统调度器持有。外部调度器到点调用时使用 `--now`。
 
 测试全部使用临时配置和本地假上游：
 
 ```bash
 ./.venv/bin/python test/run_tests.py
-./.venv/bin/python test/test_split.py
-./.venv/bin/python test/test_event_levels.py
+./.venv/bin/python -m unittest discover -s test -p 'test_*.py'
 ```
 
 监听 `127.0.0.1:8811`（在 `settings/policy.yaml` 改）。共享机器上这个端口段常有别人的
@@ -325,9 +335,8 @@ python -m tui --url ...                 # 同上，少了下面那几项检查
 **源** —— 一个 endpoint 一张卡。这个资源上哪些部署在被用、当前 RPM 和最大安全 RPM。
 一个 endpoint 是一份钱、一个爆炸半径，所以按它分组。
 
-**模型** —— 一个模型一张卡。显示活跃 session 数量及类型、可用源、当前 RPM 和最大安全
-RPM。`codex` 表示普通 Codex session，`subagent` 表示输入中带 `agent_message` 的子 agent
-session。
+**模型**：一个模型一张卡，显示可用 deployment、源数量、当前 RPM 和最大安全 RPM。
+endpoint 卡片单独显示 family 绑定数。连接旧版服务时仍可显示其提供的 session 类型统计。
 
 ### 卡片的顺序，以及什么被藏起来了
 
@@ -360,11 +369,19 @@ DEBUG → INFO → WARNING → ERROR。`t` 独立切换类型：全部 → 问�
 标签显示匹配数／总数；切换过滤时保留已收到的完整事件历史。
 旧服务返回的等级会按同一规则归一化，打开更新后的 TUI 即可使用。
 
+首次使用 `/events?initial=true&limit=400` 取最新历史；历史截断仅显示“已载入最近 400 条历史”。
+之后使用 `initial=false&since=...` 增量读取，首次空流也算完成首次加载。
+`stream_id` 在正常重启中保持稳定；流重建时更换 ID。旧快照不回退游标。
+缓冲覆盖、返回限额和保留期清理造成的未读缺口分别计数。
+TUI 显示“轮询期间漏读 N 条事件：原因”，30 秒后隐藏；`c` 提前确认，
+累计漏读数保留。`r` 仅刷新。旧协议无法确定数量时标为未知。
+本地过滤、滚动和已读缓存淘汰不计漏读；serving 遥测丢失单独展示。
+
 | 等级 | 事件 |
 |---|---|
 | DEBUG | 请求进入 |
 | INFO | 请求完成、容量学习、正常会话绑定、token 刷新 |
-| WARNING | endpoint 限流、降权、故障切换、密文降级 |
+| WARNING | endpoint 限流、降权、故障切换 |
 | ERROR | I/O 超时、流中断、上游失败、重试耗尽、凭据不可用 |
 
 限流与超时分别统计。限流由 HTTP 429、限流响应头或流内 `rate_limit_exceeded` 表示；
@@ -1051,133 +1068,51 @@ foreign=0.989 → 0.889 → 0.789 → 0.689 → 0.589      每分钟正好 -0.10
 
 ---
 
-## 加密 reasoning 与会话亲和（`routing.session_affinity`）
+## 加密 reasoning 与 endpoint 绑定（`routing.session_affinity`）
 
-**上面所有「把请求换到别的 endpoint」的机制，对 codex 都是有毒的。** 这个仓库连着三个
-版本都以为不是。
+需要状态的请求在首次派发前持久化 family→endpoint 绑定。触发条件包括携带
+`encrypted_content`、请求 `reasoning.encrypted_content` 输出、引用
+`previous_response_id`、显式设置 `store:true`。已有绑定时，后续请求均继承它。
 
-codex 发 `include: ["reasoning.encrypted_content"]`，Azure 把模型的推理链**加密**之后
-返回，codex 下一轮再原样发回去。密钥属于产出它的那个资源，所以把密文交给另一个 endpoint
-会得到：
+会话标识按 `session-id` header、`prompt_cache_key`、
+`client_metadata.session_id`、`x-session-id` header 的优先级选取，去除首尾空白后取摘要。
+不同载体中相同的值表示同一 family；线程、模型和 deployment 均不参与绑定键。
+主会话与 subagent 共享 endpoint，可选择其中不同模型和 deployment。
+routing 发布 deployment 权重，serving 逐请求抽样并在该 endpoint 内重试。
 
-```
-The encrypted content for item rs_… could not be verified.
-Reason: Encrypted content could not be decrypted.
-```
-
-trial 直接死。实测：把 `balance` 改成 `capacity` 之后，前 3 个 codex trial 全是
-`NonZeroAgentExitCode`，0 通过。
-
-所以之前 README 里那句「codex 自己就发 `store: false` 并且每轮重发完整 `input`，所以三个
-endpoint 可以自由轮询」**是错的**。`store: false` 只是说「服务端别存」；加密 reasoning
-仍然是跨轮状态，只是由客户端背着。三个会移动请求的机制——`capacity` 抽样、
-`priority_threshold` 溢出、以及为了修限流而加的**流内限流故障切换**——每一个都会踩到它。
-
-**做法：带跨轮状态的会话钉在产出它的部署上，之后不再移动。**
-
-钉的是**路由**（endpoint + 部署），不是 endpoint。一个 endpoint 可以用两个部署提供
-同一个模型（换个 SKU 就是第二份配额），而 Azure 的加密内容到底是按资源还是按部署
-加密，我们没有证据。钉到具体部署不可能错；钉到 endpoint 是在赌，而赌输的代价是一个
-trial 直接死掉。`GET /healthz` 的 `sessions_per_route` 是按路由的计数，
-`sessions_per_endpoint` 是把它们按 endpoint 合起来看，`sessions_per_model` 提供模型下的
-session 总数和类型分布。
-
-### 什么算一个会话
-
-实测 codex 0.149 经 harbor 的真实流量（2026-08-20），下面四个字段**值完全一样，而且一个
-trial 的每一轮都不变**：
-
-```
-session-id:                 01a0216b-cf47-7542-95ad-7d524fbb1582   (header)
-thread-id:                  01a0216b-…                             (header)
-prompt_cache_key:           01a0216b-…                             (body)
-client_metadata.session_id: 01a0216b-…                             (body)
+```yaml
+routing:
+  session_affinity:
+    ttl_seconds: 172800
+    wait_attempts: 4
+    max_wait_seconds: 30
 ```
 
-按这个顺序取，第一个命中的就用。header 在前是因为读它不要钱；body 兜底是为了只发其中
-一种的客户端。注意 codex 发的是 **`session-id`**，不是 `x-session-id`——后者是 Harbor 的，
-排在最后。
+`runtime/affinity.sqlite3` 使用 WAL、FULL 同步、短事务和 0600 文件权限。
+唯一 family 键保证并发首请求和多个 worker 只能提交一个绑定；提交成功后才允许派发。
+最近活动续期 48 小时，主会话、子 agent 和在途请求均计入活动。普通活动按秒合并刷盘，
+临近过期时同步确认续期，正常退出前刷新。崩溃可能丢失最后一秒尚未合并的活动。
+描述缓存淘汰不删除有效绑定；过期绑定与失去引用的描述后台分批清理。
 
-取到之后还要**再拼上请求的模型名**，钉子是按「会话 + 模型」存的。钉住的是某个**部署**
-产出的密文，而一个会话 id 不保证只覆盖一个模型：2026-08-25 实测，一个 `gpt-5.6-sol` 的
-会话和一个 `gpt-5.6-terra` 的会话共用了同一格，两边轮流覆盖对方的钉子，于是每一轮都查到
-对方的路由、判定不可用、然后被均衡到一个解不开自己密文的部署上。那一整批 run 全部死于
-`invalid_encrypted_content`。加上模型名之后是两格，互不干扰。
+数据库保存标识摘要、endpoint 稳定身份、活动时间和去重后的最小路由描述。
+凭据、请求正文及密文均不进入该数据库。已移除部署的描述可供原有绑定继续使用；
+同名 endpoint 指向另一资源时返回身份冲突。
 
-绑定保存完整部署信息。当 routing 更新后某部署从候选列表中移除时，已有会话继续使用保存的
-部署，新会话使用新映射。绑定及该会话家族的部署目录按既有 TTL 和数量上限清理。
+| 情况 | 错误 |
+|---|---|
+| 状态请求缺少会话标识 | `session_id_required`（400） |
+| 携带密文或 previous_response_id，但绑定缺失或到期 | `affinity_missing`（409） |
+| 原 endpoint 无法提供目标模型 | `bound_model_unavailable`（404） |
+| 同名 endpoint 资源身份改变 | `endpoint_identity_conflict`（409） |
+| 新绑定或必要续期无法提交 | `affinity_store_unavailable`（503） |
 
-### 什么算「带状态」
+绑定一经确定，限流、超时和兼容性错误均不改变 endpoint。所有重试保留加密字段与内容顺序；
+上游兼容性错误原样返回。旧配置中的模式开关不再改变绑定行为。
+`sessions_per_endpoint` 表示 endpoint 绑定数；deployment 卡片表示实际用量。
 
-`include` 里出现 `reasoning.encrypted_content`。codex **从第一轮就发**，这一点很关键：
-钉必须发生在**产出密文的那一轮**，而不是把密文交回来的那一轮，否则等发现的时候密文已经
-在错误的 endpoint 上了。
-
-这条同时也保证了**不带加密 reasoning 的调用方完全不受影响**——chat 面、mini-swe-agent
-都不发这个字段，永远不会被钉，照旧享受完整的负载均衡。
-
-### 亲和撞上限流怎么办
-
-`on_conflict: wait`（默认）：**等 `Retry-After` 之后重试同一条路由，绝不换。**
-
-不是「快 vs 慢」的取舍，是「快且错 vs 慢且对」：限流是几秒（实测 `Retry-After` 1–8 秒），
-解密失败是整个 trial 报废。而且换过去大概率也解不开，等于白换。重试 `wait_attempts` 次
-之后仍不行，就把上游的错误交回给 codex，codex 自己会 `Reconnecting… 1/5` 再来一次——那次
-请求还是同一个会话、还是钉在同一条路由，所以两边的重试预算是叠加的，不是互相取代。
-
-`on_conflict: switch` 是退回旧行为的开关。
-
-### 钉子没守住的那一轮（`routing.session_affinity.off_route`）
-
-钉子有守不住的时候：TTL 到期、重新探测把那个部署拿掉了、或者 `on_conflict: switch`。这时候
-请求身上还背着只有原部署能解的 reasoning。
-
-`off_route: strip`（默认）：**把 `input` 里带 `encrypted_content` 的 reasoning item 摘掉再
-发。** 这一轮丢掉模型自己的推理过程，只凭对话内容作答。`off_route: send` 是照发不误、让
-Azure 拒绝。
-
-选 `strip` 不是「准确 vs 降级」的取舍：被拒绝的结果是 400 `invalid_encrypted_content`，
-codex 收到直接 `turn.failed` 且不重试，整个 run 结束。少一轮推理上下文，run 吸收得了。
-
-这是兜底，不是机制本身。把会话留在自己的部署上是钉子和 `on_conflict` 的职责，所以每一次
-触发都留了痕迹，三个地方都能看到：
-
-```bash
-# 1. 累计计数。跑完一趟 run 想知道「到底有没有触发过」，看这个就够了，不用翻日志
-curl -s http://127.0.0.1:8811/healthz | python -m json.tool   # session_affinity.stripped_turns
-
-# 2. 事件流。kind 是 stripped，算在 problems 里，看板的「问题」筛选直接能看到（图标 ✂）
-curl -s 'http://127.0.0.1:8811/events?kind=problems&limit=50' | python -m json.tool
-
-# 3. 日志。一行 WARNING
-grep 'off its pinned deployment' proxy.log
-```
-
-```
-WARNING /v1/responses model=gpt-5.6-sol is off its pinned deployment;
-        dropped 1 encrypted reasoning item(s) so gpt4v-scus/gpt-5.6-sol can answer it
-```
-
-`pin` 那个 kind 没有算进 problems，`stripped` 算了。区别在于：钉住一个会话是机制在正常
-工作，放进去会让「问题」筛选被每个会话一行淹掉；而摘掉密文是机制已经没守住，那一轮是靠
-丢掉推理上下文换来的。**这种日志成串出现，说明亲和没守住，那才是要修的东西。**
-
-### 第一轮仍然可以切
-
-还没产出任何东西的时候没有状态要保护，所以**开局那一轮照常参与均衡、照常故障切换**，
-钉是跟着**响应**走的，不是跟着请求走的。这也是亲和没有退化成「所有会话都堆在 endpoint 1」
-的原因：**会话在开始的时候被分散，之后才被固定。**
-
-实测（3 个 trial，`balance: capacity`）：`sessions_per_endpoint` 为
-`{endpoint-b: 2, endpoint-a: 1}`，3/3 通过，0 个解密错误，0 个 `ApiRateLimit`。
-
-```bash
-curl -s http://127.0.0.1:8811/healthz | python -m json.tool   # session_affinity
-curl -s http://127.0.0.1:8811/routes  | python -m json.tool   # 权重 + 钉住的会话
-```
-
-**并发上限因此变了：** 负载均衡的粒度从「每个请求」变成了「每个会话」。n 个 codex 并发
-最多只能用到 n 个 endpoint，所以 n=1 必然全压在一条路由上，跟 `balance` 设成什么无关。
+完整历史重放语义参考 [OpenAI reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)。
+同 endpoint 跨 deployment 兼容性以 [脱敏实验结果](test/results/) 为依据，不能据此保证
+所有模型版本均兼容；上游拒绝会原样报告。
 
 ---
 

@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .events import PROBLEM_KINDS, event_level
+from .affinity import AffinityError, SessionAffinity, carries_encrypted
 from .config import Config, FACES, ROOT, TABLES, _as_number
 from .bridge import (Attempt, ConfigView, ServingBridge, SnapshotMiddleware,
                      Target, Telemetry)
@@ -106,459 +107,6 @@ def face_code(face: str, stream: bool) -> int:
     return base + (1 if stream else 0)
 
 
-# --------------------------------------------------------------------------
-# Session affinity
-# --------------------------------------------------------------------------
-#
-# Some state does not travel between endpoints, and the proxy spent three
-# revisions believing otherwise. The README used to argue that because codex
-# sends `store: false` and resends its whole `input` every turn, the endpoints
-# were interchangeable and a request could go anywhere. That is wrong, and the
-# way it is wrong is expensive:
-#
-#   codex sends `include: ["reasoning.encrypted_content"]`. Azure returns the
-#   model's reasoning as an ENCRYPTED blob, and codex hands that blob back on
-#   the next turn. The key belongs to the resource that produced it. Send the
-#   blob to a different endpoint and it answers
-#
-#     The encrypted content for item rs_… could not be verified.
-#     Reason: Encrypted content could not be decrypted.
-#
-#   which kills the trial. Measured: switching balance to `capacity` took the
-#   first three codex trials to NonZeroAgentExitCode, 0 passed.
-#
-# So `store: false` means "do not keep this server-side", not "this request is
-# self-contained". The encrypted blob IS cross-turn state; it just happens to be
-# carried by the client instead of the server. Every mechanism that moves a
-# request between endpoints breaks it: capacity sampling, threshold spillover,
-# and — the one that stings — the in-band throttle failover added to fix the
-# rate limiting.
-#
-# Hence: a conversation that carries endpoint-bound state is pinned to the
-# deployment that produced it, and never moved.
-#
-# The pin names the ROUTE — endpoint and deployment — not the endpoint. One
-# resource can serve a model from two deployments (a second SKU is a second
-# quota), and whether Azure's encrypted content is scoped to the resource or to
-# the deployment is not something we have evidence for. Pinning to the exact
-# deployment cannot be wrong; pinning to the endpoint would be a guess, and the
-# failure mode of guessing wrong is a killed trial.
-#
-# What identifies a conversation, measured off real codex 0.149 traffic through
-# harbor (2026-08-20). Four independent fields agree exactly, and stay constant
-# across every turn of a trial:
-#
-#   session-id: 01a0216b-cf47-7542-95ad-7d524fbb1582      (header)
-#   thread-id:  01a0216b-cf47-7542-95ad-7d524fbb1582      (header)
-#   prompt_cache_key: 01a0216b-…                          (body)
-#   client_metadata.session_id: 01a0216b-…                (body)
-#
-# The header is preferred because it costs nothing to read, with the body fields
-# behind it so a client that sends one but not the other still works.
-#
-# What makes a request sticky is `include: ["reasoning.encrypted_content"]`,
-# which codex sends from its FIRST turn — before there is any state to protect.
-# That is exactly right: pinning has to happen on the turn that CREATES the
-# blob, not the one that returns it, or the blob is already on the wrong
-# endpoint by the time anyone notices. It also means callers that do not ask for
-# encrypted reasoning — the chat face, mini-swe-agent — are never pinned and
-# keep the full run of the balancer.
-#
-# `previous_response_id` and `store: true` qualify too, for the same reason in
-# a different costume: one dereferences an object that lives on a single
-# endpoint, the other mints it. No caller here uses them today — codex sends
-# `store: false` and resends the whole transcript — but the failure if one ever
-# did would be a 404 on someone else's endpoint, which reads like an outage
-# rather than a routing mistake. Cheap to cover now, expensive to diagnose later.
-#
-# Prompt caching is deliberately NOT a trigger. It is per-endpoint too, and
-# splitting a conversation costs real money — 89% of terminus-2's 11.4M input
-# tokens were cache hits — but a cache miss returns the right answer. Pinning
-# for it would trade a correctness mechanism for an economic one and quietly
-# reduce the balancer to strict priority, since almost every request would
-# qualify.
-
-
-class SessionAffinity:
-    """Remembers which deployment owns a conversation's encrypted state.
-
-    Pinning happens on the first response a sticky session gets, not on the
-    first request: until something has actually been produced there is no state
-    to be bound to, so the opening turn is free to fail over and to be placed by
-    the balancer like any other. That is what keeps affinity from collapsing
-    into "every session on endpoint one" — sessions are distributed as they
-    start, and only then held.
-
-    Two books, because a client session is not one conversation. `_pins` binds
-    (conversation, model) to an exact route, which is what each thread's own
-    reasoning needs. `_family` binds the conversation alone to an ENDPOINT, and
-    is what a thread consults when it has no pin of its own — the case that
-    matters being a subagent, which opens a new thread on a new model already
-    holding ciphertext its parent minted. See `family`.
-    """
-
-    def __init__(self, config: Config):
-        self.cfg = config
-        # session key -> [route, last used]. Ordered so the oldest entry is
-        # cheap to evict; a benchmark opens a bounded number of sessions but a
-        # long-lived proxy should not grow without limit.
-        self._pins: "collections.OrderedDict[str, List]" = \
-            collections.OrderedDict()
-        # family key -> [endpoint name, last used]. The coarser book: see
-        # `family` below. Same eviction rules, same bound.
-        self._family: "collections.OrderedDict[str, List]" = \
-            collections.OrderedDict()
-        # Cumulative, never reset: "did the fallback fire at all during my run"
-        # is the question this answers, and it should be one read of /healthz
-        # rather than a grep over a log that runs to tens of megabytes.
-        self._catalog = {}
-        self._stripped = 0
-        self._inherited = 0
-        self._rejected = 0
-        # family -> when its ciphertext was last found to be unplaceable. See
-        # `tainted`.
-        self._refused: "collections.OrderedDict[str, float]" = \
-            collections.OrderedDict()
-
-    def note_stripped(self, family: Optional[str] = None) -> None:
-        self._stripped += 1
-        self._taint(family)
-
-    def note_inherited(self) -> None:
-        self._inherited += 1
-
-    def note_rejected(self, family: Optional[str] = None) -> None:
-        """An endpoint refused this family's ciphertext outright."""
-        self._rejected += 1
-        self._taint(family)
-
-    def _taint(self, family: Optional[str]) -> None:
-        if not family:
-            return
-        self._refused[family] = time.time()
-        self._refused.move_to_end(family)
-        while len(self._refused) > self.cfg.affinity_max:
-            self._refused.popitem(last=False)
-
-    def tainted(self, family: Optional[str]) -> bool:
-        """Does this family still hold ciphertext nothing here can place?
-
-        Sticky, not one-shot, and that is the whole of what it is for. The
-        proxy strips a REQUEST; it cannot strip the client's transcript, and
-        codex rebuilds `input` from that transcript every turn. So a session
-        that was stripped once goes on resending the same unreadable items on
-        every subsequent turn — and the turn after the strip is pinned again,
-        looks readable, and is refused. Measured 2026-08-25: a session that
-        survived a stripped turn died on the next one with
-
-            <- 400 /v1/responses ... invalid_encrypted_content
-
-        Once tainted, the family keeps being stripped until its entry expires.
-        That costs it reasoning continuity for the rest of the hour, which is
-        the same trade `off_route: strip` already makes and the same direction:
-        a turn that has forgotten how it got here is a cost the run absorbs, a
-        refused turn ends it. Over-stripping a session that could have
-        recovered is the price, and it is small — a session only gets here
-        after it has already been moved off the endpoint that minted its state,
-        and the pin follows it to the new one rather than back.
-        """
-        if not family:
-            return False
-        at = self._refused.get(family)
-        if at is None:
-            return False
-        if time.time() - at > self.cfg.affinity_ttl:
-            self._refused.pop(family, None)
-            return False
-        return True
-
-    # -- identification ---------------------------------------------------
-    def sticky(self, body: dict) -> bool:
-        """Does this request carry (or create) endpoint-bound state?
-
-        Three ways to qualify. The first is configurable because it is a list
-        of `include` markers that Azure may extend; the other two are not,
-        because they are not heuristics — they are what the Responses API
-        means by stateful, and letting someone switch them off would only
-        enable a configuration that is known to be broken.
-        """
-        include = body.get("include")
-        if isinstance(include, list) and any(
-                str(i) in self.cfg.affinity_markers for i in include):
-            return True                 # encrypted reasoning: decryptable only
-                                        # by the resource that produced it
-
-        # References a response object that exists upstream, on one endpoint.
-        # Anywhere else it is a 404.
-        if body.get("previous_response_id"):
-            return True
-
-        # Creates that object. Nothing fails on this turn — which is the trap:
-        # the damage shows up on the next one, by which time the state is
-        # already on an endpoint nobody chose deliberately. Same reason the
-        # encrypted-reasoning pin fires on the turn that mints the blob.
-        if body.get("store") is True:
-            return True
-
-        return False
-
-    def session_type(self, body: dict) -> str:
-        """A compact operator-facing classification of a sticky session."""
-        items = body.get("input")
-        if isinstance(items, list) and any(
-                isinstance(item, dict) and item.get("type") == "agent_message"
-                for item in items):
-            return "subagent"
-        metadata = body.get("client_metadata")
-        cli = metadata.get("cli") if isinstance(metadata, dict) else None
-        if isinstance(cli, str) and cli.strip():
-            return cli.strip().lower()
-        if body.get("previous_response_id") or body.get("store") is True:
-            return "stateful"
-        return "reasoning"
-
-    def _conversation(self, request: Request, body: dict) -> Optional[str]:
-        """The conversation id this request belongs to, whatever carries it."""
-        for spec in self.cfg.affinity_keys:
-            where, _, name = spec.partition(":")
-            if where == "header":
-                value = request.headers.get(name)
-            else:
-                value = body
-                for part in name.split("."):
-                    value = value.get(part) if isinstance(value, dict) else None
-            if isinstance(value, str) and value.strip():
-                return "{}={}".format(spec, value.strip())
-        return None
-
-    def key(self, request: Request, body: dict) -> Optional[str]:
-        """The pin slot for this request: who is asking, and for which model.
-
-        The model belongs in the key because a pin binds one *deployment's*
-        encrypted state, and one conversation id can cover more than one model
-        — a session whose main model is gpt-5.6-sol may also send a turn for
-        gpt-5.6-terra, and those two blobs are minted by two different
-        deployments. Keying on the conversation alone gives them one slot to
-        share, so each turn overwrites the other's pin and both sessions end up
-        routed to a deployment that cannot decrypt what they carry.
-        """
-        conversation = self._conversation(request, body)
-        if conversation is None:
-            return None
-        model = body.get("model")
-        model = model.strip() if isinstance(model, str) else ""
-        return "{}\0model={}".format(conversation, model)
-
-    def family(self, request: Request, body: dict) -> Optional[str]:
-        """The slot for everything one client session has going at once.
-
-        The same key without the model, and it exists because a codex session
-        is not one conversation. When the master calls
-        `collaboration.spawn_agent`, the subagent opens its OWN thread — a
-        different `thread-id`, the SAME `session-id` — on a different model,
-        and codex seeds that thread with an `agent_message` item it inherited
-        from the parent. Measured on 2026-08-25, that item carries the parent's
-        ciphertext:
-
-            {"type": "agent_message",
-             "content": [{...},
-                         {"type": "encrypted_content",
-                          "encrypted_content": "gAAAAABqjaoo…"}]}
-
-        The blob was minted by the master's endpoint. `key` gives the subagent
-        a slot of its own — correctly, because its own reasoning is minted
-        wherever it lands — but that slot is empty on the subagent's first
-        turn, so the balancer placed it anywhere and the parent's blob went to
-        an endpoint that could not read it:
-
-            event: error   {"code": "invalid_encrypted_content",
-                            "message": "Encrypted function output content
-                                        could not be decrypted or decoded."}
-            event: response.failed
-
-        which codex reports as `stream disconnected before completion` and the
-        worker's first turn dies. Intermittent, because a balancer that
-        happened to pick the master's endpoint produced a working subagent —
-        with three endpoints serving the model, roughly one spawn in three.
-
-        So the family pin holds a whole session's threads on ONE endpoint,
-        while `key` still binds each thread+model to its exact deployment. The
-        endpoint is the useful unit here: the parent's blob has to survive a
-        move to a *different deployment* on the same resource (sol -> terra),
-        which the per-route pin cannot express and which the subagent case
-        requires by construction.
-        """
-        return self._conversation(request, body)
-
-    # -- the map ----------------------------------------------------------
-    def _expire(self, now: float) -> None:
-        ttl = self.cfg.affinity_ttl
-        for book in (self._pins, self._family):
-            while book:
-                _key, entry = next(iter(book.items()))
-                if now - entry[1] <= ttl:
-                    break
-                book.popitem(last=False)
-            while len(book) > self.cfg.affinity_max:
-                book.popitem(last=False)
-
-        for key in list(self._catalog):
-            if key not in self._family:
-                self._catalog.pop(key, None)
-
-    def candidates(self, request, body, table, active):
-        """Retain the family catalog for bound sessions as deployments drain."""
-        family = self.family(request, body)
-        self._expire(time.time())
-        catalog = self._catalog.get(family, {}).get("tables", {})
-        retained = catalog.get(table, {}).get(body.get("model"), [])
-        # Active order is supplied by routing. Retired routes are only
-        # accessible through this family's retained catalog.
-        return list(active) + [r for r in retained if str(r) not in {str(a) for a in active}]
-
-    def home(self, family: Optional[str],
-             routes: List[Target]) -> Tuple[Optional[str], List[Target]]:
-        """The endpoint this session's state lives on, and the way in.
-
-        Used when the exact (conversation, model) slot is empty but the family
-        one is not — which is precisely a subagent's first turn. The answer is
-        an endpoint name and the subset of `routes` that sits on it, so the
-        balancer still chooses between that endpoint's deployments and
-        failover inside the resource still works.
-
-        An empty subset is not an error and does not clear the entry: the
-        session's endpoint simply does not serve this model. The caller strips
-        the ciphertext and routes wherever it likes, which costs the turn its
-        inherited context and nothing else.
-        """
-        if not family:
-            return None, []
-        now = time.time()
-        self._expire(now)
-        entry = self._family.get(family)
-        if entry is None:
-            return None, []
-        entry[1] = now
-        self._family.move_to_end(family)
-        return entry[0], [r for r in routes if r.endpoint == entry[0]]
-
-    def pinned(self, key: Optional[str]) -> Optional[Target]:
-        """Use the retained descriptor while a bound deployment drains.
-
-        Publishing a new model table leaves existing bindings intact. Expiry
-        and explicit successful re-binding still follow the affinity policy.
-        """
-        if not key:
-            return None
-        now = time.time()
-        self._expire(now)
-        entry = self._pins.get(key)
-        if entry is None:
-            return None
-        entry[1] = now
-        self._pins.move_to_end(key)
-        return entry[0]
-
-    def pin(self, key: Optional[str], route: Target,
-            family: Optional[str] = None,
-            session_type: str = "reasoning") -> None:
-        """Record where this conversation's state now lives.
-
-        Both books are written on every successful sticky response. A move is
-        logged rather than being made silently: a pin that changes route is how
-        a session loses state it is still carrying, and the previous outage
-        could not be read out of proxy.log because this branch said nothing.
-        """
-        now = time.time()
-        if key:
-            entry = self._pins.get(key)
-            if entry is None:
-                _ev("pin", "info", "session pinned to %s (%d live)", route,
-                    len(self._pins) + 1, route=route, live=len(self._pins) + 1)
-                self._pins[key] = [route, now, session_type]
-            else:
-                if str(entry[0]) != str(route):
-                    _ev("pin", "warning",
-                        "session moved from %s to %s; state minted on the old "
-                        "one is no longer readable", entry[0], route,
-                        route=route, from_route=str(entry[0]), moved=True)
-                entry[:] = [route, now, session_type]
-            self._pins.move_to_end(key)
-
-        if family:
-            entry = self._family.get(family)
-            if entry is None:
-                self._family[family] = [route.endpoint, now]
-            else:
-                if entry[0] != route.endpoint:
-                    _ev("pin", "warning",
-                        "session's endpoint moved from %s to %s; threads "
-                        "spawned before this carry state it cannot read",
-                        entry[0], route.endpoint,
-                        route=route, from_endpoint=entry[0], moved=True)
-                entry[0], entry[1] = route.endpoint, now
-            self._family.move_to_end(family)
-
-        if family:
-            catalog = self._catalog.get(family)
-            if not catalog or catalog["endpoint"] != route.endpoint:
-                catalog = self._catalog[family] = {"endpoint": route.endpoint, "tables": {},
-                                                   "images": {}}
-            deployment = getattr(self.cfg, "image_deployments", {}).get(route.endpoint)
-            if deployment:
-                catalog["images"][route.endpoint] = deployment
-            for table in TABLES:
-                retained = catalog["tables"].setdefault(table, {})
-                for model, candidates in getattr(self.cfg, table, {}).items():
-                    local = [r for r in candidates if r.endpoint == route.endpoint]
-                    if local:
-                        previous = retained.get(model, [])
-                        retained[model] = local + [r for r in previous
-                                                 if str(r) not in {str(a) for a in local}]
-        self._expire(now)
-
-    def report(self) -> dict:
-        now = time.time()
-        self._expire(now)
-        # Per route, and per endpoint underneath it. The endpoint total is the
-        # one to read for "is affinity pushing everything at one resource"; the
-        # route breakdown is what says which deployment is carrying it.
-        routes: Dict[str, int] = {}
-        counts: Dict[str, int] = {}
-        models: Dict[str, dict] = {}
-        for key, entry in self._pins.items():
-            target, _ts, session_type = entry
-            route = str(target)
-            routes[route] = routes.get(route, 0) + 1
-            endpoint = route.split("/", 1)[0]
-            counts[endpoint] = counts.get(endpoint, 0) + 1
-            marker = "\0model="
-            model = key.rpartition(marker)[2] if marker in key else ""
-            if model:
-                bucket = models.setdefault(model, {"total": 0, "types": {}})
-                bucket["total"] += 1
-                types = bucket["types"]
-                types[session_type] = types.get(session_type, 0) + 1
-        return {"enabled": self.cfg.affinity_enabled,
-                "on_conflict": self.cfg.affinity_on_conflict,
-                "off_route": self.cfg.affinity_off_route,
-                "stripped_turns": self._stripped,
-                # How often a thread was placed on its session's endpoint
-                # rather than by the balancer — the subagent case. Read next to
-                # stripped_turns: inherited means the parent's state survived,
-                # stripped means it did not.
-                "inherited_turns": self._inherited,
-                # Turns an endpoint actually refused. Zero is the number to
-                # expect; anything else says routing let ciphertext reach an
-                # endpoint that could not read it, and the log says which.
-                "rejected_turns": self._rejected,
-                "live_sessions": len(self._pins),
-                "live_families": len(self._family),
-                "sessions_per_route": routes,
-                "sessions_per_endpoint": counts,
-                "sessions_per_model": models}
-
-
 class TokenUnavailable(Exception):
     """No usable credential, and refreshing did not produce one."""
 
@@ -602,7 +150,7 @@ class TokenCache:
         self._refresh_at = 0.0
         self._last_attempt = 0.0
         self._last_error: Optional[str] = None
-        self._lock = asyncio.Lock()
+        self._lock = None
 
     def _fetch_via_cli(self):
         token = self._credential.get_token(self._scope)
@@ -668,6 +216,8 @@ class TokenCache:
         if self._usable(now) and now < self._refresh_at:
             return self._token
 
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             now = time.time()
             if self._usable(now) and now < self._refresh_at:
@@ -689,6 +239,8 @@ class TokenCache:
                 await asyncio.sleep(interval)
                 now = time.time()
                 if not self._usable(now) or now >= self._refresh_at:
+                    if self._lock is None:
+                        self._lock = asyncio.Lock()
                     async with self._lock:
                         await self._refresh(time.time())
             except asyncio.CancelledError:
@@ -751,12 +303,12 @@ def token_cache_for(scope: Optional[str]) -> TokenCache:
 
 bridge = ServingBridge(ROOT, cfg)
 telemetry = Telemetry(bridge)
-affinity = SessionAffinity(cfg)
+affinity = SessionAffinity(cfg, ROOT)
+affinity.emit = _ev
 app = FastAPI(title="azure-proxy", docs_url=None, redoc_url=None)
 client: Optional[httpx.AsyncClient] = None
 _refreshers: List[asyncio.Task] = []
 STARTED_AT = time.time()
-bridge.sessions = affinity.report
 app.add_middleware(SnapshotMiddleware, config=cfg)
 
 
@@ -786,7 +338,7 @@ def _az_account() -> Optional[str]:
         return None
 
 
-def _log_startup():
+def _log_startup(account):
     report = cfg.routing_report
     log.info("listening on http://%s:%s", cfg.host, cfg.port)
     log.info("az config dir: %s", cfg.az_config_dir or "~/.azure (shared!)")
@@ -797,7 +349,6 @@ def _log_startup():
              "on" if cfg.responses_compat else "off (raw Azure validation)")
     log.info("routing balance: %s", report.get("balance"))
 
-    account = _az_account()
     if account is None:
         pass                    # static token, or `az` could not answer
     elif cfg.expected_account and account != cfg.expected_account:
@@ -831,18 +382,25 @@ def _log_startup():
         account=account, probed_at=report.get("probed_at"))
 
 
+async def _startup_diagnostics():
+    account = await asyncio.to_thread(_az_account)
+    _log_startup(account)
+
+
 @app.on_event("startup")
 async def _startup():
     global client
     await bridge.start()
+    await affinity.start()
+    for scope in await asyncio.to_thread(affinity.store.scopes):
+        token_cache_for(scope)
     client = httpx.AsyncClient(timeout=httpx.Timeout(cfg.timeout, connect=15.0))
     # Prime every scope's token at boot rather than on the first request, so a
     # bad login fails loudly here. One background refresher per cache.
-    for cache in TOKEN_CACHES.values():
-        await cache.get()
+    await asyncio.gather(*(cache.get() for cache in list(TOKEN_CACHES.values())))
     _refreshers[:] = [asyncio.create_task(cache.run_background_refresh())
                       for cache in TOKEN_CACHES.values()]
-    _log_startup()
+    _refreshers.append(asyncio.create_task(_startup_diagnostics()))
 
 
 @app.on_event("shutdown")
@@ -851,6 +409,7 @@ async def _shutdown():
         task.cancel()
     if client:
         await client.aclose()
+    await affinity.stop()
     await bridge.stop()
     # Uvicorn may re-raise SIGTERM after its graceful shutdown has completed.
     # Release ownership during lifespan shutdown as well as through atexit.
@@ -859,6 +418,15 @@ async def _shutdown():
 
 @app.get("/healthz")
 async def healthz():
+    from .supervisor import status_path
+    try:
+        with open(status_path()) as file:
+            supervisor = json.load(file)
+        supervisor["heartbeat_age_seconds"] = max(0, time.time() - supervisor["heartbeat"])
+        supervisor["ok"] = supervisor["heartbeat_age_seconds"] < 3
+    except (OSError, ValueError):
+        supervisor = dict(ok=False)
+    affinity_state = await affinity.status()
     report = cfg.routing_report
     token = tokens.status()
     # Healthy means every scope in use has a live token, not just the default:
@@ -867,9 +435,12 @@ async def healthz():
     per_scope = {scope: cache.status() for scope, cache in TOKEN_CACHES.items()}
     ok = all(s["have_token"] and s["expires_in_seconds"] > 0
              for s in per_scope.values())
-    return {"ok": ok,
+    return {"ok": ok and affinity_state["persistence"]["ok"],
             "role": "serving",
             "pid": os.getpid(),
+            "producer": bridge.producer,
+            "supervisor": supervisor,
+            "affinity_store": affinity_state["persistence"],
             "routing": bridge.status(),
             "models": len(cfg.routes),
             "responses_models": len(cfg.responses_routes),
@@ -889,7 +460,7 @@ async def healthz():
             "started_at": STARTED_AT,
             "uptime_seconds": round(time.time() - STARTED_AT, 1),
             "load_window_seconds": report.get("load_window_seconds"),
-            "session_affinity": affinity.report(),
+            "session_affinity": affinity_state,
             "token": token,
             "tokens": per_scope}
 
@@ -897,31 +468,19 @@ async def healthz():
 @app.get("/routes")
 async def routes_report():
     report = dict((bridge.snapshot or {}).get("report", {}))
-    report["session_affinity"] = affinity.report()
+    report["session_affinity"] = await affinity.status()
     report["routing"] = bridge.status()
     report["stats_stale"] = (not report["routing"]["ok"]
                              or bool(report["routing"]["telemetry_dropped"]))
     return report
-
-
 @app.get("/events")
-async def events_feed(since: int = 0, limit: int = 500,
-                      kind: Optional[str] = None):
-    feed = (bridge.snapshot or {}).get("events", {})
-    held = recent(feed.get("events", []), time.time() - RETENTION_SECONDS)
-    fresh = [event for event in held if event["seq"] > since]
-    cursor = feed.get("next", 0)
-    dropped = bool(since > 0 and held and held[0]["seq"] > since + 1)
-    kinds = (PROBLEM_KINDS if kind == "problems" else
-             frozenset(k.strip() for k in kind.split(",")) if kind else None)
-    if kinds is not None:
-        fresh = [event for event in fresh if event["kind"] in kinds]
-    if limit > 0 and len(fresh) > limit:
-        fresh = fresh[-limit:]
-        dropped = True
-    return {"events": fresh, "next": cursor, "dropped": dropped,
-            "counts": dict(collections.Counter(e["kind"] for e in held)),
-            "stats_stale": not bridge.status()["ok"]}
+async def events_feed(since: int = 0, limit: int = 400,
+                      kind: Optional[str] = None, initial: bool = False):
+    from .events import event_feed
+    result = event_feed((bridge.snapshot or {}).get("events", {}),
+                        since, limit, kind, initial)
+    result["stats_stale"] = not bridge.status()["ok"]
+    return result
 
 
 @app.get("/v1/models")
@@ -1562,8 +1121,6 @@ def _note_upstream_error(failure: Optional[Tuple[str, str]], route: Target,
         route, code, ": " + message if message else "", sent,
         route=route, face=face, model=model, error_code=code,
         error=message, bytes=sent, in_stream=True)
-    if code == ENCRYPTED_REJECTED.decode() and cfg.affinity_enabled:
-        affinity.note_rejected(family)
 
 
 def _error(status: int, message: str, code: str) -> JSONResponse:
@@ -1657,100 +1214,7 @@ def _apply_responses_compat(body: dict) -> Dict[str, int]:
     return stats
 
 
-def _strip_encrypted_reasoning(body: dict) -> Tuple[dict, int]:
-    """`body` without the ciphertext only one endpoint can read.
-
-    Azure encrypts with a key belonging to the resource that produced it, so
-    handing it to any other endpoint earns `invalid_encrypted_content` — a 400
-    on the buffered face, and on the streaming face a 200 that carries
-
-        event: error   {"code": "invalid_encrypted_content", …}
-        event: response.failed
-
-    which codex reports as a failed turn either way. Affinity exists to make
-    sure that never happens; this is what to do on the turns where it could not
-    be kept, so that losing a pin costs the turn its context instead of costing
-    the run.
-
-    Two places carry it, and both have been seen live:
-
-      * a top-level `reasoning` item with `encrypted_content` — the model's own
-        chain of thought, on every codex turn after the first.
-      * an `encrypted_content` entry inside another item's `content` list —
-        which is how codex 0.148 hands a subagent the message its parent wrote
-        for it. Missing this one is what let a stripped subagent turn fail
-        anyway: the item is an `agent_message`, not a `reasoning`, so the
-        type test above walked straight past it.
-
-    So the rule is the field, not the item type. An item whose only content was
-    ciphertext is dropped rather than sent with an empty `content`, which the
-    validator rejects.
-
-    Returns a copy down to every dict it modifies, because the caller's `body`
-    is reused by the other attempts and `input` is a list it shares.
-    """
-    items = body.get("input")
-    if not isinstance(items, list):
-        return body, 0
-
-    dropped = 0
-    kept: List = []
-    for item in items:
-        if not isinstance(item, dict):
-            kept.append(item)
-            continue
-
-        if item.get("type") == "reasoning" and item.get("encrypted_content"):
-            dropped += 1
-            continue
-
-        content = item.get("content")
-        if isinstance(content, list) and any(
-                isinstance(c, dict) and c.get("encrypted_content")
-                for c in content):
-            clean = [c for c in content
-                     if not (isinstance(c, dict) and c.get("encrypted_content"))]
-            dropped += len(content) - len(clean)
-            if not clean:
-                continue
-            item = dict(item)
-            item["content"] = clean
-        elif item.get("encrypted_content"):
-            # Some other item type carrying it at the top. Take the field and
-            # leave the item: it is the ciphertext that is unreadable, not the
-            # tool call or message wrapped around it.
-            dropped += 1
-            item = {k: v for k, v in item.items() if k != "encrypted_content"}
-
-        kept.append(item)
-
-    if not dropped:
-        return body, 0
-    out = dict(body)
-    out["input"] = kept
-    return out, dropped
-
-
-def _carries_encrypted(body: dict) -> bool:
-    """Is there endpoint-bound ciphertext in this request's `input`?
-
-    Same two places `_strip_encrypted_reasoning` looks, asked as a question.
-    Used only to decide whether a routing decision is worth warning about:
-    `include: ["reasoning.encrypted_content"]` makes a request sticky from its
-    first turn, before there is anything to protect, so "sticky" on its own
-    says nothing about whether this particular turn is at risk.
-    """
-    for item in body.get("input") or []:
-        if not isinstance(item, dict):
-            continue
-        if item.get("encrypted_content"):
-            return True
-        content = item.get("content")
-        if isinstance(content, list) and any(
-                isinstance(c, dict) and c.get("encrypted_content")
-                for c in content):
-            return True
-    return False
+_carries_encrypted = carries_encrypted
 
 
 async def _body_and_model(request: Request):
@@ -1840,81 +1304,15 @@ async def _forward(request: Request, body: dict, routes: List[Target],
 
     headers = _upstream_headers(request.headers, token, content_type)
 
-    # Where this request is allowed to go. A conversation carrying encrypted
-    # reasoning is bound to the endpoint that produced it (see SessionAffinity),
-    # so once pinned its attempt list is that ONE endpoint, tried repeatedly,
-    # rather than a walk across the others. Moving it would trade a slow request
-    # for a guaranteed decryption failure.
-    session = affinity.key(request, body) if cfg.affinity_enabled else None
-    family = affinity.family(request, body) if cfg.affinity_enabled else None
-    sticky = bool(session) and not is_image and affinity.sticky(body)
-    session_type = affinity.session_type(body) if sticky else ""
-    pinned = affinity.pinned(session) if sticky else None
-    # This family has been found carrying ciphertext that could not be placed,
-    # so it goes out stripped wherever it goes — the client resends the same
-    # unreadable items every turn, so one stripped retry is not enough. No
-    # event of its own: the per-route `stripped` warning below fires whenever
-    # this actually removes something, and saying it twice per turn for an hour
-    # would drown the log this is meant to make readable.
-    tainted = affinity.tainted(family) if sticky else False
-    # The endpoint that owns this session's state, and the routes onto it.
-    # Consulted only when the exact slot is empty, which for codex means the
-    # first turn of a thread — including a subagent's, which arrives already
-    # carrying ciphertext its parent minted. See SessionAffinity.family.
-    home, local = affinity.home(family, routes) if sticky and pinned is None \
-        else (None, [])
-    if pinned is not None and cfg.affinity_on_conflict == "wait":
-        attempts = [pinned] * max(1, 1 + cfg.affinity_attempts)
-    elif pinned is not None:
-        # `switch` keeps the old behaviour: try the pin first, then fail over
-        # like anything else. Faster, and wrong for codex.
-        attempts = [pinned] + [r for r in routes if str(r) != str(pinned)]
-        attempts = attempts[:cfg.max_attempts]
-    elif local:
-        # This thread has no pin of its own but its session does. Balance
-        # inside that endpoint — a second deployment there is a second quota,
-        # and the ciphertext is readable across both — then let the rest of the
-        # world follow as a fallback, stripped, so an endpoint that has gone
-        # down costs the turn its inherited context rather than the turn.
-        affinity.note_inherited()
-        rest = [r for r in routes if r.endpoint != home]
-        attempts = (list(local) + list(rest))[:cfg.max_attempts]
-        _ev("inherited", "info",
-            "%s model=%s has no pin of its own; its session's state is on %s, "
-            "so it goes there (%d route(s))",
-            face, requested, home, len(local),
-            face=face, model=requested, endpoint=home, routes=len(local))
-    elif is_image:
-        # Cycled, not truncated. Most image models have one deployment, so a
-        # permutation of the routes is a list of length one and the first 429
-        # would be the caller's answer. Repeating the same route is right here
-        # for the reason repeating it on a text face would be wrong: the refusal
-        # is a per-minute request ceiling that refills on a clock, not a sign
-        # that this destination is unwell.
-        ordered = list(routes)
-        attempts = [ordered[i % len(ordered)]
-                    for i in range(max(1, cfg.image_attempts))]
-    else:
-        # Balancing decides the order; max_attempts still decides the depth, and
-        # the list is a permutation of `routes`, so no endpoint is tried twice.
-        attempts = list(routes)[:cfg.max_attempts]
-        if sticky and family and _carries_encrypted(body):
-            # Nothing knows where this ciphertext came from — a proxy restart,
-            # an expired pin, or a client that opened a thread the proxy never
-            # saw the parent of. It may well be rejected, so say so here rather
-            # than leaving the next occurrence to be reconstructed from the
-            # client's error message.
-            _ev("unpinned", "warning",
-                "%s model=%s carries encrypted state but has no pin and no "
-                "session endpoint; routing it to %s on the balancer's word",
-                face, requested, attempts[0] if attempts else "nowhere",
-                face=face, model=requested,
-                route=str(attempts[0]) if attempts else None)
-    held = pinned is not None and cfg.affinity_on_conflict == "wait"
+    family = getattr(request.state, "affinity_family", None)
+    held = bool(getattr(request.state, "affinity_binding", None))
+    sticky = held
     if held:
-        _ev("held", "info", "%s model=%s held on pinned %s (%d attempts)",
-            face, requested, pinned, len(attempts),
-            route=pinned, face=face, model=requested, attempts=len(attempts))
+        attempts = [routes[i % len(routes)] for i in range(max(1, 1 + cfg.affinity_attempts))]
+    elif is_image:
+        attempts = [routes[i % len(routes)] for i in range(max(1, cfg.image_attempts))]
+    else:
+        attempts = routes[:cfg.max_attempts]
 
     def pause(next_route, hint):
         """How long to wait before the next attempt, and what to say about it.
@@ -1974,28 +1372,6 @@ async def _forward(request: Request, body: dict, routes: List[Target],
                     scope=route.scope, error=str(e))
                 continue
         payload = dict(body)
-        # Off the endpoint that minted it, the ciphertext in this body is
-        # unreadable and Azure rejects the whole call. Two routes can read it:
-        # the exact pin, and — when there is no pin yet — any deployment on the
-        # endpoint this session's state lives on, which is what carries a
-        # subagent's inherited `agent_message` across from its parent's model.
-        # Anywhere else it has to come off, or the turn dies instead of merely
-        # forgetting how it got here.
-        readable = route is pinned or (pinned is None and home is not None
-                                       and route.endpoint == home)
-        if sticky and (tainted or not readable) \
-                and cfg.affinity_off_route == "strip":
-            payload, dropped = _strip_encrypted_reasoning(payload)
-            if dropped:
-                # Taints the family as it strips: the items are still in the
-                # client's transcript and will be back next turn, on a route
-                # that by then looks readable. See SessionAffinity.tainted.
-                affinity.note_stripped(family)
-                _ev("stripped", "warning",
-                    "%s model=%s is off the endpoint that minted its state; "
-                    "dropped %d encrypted item(s) so %s can answer it",
-                    face, requested, dropped, route,
-                    route=route, face=face, model=requested, stripped=dropped)
         payload["model"] = route.deployment
         entry = telemetry.charge(route, request_bytes, ledger_face, model=requested)
         resp = None
@@ -2147,8 +1523,6 @@ async def _forward(request: Request, body: dict, routes: List[Target],
                             route=route, face=face, model=requested,
                             reason=reason, in_stream=True, last_route=True)
 
-                    if sticky:
-                        affinity.pin(session, route, family, session_type)
                     return _relay_stream(resp, route, face, started, head,
                                          request_bytes, entry,
                                          counted=bool(head.retry_reason) or throttled,
@@ -2173,7 +1547,7 @@ async def _forward(request: Request, body: dict, routes: List[Target],
                         seconds=round(time.monotonic() - started, 1))
                     # The buffered face's shape of the same refusal: a 400 whose
                     # body names invalid_encrypted_content. Same treatment — say so
-                    # in the log, and make the client's retry go out stripped.
+                    # in the log. Binding and ciphertext remain unchanged.
                     if sticky and ENCRYPTED_REJECTED in resp.content:
                         _ev("upstream_error", "warning",
                             "!! %s refused %s model=%s for the encrypted state it "
@@ -2182,9 +1556,6 @@ async def _forward(request: Request, body: dict, routes: List[Target],
                             route=route, face=face, model=requested,
                             error_code=ENCRYPTED_REJECTED.decode(),
                             status=resp.status_code)
-                        affinity.note_rejected(family)
-                    if sticky and resp.status_code < 400:
-                        affinity.pin(session, route, family, session_type)
                     return _relay(resp, route, request_bytes, entry,
                                   counted=retryable)
 
@@ -2263,19 +1634,36 @@ def _wants_image_tool(body: dict) -> bool:
                for t in tools)
 
 
-def _routes_for(request, body, table):
-    active = getattr(cfg, table).get(body.get("model"), [])
-    if cfg.affinity_enabled and affinity.sticky(body):
-        return affinity.candidates(request, body, table, active)
-    return active
+async def _routes_for(request, body, table):
+    return await affinity.prepare(request, body, table)
 
 
 def _image_deployments(request, body):
     deployments = dict(cfg.image_deployments)
-    if cfg.affinity_enabled and affinity.sticky(body):
-        family = affinity.family(request, body)
-        deployments.update(affinity._catalog.get(family, {}).get("images", {}))
+    binding = getattr(request.state, "affinity_binding", None)
+    if binding:
+        deployments.update(binding["catalog"].get("images", {}))
     return deployments
+
+
+@app.exception_handler(AffinityError)
+async def affinity_error(request, exc):
+    return _error(exc.status, str(exc), exc.code)
+
+
+class AffinityLifecycle:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if scope["type"] == "http":
+                affinity.release(Request(scope))
+
+
+app.add_middleware(AffinityLifecycle)
 
 
 @app.post("/v1/chat/completions")
@@ -2284,7 +1672,7 @@ async def chat_completions(request: Request):
     if err is not None:
         return err
 
-    routes = _routes_for(request, body, "routes")
+    routes = await _routes_for(request, body, "routes")
     if not routes:
         elsewhere = _other_faces(requested,
                                  ("/v1/responses", cfg.responses_routes),
@@ -2319,7 +1707,7 @@ async def responses(request: Request):
     if err is not None:
         return err
 
-    routes = _routes_for(request, body, "responses_routes")
+    routes = await _routes_for(request, body, "responses_routes")
     if not routes:
         elsewhere = _other_faces(requested,
                                  ("/v1/chat/completions", cfg.routes),
@@ -2395,7 +1783,7 @@ async def images_generations(request: Request):
     if err is not None:
         return err
 
-    routes = cfg.image_routes.get(requested)
+    routes = await _routes_for(request, body, "image_routes")
     if not routes:
         return _image_404(requested, cfg.image_routes, "images/generations",
                           "no_image_route")
@@ -2425,7 +1813,7 @@ async def images_edits(request: Request):
     if not requested:
         return _error(400, "`model` is required", "missing_model")
 
-    routes = cfg.image_edit_routes.get(requested)
+    routes = await _routes_for(request, {"model": requested}, "image_edit_routes")
     if not routes:
         if requested in cfg.image_routes:
             # A real distinction rather than a shade of the same 404: the model

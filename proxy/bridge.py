@@ -35,6 +35,7 @@ class Target:
     scope: Optional[str]
     targets: dict
     routing_data: dict
+    selection_weight: Optional[float] = None
 
     def __repr__(self):
         return "{}/{}".format(self.endpoint, self.deployment)
@@ -70,6 +71,11 @@ def decode_snapshot(snapshot, base):
     if type(snapshot.get("revision")) is not int or snapshot["revision"] < 1:
         raise ValueError("invalid routing revision")
     candidate = copy.copy(base)
+    candidate.endpoint_identities = snapshot["config"].get("endpoint_identities", {})
+    if not isinstance(candidate.endpoint_identities, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and len(v) == 64
+            for k, v in candidate.endpoint_identities.items()):
+        raise ValueError("invalid endpoint identity registry")
     for key in SNAPSHOT_FIELDS:
         setattr(candidate, key, snapshot["config"][key])
     if not isinstance(candidate.scopes, list) or not all(
@@ -92,7 +98,8 @@ def decode_snapshot(snapshot, base):
             for record in records:
                 route = Target(endpoint=record["endpoint"], deployment=record["deployment"],
                                scope=record.get("scope"), targets=record["targets"],
-                               routing_data=record["routing_data"])
+                               routing_data=record["routing_data"],
+                               selection_weight=record.get("selection_weight"))
                 if not all(isinstance(v, str) and v for v in
                            (route.endpoint, route.deployment)):
                     raise ValueError("incomplete route descriptor")
@@ -109,6 +116,10 @@ def decode_snapshot(snapshot, base):
                     raise ValueError("route scope missing from snapshot scopes")
                 if not isinstance(route.routing_data, dict):
                     raise ValueError("invalid routing metadata")
+                if route.selection_weight is not None and (
+                        not isinstance(route.selection_weight, (int, float))
+                        or not math.isfinite(route.selection_weight) or route.selection_weight < 0):
+                    raise ValueError("invalid deployment selection weight")
                 routes.append(route)
             if len({str(route) for route in routes}) != len(routes):
                 raise ValueError("duplicate deployment in model mapping")
@@ -153,7 +164,8 @@ class ServingBridge:
             if self.dropped == 1:
                 log.error("telemetry queue full; serving continues with a statistics gap")
             return
-        self.pending.append(dict(data, kind=kind, at=time.time(), local_seq=self.local_seq))
+        self.pending.append(dict(data, kind=kind, at=time.time(), local_seq=self.local_seq,
+                                 producer=self.producer, producer_pid=os.getpid()))
 
     async def start(self):
         self.store = await asyncio.to_thread(Store, self.root)
@@ -188,8 +200,12 @@ class ServingBridge:
 
     async def run(self):
         last_sessions = None
+        heartbeat_at = 0
         while not self.stopping:
             try:
+                if time.monotonic() - heartbeat_at >= 1:
+                    self.record("producer_heartbeat")
+                    heartbeat_at = time.monotonic()
                 if self.sessions:
                     summary = self.sessions()
                     if summary != last_sessions:

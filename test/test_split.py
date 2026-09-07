@@ -239,7 +239,7 @@ class SplitTests(unittest.TestCase):
                 self.assertEqual(turn(p, "new")[0], 200)
                 self.assertEqual(b.requests[-1]["path"], "/custom/responses")
                 health = p.get_raw("/healthz")[1]
-                self.assertEqual(health["pid"], p.proc.pid)
+                self.assertEqual(health["supervisor"]["pid"], p.proc.pid)
                 self.assertEqual(health["balance"], "future-mode")
                 self.assertIsNone(health["spill_threshold"])
                 self.assertEqual(p.get_raw("/routes")[1]["future_metric"], {"value": 17})
@@ -340,7 +340,7 @@ class SplitTests(unittest.TestCase):
             result = p.post(dict(CODEX_BODY, model="added-model", stream=False), path="/v1/responses")
             self.assertEqual(result[2]["x-azure-proxy-route"], "beta/" + DEPLOYMENT)
             health = p.get("/healthz")[1]
-            self.assertEqual(health["pid"], p.proc.pid)
+            self.assertEqual(health["supervisor"]["pid"], p.proc.pid)
             self.assertIn("https://ai.azure.com/.default", health["tokens"])
 
     def test_buffered_request_keeps_its_generation_during_remap(self):
@@ -440,7 +440,7 @@ class SplitTests(unittest.TestCase):
             request = urllib.request.Request(
                 p.url("/v1/responses"), data=json.dumps(CODEX_BODY).encode(),
                 headers={"Content-Type": "application/json"})
-            pid = p.proc.pid
+            pid = p.get("/healthz")[1]["pid"]
             with urllib.request.urlopen(request, timeout=15) as reply:
                 first = reply.readline()
                 self.assertTrue(first)
@@ -526,7 +526,7 @@ class SplitTests(unittest.TestCase):
                                         capture_output=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 health = p.get_raw("/healthz")[1]
-                self.assertEqual(health["pid"], p.proc.pid)
+                self.assertEqual(health["supervisor"]["pid"], p.proc.pid)
                 self.assertNotEqual(health["routing"]["pid"], old)
                 self.assertTrue(health["routing"]["ok"])
             finally:

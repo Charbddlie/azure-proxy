@@ -4,11 +4,13 @@ Importing this module performs no file I/O and starts no services.
 """
 
 import json
+import hashlib
 import math
 import os
 from typing import Dict, List, Optional, Tuple
 
 import yaml
+from urllib.parse import urlsplit, urlunsplit
 
 ROOT = os.environ.get("AZURE_PROXY_HOME",
                       os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,6 +20,14 @@ BALANCE_MODES = ("strict_priority", "priority_threshold", "capacity")
 BALANCE_ALIASES = {"priority": "strict_priority", "weighted": "capacity"}
 FACES = ("chat", "chat_stream", "responses", "responses_stream", "image")
 TABLES = ("routes", "responses_routes", "image_routes", "image_edit_routes")
+
+
+def endpoint_identity(address, scope):
+    url = urlsplit(address)
+    if url.username or url.password or url.query or url.fragment:
+        raise ValueError("endpoint URL must not contain credentials, query or fragment")
+    normalized = urlunsplit((url.scheme.lower(), url.netloc.lower(), url.path.rstrip("/"), "", ""))
+    return hashlib.sha256((normalized + "\0" + scope).encode()).hexdigest()
 
 def _as_number(value) -> Optional[float]:
     """Header value -> float, or None. Azure has been consistent about sending
@@ -179,22 +189,19 @@ class Config:
         self.image_max_wait = float(i.get("max_wait_seconds", 30))
 
         a = r.get("session_affinity") or {}
-        self.affinity_enabled = bool(a.get("enabled", True))
         self.affinity_keys = list(a.get("keys") or [
             "header:session-id", "body:prompt_cache_key",
             "body:client_metadata.session_id", "header:x-session-id"])
-        self.affinity_markers = list(a.get("sticky_include") or
-                                     ["reasoning.encrypted_content"])
-        self.affinity_ttl = float(a.get("ttl_seconds", 3600))
-        self.affinity_max = int(a.get("max_sessions", 4096))
-        self.affinity_on_conflict = a.get("on_conflict", "wait")
-        if self.affinity_on_conflict not in ("wait", "switch"):
-            self.affinity_on_conflict = "wait"
+        self.affinity_ttl = float(a.get("ttl_seconds", 172800))
+        if not math.isfinite(self.affinity_ttl) or self.affinity_ttl <= 0:
+            raise ValueError("session affinity TTL must be positive and finite")
         self.affinity_attempts = int(a.get("wait_attempts", 4))
         self.affinity_max_wait = float(a.get("max_wait_seconds", 30))
-        self.affinity_off_route = a.get("off_route", "strip")
-        if self.affinity_off_route not in ("strip", "send"):
-            self.affinity_off_route = "strip"
+        if (self.affinity_attempts < 0 or not math.isfinite(self.affinity_max_wait)
+                or self.affinity_max_wait < 0):
+            raise ValueError("invalid session affinity retry budget")
+        # Legacy mode switches are ignored during migration. Endpoint binding
+        # and full encrypted-state preservation are unconditional.
 
         self.forward_headers = policy["request"]["forward_headers"]
         self.responses_compat = policy["request"].get("responses_compat", True)
@@ -207,6 +214,9 @@ class Config:
         # path uses ai.azure.com). The token layer holds one cache per scope.
         self.scopes = {self.scope} | {
             e["scope"] for e in sources["endpoints"] if e.get("scope")}
+        self.endpoint_identities = {
+            e["name"]: endpoint_identity(e["url"], e.get("scope") or self.scope)
+            for e in sources["endpoints"]}
 
         # Give the Azure CLI its own directory before anything shells out to it.
         # AzureCliCredential spawns `az` with a copy of os.environ, so setting

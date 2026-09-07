@@ -108,6 +108,7 @@ class EventLevelTests(unittest.TestCase):
         self.assertEqual(event["event_kind"], "timeout")
         engine = Engine.__new__(Engine)
         engine.event = Mock()
+        engine.producers = {}
         engine.consume(event)
         engine.event.assert_called_once_with("timeout", "error", "test I/O timeout")
 

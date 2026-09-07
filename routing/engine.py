@@ -58,10 +58,13 @@ class Engine:
         self.now = time.time()
         self.cursor = 0
         self.pending = {}
+        self.producers = {}
         self.catalog = {}
         self.sessions = {}
         self.events = collections.deque(maxlen=2000)
         self.event_seq = 0
+        self.stream_id = uuid.uuid4().hex
+        self.retention_through = 0
         self.quota = QuotaTracker(self.config, clock=lambda: self.now,
                                  emit=self.event, persist_capacity=False)
         try:
@@ -98,6 +101,8 @@ class Engine:
         self.sessions = saved["sessions"]
         self.events.extend(normalized_event(event) for event in saved["events"])
         self.event_seq = saved["event_seq"]
+        self.stream_id = saved.get("stream_id", self.stream_id)
+        self.retention_through = saved.get("retention_through", 0)
         self.catalog = saved.get("catalog", {})
         self.quota._saved_capacity = saved["capacity"]
         entries = {}
@@ -108,6 +113,7 @@ class Engine:
             self.quota.states[key] = state
             entries.update((item[4], item) for item in state.sent if len(item) > 4)
         self.pending = saved["pending"]
+        self.producers = saved.get("producers", {})
         for key, record in self.pending.items():
             record["entry"] = entries.get(key, record["entry"])
 
@@ -115,8 +121,9 @@ class Engine:
         return dict(schema_version=SCHEMA_VERSION, cursor=self.cursor,
                     retention_epoch=int(self.now // CLEANUP_INTERVAL),
                     capacity=dict(self.quota._saved_capacity), pending=self.pending,
-                    catalog=self.catalog, sessions=self.sessions,
+                    catalog=self.catalog, sessions=self.sessions, producers=self.producers,
                     events=list(self.events), event_seq=self.event_seq,
+                    stream_id=self.stream_id, retention_through=self.retention_through,
                     states={key: {name: list(value) if isinstance(value, collections.deque)
                                   else value for name in RouteState.__slots__
                                   for value in [getattr(state, name)]}
@@ -125,6 +132,11 @@ class Engine:
     def consume(self, event):
         self.now = event["at"]
         kind = event["kind"]
+        producer = event.get("producer", "legacy")
+        if event.get("producer_pid"):
+            self.producers[producer] = dict(pid=event["producer_pid"], at=self.now)
+        if kind == "producer_heartbeat":
+            return
         if kind == "event":
             self.event(event["event_kind"], event["level"], event["message"],
                        **event.get("fields", {}))
@@ -137,8 +149,10 @@ class Engine:
             # final observations. An abrupt serving exit leaves unknown
             # completions; a new owner retires those entries without claiming
             # upstream success or timeout.
-            self.pending.clear()
-            self.sessions = {}
+            self.pending = {key: value for key, value in self.pending.items()
+                            if value.get("producer", "legacy") != producer}
+            if kind == "producer_stopped":
+                self.producers.pop(producer, None)
             return
         attempt = event.get("attempt")
         if kind == "finish":
@@ -154,7 +168,7 @@ class Engine:
             entry = self.quota.charge(
                 route, self.quota.estimate_tokens(route, event["request_bytes"]), event["face"])
             entry.append(attempt)
-            self.pending[attempt] = dict(entry=entry, route=event["route"])
+            self.pending[attempt] = dict(entry=entry, route=event["route"], producer=producer)
             self.catalog[str(route)] = dict(route=event["route"], model=event.get("model", ""))
         elif kind == "observed":
             self.quota.observed(route, event["status"], event["headers"])
@@ -169,15 +183,34 @@ class Engine:
             self.quota.note_success(route, entry)
             record["success"] = True
 
+    def weighted_targets(self, routes):
+        ordered = self.quota.order(routes)
+        return list(zip(ordered, self.quota.weights(ordered)))
+
     def snapshot(self, ready=True):
+        for producer, state in list(self.producers.items()):
+            if self.now - state["at"] < 3:
+                continue
+            try:
+                with open("/proc/{}/stat".format(state["pid"])) as file:
+                    dead = file.read().rpartition(")")[2].split()[0] == "Z"
+            except FileNotFoundError:
+                dead = True
+            if dead:
+                self.producers.pop(producer, None)
+                self.pending = {key: value for key, value in self.pending.items()
+                                if value.get("producer") != producer}
         cutoff = self.now - RETENTION_SECONDS + CLEANUP_INTERVAL
+        self.retention_through = max([self.retention_through] +
+                                    [e["seq"] for e in self.events if e["at"] <= cutoff])
         self.events = collections.deque(recent(self.events, cutoff), maxlen=2000)
         self.pending = {key: value for key, value in self.pending.items()
                         if value.get("entry") and value["entry"][0] > cutoff}
         for state in self.quota.states.values():
             state.sent = collections.deque(entry for entry in state.sent if entry[0] > cutoff)
         cfg = self.config
-        tables = {name: {model: [target_record(route) for route in self.quota.order(routes)]
+        tables = {name: {model: [dict(target_record(route), selection_weight=weight)
+                                for route, weight in self.weighted_targets(routes)]
                          for model, routes in getattr(cfg, name).items()} for name in TABLES}
         merged = {}
         for name in TABLES:
@@ -202,11 +235,13 @@ class Engine:
                       updated_at=self.now)
         config = {name: sorted(value) if isinstance(value, set) else value
                   for name in SNAPSHOT_FIELDS for value in [getattr(cfg, name)]}
+        config["endpoint_identities"] = getattr(cfg, "endpoint_identities", {})
         return dict(schema_version=SNAPSHOT_VERSION, revision=self.revision + 1,
                     config=config, tables=tables, report=report,
                     routing=dict(pid=os.getpid(), instance_id=self.instance,
                                  heartbeat=self.now, processed_seq=self.cursor, ready=ready),
                     events=dict(events=list(self.events), next=self.event_seq,
+                                stream_id=self.stream_id, retention_through=self.retention_through,
                                 counts=dict(collections.Counter(e["kind"] for e in self.events))))
 
     def step(self, ready=True):

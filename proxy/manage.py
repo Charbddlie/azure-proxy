@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -83,6 +84,7 @@ def start(role, timeout):
     with open(log_path, "ab", buffering=0) as log:
         process = subprocess.Popen([sys.executable, "-m", module], stdin=subprocess.DEVNULL,
                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                                   env=dict(os.environ, AZURE_PROXY_MANAGED_LOG="1"),
                                    cwd=os.path.dirname(os.path.dirname(__file__)))
     deadline = time.monotonic() + timeout
     accepted_revision = None
@@ -91,7 +93,7 @@ def start(role, timeout):
             raise RuntimeError("{} failed to start; see {}".format(role, log_path))
         if role == "serving":
             reply = health()
-            ready = reply and reply.get("pid") == process.pid
+            ready = reply and reply.get("supervisor", {}).get("pid", reply.get("pid")) == process.pid
         else:
             snapshot = publication()
             ready = (snapshot and snapshot["routing"].get("ready")
@@ -157,12 +159,28 @@ def main(argv=None):
         if args.action == "start":
             for name in roles:
                 refuse_online(name)
+        if args.action == "restart" and "serving" in roles:
+            from .supervisor import control_path
+            if live_pid("serving") and not os.path.exists(control_path()):
+                raise RuntimeError("legacy serving requires a scheduled first migration; wait for old sessions, then stop/start")
         if args.action in ("stop", "restart"):
             for name in reversed(roles):
-                stop(name, args.timeout, args.force)
+                if args.action != "restart" or name != "serving":
+                    stop(name, args.timeout, args.force)
         if args.action in ("start", "restart"):
             for name in roles:
-                start(name, args.timeout)
+                if args.action == "restart" and name == "serving" and live_pid(name):
+                    with socket.socket(socket.AF_UNIX) as channel:
+                        channel.settimeout(args.timeout + 10)
+                        channel.connect(control_path())
+                        channel.sendall(json.dumps(dict(action="restart", timeout=args.timeout)).encode() + b"\n")
+                        with channel.makefile("rb") as reader:
+                            result = json.loads(reader.readline())
+                    if not result.get("ok"):
+                        raise RuntimeError(result.get("error", "rolling restart failed"))
+                    print("rolled serving: " + json.dumps(result))
+                else:
+                    start(name, args.timeout)
     except (RuntimeError, OSError, ValueError) as exc:
         parser.exit(1, str(exc) + "\n")
 

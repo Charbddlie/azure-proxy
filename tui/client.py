@@ -46,7 +46,12 @@ class Poller:
         self._routes: Optional[dict] = None
         self._events: list = []
         self._cursor = 0
-        self._dropped = False
+        self._initial_loaded = False
+        self._stream_id = None
+        self._gap = None
+        self._missed = 0
+        self._unknown_gaps = 0
+        self._history = None
         self._fetched_at = 0.0
         self._error: Optional[str] = None
         self._health_fetched_at = 0.0
@@ -69,13 +74,65 @@ class Poller:
         """Skip the rest of the interval. Bound to `r`."""
         self._wake.set()
 
+    def acknowledge_gap(self):
+        with self._lock:
+            self._gap = None
+
+    def _accept_feed(self, feed):
+        """Called under the poll lock; a stale generation never rewinds a cursor."""
+        stream_id = feed.get("stream_id")
+        cursor = int(feed.get("next", self._cursor) or 0)
+        if stream_id and self._stream_id and stream_id != self._stream_id:
+            self._events = []
+            self._cursor = 0
+            self._initial_loaded = False
+            self._gap = self._history = None
+            self._missed = self._unknown_gaps = 0
+            self._stream_id = stream_id
+            return False  # Fetch latest history with an explicit initial request.
+        if cursor < self._cursor:
+            if stream_id:
+                return False
+            # Legacy protocol cannot distinguish a restart from a stale snapshot.
+            # Confirm the lower waterline on a subsequent poll before resetting.
+            if getattr(self, "_legacy_lower", None) != cursor:
+                self._legacy_lower = cursor
+                return False
+            self._events, self._cursor, self._initial_loaded = [], 0, False
+            self._gap = self._history = None
+            self._missed = self._unknown_gaps = 0
+        self._legacy_lower = None
+        self._stream_id = stream_id or self._stream_id
+        if not self._initial_loaded:
+            if (feed.get("history") or {}).get("truncated") or feed.get("dropped"):
+                self._history = "已载入最近 {} 条历史".format(len(feed.get("events") or []))
+        else:
+            gap = feed.get("gap")
+            if gap or feed.get("dropped"):
+                count = gap.get("count") if gap else None
+                reasons = [item["reason"] for item in gap.get("reasons", [])] if gap else ["legacy_unknown"]
+                self._gap = dict(count=count, reasons=reasons, at=time.time(),
+                                 deadline=time.monotonic() + 30)
+                if count is None:
+                    self._unknown_gaps += 1
+                else:
+                    self._missed += count
+        self._events.extend(e for e in (feed.get("events") or []) if e["seq"] > self._cursor)
+        self._cursor = cursor
+        self._initial_loaded = True
+        del self._events[:-4000]
+        return True
+
     # -- reading ----------------------------------------------------------
     def snapshot(self) -> dict:
         with self._lock:
             now = time.time()
             self._events = recent(self._events, now - RETENTION_SECONDS)
             return {"health": self._health, "routes": self._routes,
-                    "events": list(self._events), "dropped": self._dropped,
+                    "events": list(self._events),
+                    "gap": (dict(self._gap) if self._gap and time.monotonic() < self._gap["deadline"] else None),
+                    "missed_events": self._missed, "unknown_gaps": self._unknown_gaps,
+                    "history_notice": self._history,
                     "fetched_at": self._fetched_at, "error": self._error,
                     "age": (max(0, now - self._fetched_at)
                             if self._fetched_at else None),
@@ -107,31 +164,18 @@ class Poller:
                 self._health_error = None
             try:
                 routes = self._get("/routes")
-                feed = self._get("/events?since={}&limit={}".format(
-                    self._cursor, self.event_limit))
+                feed = self._get("/events?since={}&limit={}&initial={}".format(
+                    self._cursor, self.event_limit, str(not self._initial_loaded).lower()))
             except Exception as e:
                 with self._lock:
                     self._error = "{}: {}".format(type(e).__name__, e)
             else:
                 with self._lock:
-                    self._routes = routes
-                    cursor = int(feed.get("next", self._cursor) or 0)
-                    if cursor < self._cursor:
-                        # The proxy restarted: sequence numbers begin again at
-                        # one, so anything held is from a process that no longer
-                        # exists. Keeping it would interleave two runs' events
-                        # under one timeline.
-                        self._events = []
-                        self._dropped = False
-                    self._cursor = cursor
-                    self._events.extend(feed.get("events") or [])
-                    # Bounded independently of the server's ring: the dashboard
-                    # only ever displays a screenful, and an attached session
-                    # left running for a week should not grow.
-                    if len(self._events) > 4000:
-                        del self._events[:-4000]
-                    self._dropped = self._dropped or bool(feed.get("dropped"))
-                    self._fetched_at = time.time()
-                    self._error = None
+                    if self._accept_feed(feed):
+                        self._routes = routes
+                        self._fetched_at = time.time()
+                        self._error = None
+                    else:
+                        self._error = "event snapshot changed or stale; retrying"
             self._wake.wait(self.interval)
             self._wake.clear()

@@ -87,6 +87,8 @@ class Dashboard:
             self.offset[0] = self.offset[1] = 0
         elif seq == "r":
             self.poller.refresh_now()
+        elif seq == "c":
+            self.poller.acknowledge_gap()
 
     def _scroll(self, delta: int) -> None:
         limit = max(0, self._extent[self.board] - 1)
@@ -97,7 +99,7 @@ class Dashboard:
     def render(self):
         snapshot = Snapshot(self.poller.snapshot())
         width = self.console.width
-        header = RichGroup(_header(snapshot), _processes(snapshot),
+        header = RichGroup(_header(snapshot), _processes(snapshot), _event_notice(snapshot),
                            _tabs(self.board, snapshot, self.show_all, self.filter,
                                  self.kind_filter), Rule(style=theme.BORDER))
         footer = _footer(self, snapshot, self._extent[self.board])
@@ -230,11 +232,42 @@ def _processes(snapshot: Snapshot) -> RichGroup:
     if snapshot.heartbeat_age is not None:
         routing.append("  heartbeat {} ago".format(_duration(snapshot.heartbeat_age)),
                        style=theme.DIM if route_status == "online" else theme.WARN)
-    if state.get("backlog"):
-        routing.append("  backlog {:,}".format(state["backlog"]), style=theme.WARN)
-    if state.get("telemetry_dropped"):
-        routing.append("  dropped {:,}".format(state["telemetry_dropped"]), style=theme.CRIT)
-    return RichGroup(serving, routing)
+    telemetry = Text("telemetry backlog {:,}  pending {:,}  dropped {:,}".format(
+        state.get("backlog", 0), state.get("telemetry_pending", 0), state.get("telemetry_dropped", 0)),
+        style=theme.WARN if state.get("backlog") or state.get("telemetry_dropped") else theme.DIM,
+        no_wrap=True, overflow="ellipsis")
+    supervisor = snapshot.health.get("supervisor") or {}
+    owner = Text(no_wrap=True, overflow="ellipsis")
+    if supervisor:
+        owner.append("supervisor {} PID {}".format(
+            "online" if supervisor.get("ok") and status == "online" else "unknown",
+            supervisor.get("pid", "?")), style=theme.DIM)
+        workers = Text("active {}  draining {}".format(supervisor.get("active", "?"),
+            ",".join(map(str, supervisor.get("draining", []))) or "0"),
+            style=theme.DIM, no_wrap=True, overflow="ellipsis")
+        if supervisor.get("starting"):
+            workers.append("  starting {}".format(supervisor["starting"]), style=theme.WARN)
+    storage = snapshot.health.get("affinity_store") or {}
+    persistence = Text(no_wrap=True, overflow="ellipsis")
+    if storage:
+        persistence.append("bindings {}  pending {}".format(
+            "durable" if storage.get("ok") else "unavailable", storage.get("pending", "?")),
+            style=theme.OK if storage.get("ok") else theme.CRIT)
+    return RichGroup(serving, routing, telemetry, *([owner, workers] if supervisor else []),
+                     *([persistence] if storage else []))
+
+
+def _event_notice(snapshot):
+    if snapshot.gap:
+        labels = {"buffer_overwrite": "缓冲覆盖", "limit": "返回限额截断",
+                  "retention": "保留期清理", "legacy_unknown": "旧协议，原因未知"}
+        count = snapshot.gap.get("count")
+        return Text("轮询期间漏读 {} 条事件：{}".format(
+            count if count is not None else "未知数量",
+            "、".join(labels.get(r, r) for r in snapshot.gap.get("reasons", []))), style=theme.WARN)
+    if snapshot.history_notice:
+        return Text(snapshot.history_notice, style=theme.DIM)
+    return Text("", end="")
 
 
 def _tabs(active: int, snapshot: Snapshot, show_all: bool,
@@ -259,7 +292,7 @@ def _tabs(active: int, snapshot: Snapshot, show_all: bool,
         out.append(" ")
     sessions = (snapshot.affinity or {}).get("live_sessions")
     if sessions:
-        out.append("  {} pinned sessions".format(sessions), style=theme.ACCENT)
+        out.append("  {} endpoint-bound families".format(sessions), style=theme.ACCENT)
     return out
 
 
@@ -296,6 +329,7 @@ def _footer(dash: "Dashboard", snapshot: Snapshot, extent: int) -> Table:
     keys.append(" 刷新  ", style=theme.DIM)
     keys.append("q", style=theme.ACCENT)
     keys.append(" 退出", style=theme.DIM)
+    keys.append("  c 确认提示", style=theme.DIM)
 
     state = Text()
     if extent > 1:
@@ -312,6 +346,15 @@ def _footer(dash: "Dashboard", snapshot: Snapshot, extent: int) -> Table:
                      style=theme.WARN if snapshot.stats_stale else theme.DIM)
     if snapshot.stats_stale:
         state.append("  stale", style=theme.WARN)
+    if snapshot.missed_events or snapshot.unknown_gaps:
+        state.append("  漏读累计 {}{}".format(snapshot.missed_events,
+            " + {} 次数量未知".format(snapshot.unknown_gaps) if snapshot.unknown_gaps else ""), style=theme.WARN)
+
+    if dash.console.width < 100:
+        compact = Text("←→ 看板  ↑↓ 滚动  r 刷新  c 确认提示  q 退出", style=theme.DIM,
+                       no_wrap=True, overflow="ellipsis")
+        state.no_wrap, state.overflow = True, "ellipsis"
+        return RichGroup(compact, state)
 
     table.add_row(legend() if dash.board != 2 else keys, state)
     if dash.board != 2:

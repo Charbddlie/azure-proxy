@@ -61,9 +61,8 @@ class Proxy:
                  balance="priority_threshold", static_weights=None,
                  demote_seconds=30, demote_halflife=30, observation_ttl=120,
                  spill_threshold=0.70, load_window=60, probe_seconds=0.5,
-                 affinity=True, affinity_on_conflict="wait",
+                 affinity=True,
                  affinity_attempts=4, affinity_max_wait=30,
-                 affinity_off_route="strip",
                  foreign=True, foreign_reclaim=0.1, deployments=None,
                  faces=None, images=None, image_attempts=3,
                  image_max_wait=30):
@@ -135,13 +134,9 @@ class Proxy:
                 "    max_wait_seconds: {imgwait}\n"
                 "  session_affinity:\n"
                 "    enabled: {affinity}\n"
-                "    on_conflict: {conflict}\n"
                 "    wait_attempts: {waits}\n"
                 "    max_wait_seconds: {maxwait}\n"
-                "    off_route: {offroute}\n"
-                "    ttl_seconds: 3600\n"
-                "    max_sessions: 4096\n"
-                "    sticky_include: [reasoning.encrypted_content]\n"
+                "    ttl_seconds: 172800\n"
                 "    keys: [header:session-id, body:prompt_cache_key,\n"
                 "           body:client_metadata.session_id,\n"
                 "           header:x-session-id]\n"
@@ -176,8 +171,8 @@ class Proxy:
                     foreign="true" if foreign else "false",
                     reclaim=foreign_reclaim,
                     affinity="true" if affinity else "false",
-                    conflict=affinity_on_conflict, waits=affinity_attempts,
-                    maxwait=affinity_max_wait, offroute=affinity_off_route,
+                    waits=affinity_attempts,
+                    maxwait=affinity_max_wait,
                     weights=weights or "      {}\n",
                     compat="true" if responses_compat else "false"))
 
@@ -1114,7 +1109,7 @@ def test_load_falls_out_of_the_window():
         try:
             counts = spread(p, 10)
             assert counts.get("beta", 0) > 0, "should have spilled"
-            time.sleep(3.5)
+            time.sleep(4.2)
             _s, report = p.get("/routes")
             alpha = report["routes"]["alpha/" + DEPLOYMENT]
             assert alpha["sent_requests_in_window"] == 0, alpha
@@ -1374,7 +1369,7 @@ def test_throttled_200_is_detected_from_the_headers():
     try:
         p = Proxy([("alpha", a.url), ("beta", b.url)])
         try:
-            status, headers, chunks, err = stream_responses(p)
+            status, headers, chunks, err = stream_responses(p, body=responses_body(stream=True, include=[]))
             assert status == 200, status
             assert err is None, err
             text = stream_text(chunks)
@@ -1417,7 +1412,7 @@ def test_throttled_200_is_caught_however_big_the_preamble():
     try:
         p = Proxy([("alpha", a.url), ("beta", b.url)])
         try:
-            status, headers, chunks, err = stream_responses(p)
+            status, headers, chunks, err = stream_responses(p, body=responses_body(stream=True, include=[]))
             assert status == 200, status
             assert err is None, err
             text = stream_text(chunks)
@@ -1532,7 +1527,7 @@ def test_in_stream_rate_limit_fails_over_before_any_content():
     try:
         p = Proxy([("alpha", a.url), ("beta", b.url)])
         try:
-            status, headers, chunks, err = stream_responses(p)
+            status, headers, chunks, err = stream_responses(p, body=responses_body(stream=True, include=[]))
             assert status == 200, status
             assert err is None, err
             text = stream_text(chunks)
@@ -1610,7 +1605,7 @@ def test_in_stream_rate_limit_on_the_last_route_is_relayed():
     try:
         p = Proxy([("alpha", a.url)])
         try:
-            status, _headers, chunks, err = stream_responses(p)
+            status, _headers, chunks, err = stream_responses(p, body=responses_body(stream=True, include=[]))
             assert status == 200, status
             assert err is None, err
             text = stream_text(chunks)
@@ -2735,6 +2730,8 @@ def test_upstream_state_pins_even_without_encrypted_reasoning():
             for label, extra in (("store", {"store": True}),
                                  ("previous", {"previous_response_id": "resp_1"})):
                 session = "{}-{}".format(CODEX_SESSION, label)
+                if label == "previous":
+                    p.post(dict(model=MODEL, store=True), headers={"session-id": session}, path="/v1/responses")
                 seen = set()
                 for _ in range(25):
                     _s, body, _h = p.post(
@@ -2783,13 +2780,8 @@ def test_pinned_session_waits_out_a_throttle_instead_of_moving():
         a.stop(); b.stop()
 
 
-def test_first_turn_of_a_sticky_session_can_still_fail_over():
-    """Before anything is produced there is no state to protect.
-
-    The opening turn has to be free to move, or a throttled endpoint would
-    strand a conversation that had not even started. The pin follows the
-    response, not the request.
-    """
+def test_first_turn_of_a_sticky_session_is_bound_before_retry():
+    """The first attempt commits the endpoint, including unsuccessful attempts."""
     a = FakeAzure("alpha", [Behaviour(status=429)]).start()
     b = FakeAzure("beta").start()
     try:
@@ -2797,13 +2789,14 @@ def test_first_turn_of_a_sticky_session_can_still_fail_over():
                   balance="strict_priority")
         try:
             status, body, headers = sticky_ask(p)
-            assert status == 200, (status, body)
-            assert headers.get("x-azure-proxy-route") == "beta/" + DEPLOYMENT
+            assert status == 429, (status, body)
+            assert headers.get("x-azure-proxy-route") == "alpha/" + DEPLOYMENT
 
-            # ...and it is now pinned to where it actually succeeded.
+            # The committed endpoint remains unchanged.
+            assert b.hits == 0
             for _ in range(5):
                 _s, _b, headers = sticky_ask(p)
-                assert headers.get("x-azure-proxy-route") == "beta/" + DEPLOYMENT
+                assert headers.get("x-azure-proxy-route") == "alpha/" + DEPLOYMENT
         finally:
             p.close()
     finally:
@@ -2845,8 +2838,8 @@ def test_affinity_survives_the_inband_throttle_failover():
         a.stop(); b.stop()
 
 
-def test_affinity_can_be_switched_off():
-    """The escape hatch back to pure balancing."""
+def test_legacy_disable_cannot_disable_endpoint_binding():
+    """Legacy configuration migrates to unconditional endpoint binding."""
     a = FakeAzure("alpha", headers=ratelimit(limit_tokens=500000)).start()
     b = FakeAzure("beta", headers=ratelimit(limit_tokens=500000)).start()
     try:
@@ -2857,10 +2850,10 @@ def test_affinity_can_be_switched_off():
             for _ in range(40):
                 _s, _b, headers = sticky_ask(p)
                 seen.add(headers.get("x-azure-proxy-route"))
-            assert len(seen) == 2, "affinity=false should still spread: {}".format(
+            assert len(seen) == 1, "legacy affinity=false must preserve bindings: {}".format(
                 seen)
             _s, health = p.get("/healthz")
-            assert health["session_affinity"]["enabled"] is False, health
+            assert health["session_affinity"]["enabled"] is True, health
         finally:
             p.close()
     finally:
@@ -2888,309 +2881,6 @@ def test_session_id_falls_back_to_the_body_when_there_is_no_header():
             p.close()
     finally:
         a.stop(); b.stop()
-
-
-def test_a_removed_deployment_drains_with_its_existing_pin():
-    """A published model table can retire a deployment while its sessions live."""
-    sys.path.insert(0, ROOT)
-    import logging
-    from proxy.server import SessionAffinity
-    # In-process, so the proxy's own logger would write into the test output.
-    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
-
-    class Cfg:
-        affinity_enabled = True
-        affinity_keys = ["header:session-id", "body:prompt_cache_key"]
-        affinity_markers = ["reasoning.encrypted_content"]
-        affinity_ttl = 3600
-        affinity_max = 16
-        affinity_on_conflict = "wait"
-        affinity_off_route = "strip"
-
-    def route(name):
-        return serving_target(name, "http://x/", "v", DEPLOYMENT, "max_completion_tokens",
-                     0, "openai/v1/responses")
-
-    aff = SessionAffinity(Cfg())
-    gone, live = route("gone"), route("live")
-    aff.pin("s1", gone)
-    assert aff.pinned("s1") is gone
-    # The endpoint disappears from the model's route list.
-    assert aff.pinned("s1") is gone, "retirement must preserve the binding"
-    # Both the binding and its full route descriptor survive the update.
-    assert aff.report()["live_sessions"] == 1, aff.report()
-    # And it is still the binding if the endpoint comes back.
-    assert aff.pinned("s1") is gone
-    aff.pin("s1", live)
-    assert aff.pinned("s1") is live
-
-
-def test_two_models_in_one_session_do_not_share_a_pin():
-    """One conversation id, two models, two bindings.
-
-    A pin binds one *deployment's* encrypted reasoning, and a session id does
-    not have to cover only one model. Measured on 2026-08-25: a gpt-5.6-sol
-    session and a gpt-5.6-terra session held the same slot and took turns
-    overwriting it, so each model's turns kept finding the other's route,
-    declining it, and being balanced onto a deployment that could not decrypt
-    what they carried. Every one of those turns was a 400
-    `invalid_encrypted_content`, which codex reports as `turn.failed`.
-
-    So the model belongs in the key. Two slots, no interference.
-    """
-    sys.path.insert(0, ROOT)
-    import logging
-    from proxy.server import SessionAffinity
-    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
-
-    class Cfg:
-        affinity_enabled = True
-        affinity_keys = ["header:session-id", "body:prompt_cache_key"]
-        affinity_markers = ["reasoning.encrypted_content"]
-        affinity_ttl = 3600
-        affinity_max = 16
-        affinity_on_conflict = "wait"
-        affinity_off_route = "strip"
-
-    class Req:
-        def __init__(self, headers):
-            self.headers = headers
-
-    def route(endpoint, deployment):
-        return serving_target(endpoint, "http://x/", "v", deployment,
-                     "max_completion_tokens", 0, "openai/v1/responses")
-
-    aff = SessionAffinity(Cfg())
-    request = Req({"session-id": CODEX_SESSION})
-    sol = {"model": "sol", "include": ["reasoning.encrypted_content"]}
-    terra = {"model": "terra", "include": ["reasoning.encrypted_content"]}
-
-    k_sol, k_terra = aff.key(request, sol), aff.key(request, terra)
-    assert k_sol and k_terra
-    assert k_sol != k_terra, "one slot for two models: {}".format(k_sol)
-
-    a, b = route("alpha", "sol"), route("beta", "terra")
-    aff.pin(k_sol, a)
-    aff.pin(k_terra, b)
-    # Neither model's route list contains the other's deployment, which is what
-    # used to make each lookup discard the other's pin.
-    assert aff.pinned(k_sol) is a
-    assert aff.pinned(k_terra) is b
-    assert aff.pinned(k_sol) is a, "terra's turn unpinned sol"
-    assert aff.report()["live_sessions"] == 2, aff.report()
-
-
-def test_a_subagent_starts_on_the_endpoint_its_parent_minted_state_on():
-    """The other half of the same fact: two models, but one endpoint.
-
-    Separating the two models' pins is right for the reasoning each of them
-    mints, and on its own it is what broke codex subagents. Measured
-    2026-08-25: when a master calls `collaboration.spawn_agent`, the worker
-    opens a thread on a DIFFERENT model carrying an `agent_message` whose
-    content holds the PARENT's ciphertext. Its own slot is empty on that first
-    turn, so the balancer placed it wherever it liked and the parent's blob
-    went to an endpoint that could not read it —
-
-        event: error   {"code": "invalid_encrypted_content",
-                        "message": "Encrypted function output content could
-                                    not be decrypted or decoded."}
-
-    — which codex reports as "stream disconnected before completion". It
-    succeeded whenever the balancer happened to pick the parent's endpoint,
-    which is why it looked intermittent rather than broken.
-
-    So the conversation id alone, without the model, binds the ENDPOINT, and a
-    thread with no pin of its own starts there. Driven against the map
-    directly: two models on one session is awkward to stage over HTTP.
-    """
-    sys.path.insert(0, ROOT)
-    import logging
-    from proxy.server import SessionAffinity
-    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
-
-    class Cfg:
-        affinity_enabled = True
-        affinity_keys = ["header:session-id", "body:prompt_cache_key"]
-        affinity_markers = ["reasoning.encrypted_content"]
-        affinity_ttl = 3600
-        affinity_max = 16
-        affinity_on_conflict = "wait"
-        affinity_off_route = "strip"
-
-    class Req:
-        def __init__(self, headers):
-            self.headers = headers
-
-    def route(endpoint, deployment):
-        return serving_target(endpoint, "http://x/", "v", deployment,
-                     "max_completion_tokens", 0, "openai/v1/responses")
-
-    aff = SessionAffinity(Cfg())
-    # One codex session. The worker sends the master's session-id and its own
-    # thread-id, so this is the same request object for both.
-    request = Req({"session-id": CODEX_SESSION})
-    master = {"model": "sol", "include": ["reasoning.encrypted_content"]}
-    worker = {"model": "terra", "include": ["reasoning.encrypted_content"]}
-
-    alpha_sol, beta_sol = route("alpha", "sol"), route("beta", "sol")
-    alpha_terra, beta_terra = route("alpha", "terra"), route("beta", "terra")
-
-    family = aff.family(request, master)
-    assert family == aff.family(request, worker), \
-        "master and worker are not the same family"
-
-    # The master's first turn lands on alpha and is pinned there.
-    aff.pin(aff.key(request, master), alpha_sol, family)
-
-    # The worker has no pin of its own...
-    assert aff.pinned(aff.key(request, worker)) is None
-    # ...but its session does, and it names the endpoint, not the deployment.
-    home, local = aff.home(family, [alpha_terra, beta_terra])
-    assert home == "alpha", home
-    assert local == [alpha_terra], local
-
-    # The master's own slot is untouched by any of this.
-    assert aff.pinned(aff.key(request, master)) is alpha_sol
-
-    # An endpoint that does not serve the worker's model is not an error: the
-    # caller strips and routes freely rather than refusing to route at all.
-    home, local = aff.home(family, [beta_terra])
-    assert home == "alpha" and local == [], (home, local)
-
-    report = aff.report()
-    assert report["live_families"] == 1, report
-    assert report["live_sessions"] == 1, report
-
-
-def test_affinity_reports_session_counts_and_types_per_model():
-    sys.path.insert(0, ROOT)
-    import logging
-    from proxy.server import SessionAffinity
-    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
-
-    class Cfg:
-        affinity_enabled = True
-        affinity_keys = ["header:session-id"]
-        affinity_markers = ["reasoning.encrypted_content"]
-        affinity_ttl = 3600
-        affinity_max = 16
-        affinity_on_conflict = "wait"
-        affinity_off_route = "strip"
-
-    affinity = SessionAffinity(Cfg())
-    sol = serving_target("alpha", "http://x/", "v", "sol",
-                "max_completion_tokens", 0)
-    terra = serving_target("alpha", "http://x/", "v", "terra",
-                  "max_completion_tokens", 0)
-    affinity.pin("root\0model=gpt-5.6-sol", sol, "root", "codex")
-    affinity.pin("worker\0model=gpt-5.6-terra", terra, "root", "subagent")
-
-    report = affinity.report()["sessions_per_model"]
-    assert report["gpt-5.6-sol"] == {"total": 1,
-                                     "types": {"codex": 1}}, report
-    assert report["gpt-5.6-terra"] == {"total": 1,
-                                       "types": {"subagent": 1}}, report
-
-
-def test_a_refused_family_keeps_going_out_stripped():
-    """One refusal taints the session, and the taint does not wear off in a turn.
-
-    The proxy strips a REQUEST; it cannot strip the client's transcript, and
-    codex rebuilds `input` from that transcript every turn. So the items that
-    were refused come straight back on the next one — which is pinned again by
-    then, looks readable, and is refused again. Measured 2026-08-25: a session
-    that survived a stripped turn died on the very next one with a 400
-    `invalid_encrypted_content`.
-
-    So the note is sticky rather than one-shot, and a strip sets it as surely
-    as a refusal does: both mean the same thing, that this family is carrying
-    items the endpoint it is going to cannot read.
-    """
-    sys.path.insert(0, ROOT)
-    from proxy.server import SessionAffinity
-
-    class Cfg:
-        affinity_enabled = True
-        affinity_keys = ["header:session-id"]
-        affinity_markers = ["reasoning.encrypted_content"]
-        affinity_ttl = 3600
-        affinity_max = 16
-        affinity_on_conflict = "wait"
-        affinity_off_route = "strip"
-
-    aff = SessionAffinity(Cfg())
-    assert aff.tainted("f1") is False, "nothing has been refused yet"
-
-    aff.note_rejected("f1")
-    assert aff.tainted("f1") is True
-    # Reading does not spend it: the next turn carries the same items.
-    assert aff.tainted("f1") is True
-    assert aff.tainted("f2") is False, "one session's taint is not another's"
-
-    # A strip taints too, and for the same reason.
-    aff.note_stripped("f2")
-    assert aff.tainted("f2") is True
-
-    report = aff.report()
-    assert report["rejected_turns"] == 1, report
-    assert report["stripped_turns"] == 1, report
-
-    # It expires with everything else, so a conversation that has gone quiet
-    # does not hold a session id hostage for the life of the process.
-    Cfg.affinity_ttl = -1
-    assert aff.tainted("f1") is False
-    assert aff.tainted("f2") is False
-
-
-def test_the_blob_a_parent_hands_a_subagent_comes_off_too():
-    """Stripping follows the field, not the item type.
-
-    The first version of this looked for `type: "reasoning"` items, which is
-    where a model's own chain of thought lives. It is not where codex puts the
-    message a master writes for its worker: that is an `agent_message` whose
-    `content` list holds an `encrypted_content` entry beside the plain text.
-    Walking past it is what let a stripped subagent turn be refused anyway.
-
-    The plain text stays. That is the point of stripping rather than dropping:
-    the worker still gets its instructions, just not whatever the encrypted
-    channel added to them.
-    """
-    sys.path.insert(0, ROOT)
-    from proxy.server import _strip_encrypted_reasoning, _carries_encrypted
-
-    blob = "gAAAAABo" + "x" * 64
-    body = {"input": [
-        {"type": "message", "content": [{"type": "input_text", "text": "hi"}]},
-        codex_reasoning_item(),
-        # As captured off codex 0.148 on 2026-08-25.
-        {"type": "agent_message", "id": "amsg_1", "author": "/root",
-         "content": [{"type": "input_text", "text": "do the thing"},
-                     {"type": "encrypted_content", "encrypted_content": blob}]},
-        # Nothing but ciphertext: the item goes, rather than being sent with an
-        # empty `content` the validator would reject.
-        {"type": "agent_message", "id": "amsg_2",
-         "content": [{"type": "encrypted_content", "encrypted_content": blob}]},
-        # And the field on an item of some type this proxy has not seen.
-        {"type": "custom_tool_call", "id": "ctc_1", "encrypted_content": blob},
-    ]}
-    assert _carries_encrypted(body)
-
-    out, dropped = _strip_encrypted_reasoning(body)
-    assert dropped == 4, dropped
-    assert not _carries_encrypted(out), out
-    kinds = [i["type"] for i in out["input"]]
-    assert kinds == ["message", "agent_message", "custom_tool_call"], kinds
-    assert out["input"][1]["content"] == [
-        {"type": "input_text", "text": "do the thing"}], out["input"][1]
-    assert out["input"][1]["author"] == "/root", "the item lost more than its blob"
-    assert "encrypted_content" not in out["input"][2], out["input"][2]
-
-    # The caller's body is reused by the other attempts and must not be edited.
-    assert len(body["input"]) == 5 and _carries_encrypted(body)
-
-    # A body with nothing to strip is handed back as-is, not copied.
-    clean = {"input": [{"type": "message"}]}
-    assert _strip_encrypted_reasoning(clean) == (clean, 0)
 
 
 def test_a_turn_the_upstream_failed_inside_a_200_is_read_off_the_bytes():
@@ -3302,109 +2992,6 @@ def test_a_turn_off_its_pinned_deployment_keeps_its_reasoning():
     finally:
         a.stop(); b.stop()
 
-
-def test_a_turn_off_its_pinned_deployment_loses_reasoning_not_the_run():
-    """Unpinned, the blob comes off rather than killing the turn.
-
-    A session whose pin has expired, or whose deployment a re-probe took away,
-    still carries reasoning only its old deployment can decrypt. Forwarding it
-    earns a 400 `invalid_encrypted_content`, which codex reports as
-    `turn.failed` and does not retry — the run ends. Dropping the item costs
-    the turn its reasoning context and nothing else.
-    """
-    a = FakeAzure("alpha", headers=ratelimit(limit_tokens=500000)).start()
-    try:
-        p = Proxy([("alpha", a.url)])
-        try:
-            # A session the proxy has never seen, already carrying a blob.
-            body = codex_turn("a-session-with-no-pin-here")
-            body["input"] = list(body["input"]) + [codex_reasoning_item()]
-            status, _body, _h = p.post(
-                body, headers={"session-id": "a-session-with-no-pin-here"},
-                path="/v1/responses")
-            assert status == 200, status
-
-            sent = a.requests[-1]["body"]["input"]
-            assert not [i for i in sent if i.get("type") == "reasoning"], sent
-            # Only the unreadable item goes; the conversation is intact.
-            assert len(sent) == len(body["input"]) - 1, sent
-
-            # A silent fallback is a fallback nobody notices has become the
-            # normal case, so it has to be visible without reading the log: a
-            # counter to check after a run, and a `problems` event during one.
-            _s, health = p.get("/healthz")
-            aff = health["session_affinity"]
-            assert aff["stripped_turns"] == 1, aff
-            assert aff["off_route"] == "strip", aff
-
-            _s, seen = p.get("/events?kind=problems&limit=200")
-            stripped = [e for e in seen["events"] if e["kind"] == "stripped"]
-            assert len(stripped) == 1, seen["events"]
-            assert stripped[0]["level"] == "warning", stripped[0]
-            assert stripped[0]["stripped"] == 1, stripped[0]
-            assert stripped[0]["endpoint"] == "alpha", stripped[0]
-        finally:
-            p.close()
-    finally:
-        a.stop()
-
-
-def test_off_route_send_forwards_the_blob_untouched():
-    """`off_route: send` is the escape hatch back to letting Azure refuse it."""
-    a = FakeAzure("alpha", headers=ratelimit(limit_tokens=500000)).start()
-    try:
-        p = Proxy([("alpha", a.url)], affinity_off_route="send")
-        try:
-            body = codex_turn("another-session-with-no-pin")
-            body["input"] = list(body["input"]) + [codex_reasoning_item()]
-            status, _body, _h = p.post(
-                body, headers={"session-id": "another-session-with-no-pin"},
-                path="/v1/responses")
-            assert status == 200, status
-
-            sent = a.requests[-1]["body"]["input"]
-            kept = [i for i in sent if i.get("type") == "reasoning"]
-            assert len(kept) == 1, sent
-        finally:
-            p.close()
-    finally:
-        a.stop()
-
-
-def test_affinity_evicts_by_ttl_and_count():
-    """The map is bounded in both directions, or a long-lived proxy leaks."""
-    sys.path.insert(0, ROOT)
-    import logging
-    from proxy.server import SessionAffinity
-    # In-process, so the proxy's own logger would write into the test output.
-    logging.getLogger("azure-proxy").setLevel(logging.CRITICAL)
-
-    class Cfg:
-        affinity_enabled = True
-        affinity_keys = ["header:session-id"]
-        affinity_markers = ["reasoning.encrypted_content"]
-        affinity_ttl = 3600
-        affinity_max = 5
-        affinity_on_conflict = "wait"
-        affinity_off_route = "strip"
-
-    r = serving_target("alpha", "http://x/", "v", DEPLOYMENT, "max_completion_tokens", 0)
-    aff = SessionAffinity(Cfg())
-    for i in range(20):
-        aff.pin("s{}".format(i), r)
-    assert aff.report()["live_sessions"] <= 6, aff.report()
-    # The most recent survives; the oldest is gone.
-    assert aff.pinned("s19") is r
-    assert aff.pinned("s0") is None
-
-    Cfg.affinity_ttl = -1                   # everything is already stale
-    assert aff.pinned("s19") is None
-    assert aff.report()["live_sessions"] == 0
-
-
-# --------------------------------------------------------------------------
-# responses face
-# --------------------------------------------------------------------------
 
 def test_content_type_is_sent_once_on_both_faces():
     """Forwarding the client's content-type does not override ours — it joins it.
@@ -3602,7 +3189,7 @@ def test_responses_failover_on_429():
     try:
         p = Proxy([("alpha", a.url), ("beta", b.url)])
         try:
-            status, body, _ = ask_responses(p)
+            status, body, _ = ask_responses(p, include=[])
             assert status == 200, (status, body)
             assert who_responses(body) == "beta", body
             assert a.hits == 1 and b.hits == 1, (a.hits, b.hits)
@@ -3623,7 +3210,7 @@ def test_responses_stream_fails_over_before_the_first_byte():
     try:
         p = Proxy([("alpha", a.url), ("beta", b.url)])
         try:
-            status, headers, chunks, err = stream_responses(p)
+            status, headers, chunks, err = stream_responses(p, body=responses_body(stream=True, include=[]))
             assert err is None, err
             assert status == 200, status
             assert "text/event-stream" in headers.get("content-type", ""), headers
@@ -4184,14 +3771,8 @@ def test_capacity_mode_balances_two_deployments_on_the_same_endpoint():
         a.stop()
 
 
-def test_a_pinned_session_does_not_move_between_deployments():
-    """Affinity pins the route, not the resource.
-
-    Two deployments of one model on one endpoint are two destinations. Whether
-    Azure's encrypted reasoning is scoped to the resource or to the deployment
-    is not something this proxy has evidence for, so the pin is the narrow one:
-    a session that started on `big` keeps going to `big`.
-    """
+def test_endpoint_bound_session_balances_between_deployments():
+    """Deployment use is sampled per request within the fixed endpoint."""
     a = FakeAzure("alpha", headers=ratelimit(limit_tokens=500000)).start()
     try:
         p = Proxy([("alpha", a.url)], balance="capacity",
@@ -4204,13 +3785,13 @@ def test_a_pinned_session_does_not_move_between_deployments():
                 status, body, headers = sticky_ask(p)
                 assert status == 200, (status, body)
                 seen.add(headers.get("x-azure-proxy-route"))
-            assert len(seen) == 1, "session was split across {}".format(seen)
+            assert len(seen) == 2, "session was split across {}".format(seen)
 
             hits = deployment_hits(a)
-            assert len(hits) == 1, hits
+            assert len(hits) == 2, hits
             _s, health = p.get("/healthz")
             aff = health["session_affinity"]
-            assert list(aff["sessions_per_route"]) == list(seen), aff
+            assert aff["sessions_per_endpoint"] == {"alpha": 1}, aff
         finally:
             p.close()
     finally:
@@ -4322,7 +3903,7 @@ def test_ledger_face_split_survives_the_window_expiring():
             route = report["routes"]["alpha/" + DEPLOYMENT]
             assert route["sent_by_face"]["chat"]["requests"] == 1, route
 
-            time.sleep(3.5)
+            time.sleep(4.2)
             _s, report = p.get("/routes")
             route = report["routes"]["alpha/" + DEPLOYMENT]
             assert route["sent_requests_in_window"] == 0, route

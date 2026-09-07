@@ -131,8 +131,8 @@ class Store:
     def read_events(self, after, limit=2000, through=None):
         bound = " AND seq<=?" if through is not None else ""
         args = (after, through, limit) if through is not None else (after, limit)
-        return [(seq, json.loads(payload)) for seq, payload in self.db.execute(
-            "SELECT seq,payload FROM telemetry WHERE seq>?" + bound + " ORDER BY seq LIMIT ?",
+        return [(seq, dict(json.loads(payload), producer=producer)) for seq, producer, payload in self.db.execute(
+            "SELECT seq,producer,payload FROM telemetry WHERE seq>?" + bound + " ORDER BY seq LIMIT ?",
             args)]
 
     def expire(self, now=None):
@@ -160,6 +160,8 @@ class Store:
                     prune_checkpoint(value, cutoff)
                 feed = value if name == "events" else value.get("events") if name == "snapshot" else None
                 if isinstance(feed, dict):
+                    feed["retention_through"] = max([feed.get("retention_through", 0)] +
+                        [e["seq"] for e in feed.get("events", []) if e["at"] <= cutoff])
                     feed["events"] = recent(feed.get("events", []), cutoff)
                     feed["counts"] = dict(collections.Counter(e["kind"] for e in feed["events"]))
                 updated = encode(value)
@@ -179,7 +181,7 @@ class Store:
         publication = {key: value for key, value in snapshot.items() if key != "events"}
         records = [("snapshot", encode(publication))]
         feed = snapshot["events"]
-        event_key = (feed["next"], len(feed["events"]),
+        event_key = (feed.get("stream_id"), feed.get("retention_through"), feed["next"], len(feed["events"]),
                      feed["events"][0].get("seq") if feed["events"] else None)
         if (self._checkpoint_cursor != checkpoint["cursor"]
                 or self._event_key != event_key

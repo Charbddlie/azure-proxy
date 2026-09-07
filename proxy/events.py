@@ -115,3 +115,39 @@ def event_level(kind: str, level: str = "info", fields=None) -> str:
 
 def normalized_event(event: dict) -> dict:
     return dict(event, level=event_level(event.get("kind", ""), event.get("level", "info"), event))
+
+
+def event_feed(feed, since=0, limit=400, kind=None, initial=False, now=None):
+    """A complete cursor interval, with explicit history and unread-loss metadata."""
+    import collections
+    import time
+    from .retention import RETENTION_SECONDS
+    now = time.time() if now is None else now
+    cursor = feed.get("next", 0)
+    expired = [e["seq"] for e in feed.get("events", []) if e["at"] <= now - RETENTION_SECONDS]
+    expiry = max([feed.get("retention_through", 0)] + expired)
+    held = [e for e in feed.get("events", []) if e["at"] > now - RETENTION_SECONDS]
+    fresh = [e for e in held if initial or e["seq"] > since]
+    reasons = []
+    if not initial and cursor >= since:
+        lost = max(0, cursor - since - len(fresh))
+        retention = min(lost, max(0, min(cursor, expiry) - since))
+        if retention:
+            reasons.append(dict(reason="retention", count=retention))
+        if lost > retention:
+            reasons.append(dict(reason="buffer_overwrite", count=lost - retention))
+    kinds = (PROBLEM_KINDS if kind == "problems" else
+             frozenset(k.strip() for k in kind.split(",")) if kind else None)
+    if kinds is not None:
+        fresh = [e for e in fresh if e["kind"] in kinds]
+    skipped = max(0, len(fresh) - limit) if limit > 0 else 0
+    if skipped:
+        fresh = fresh[-limit:]
+        if not initial:
+            reasons.append(dict(reason="limit", count=skipped))
+    count = sum(item["count"] for item in reasons)
+    return dict(events=fresh, next=cursor, dropped=bool(count),
+                stream_id=feed.get("stream_id"), initial=initial,
+                history=dict(truncated=initial and (cursor > len(fresh)), loaded=len(fresh)),
+                gap=dict(count=count, reasons=reasons, since=since, through=cursor) if count else None,
+                counts=dict(collections.Counter(e["kind"] for e in held)))
