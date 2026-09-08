@@ -195,6 +195,9 @@ class Config:
         self.affinity_ttl = float(a.get("ttl_seconds", 172800))
         if not math.isfinite(self.affinity_ttl) or self.affinity_ttl <= 0:
             raise ValueError("session affinity TTL must be positive and finite")
+        self.affinity_active_window = float(a.get("active_window_seconds", 300))
+        if not math.isfinite(self.affinity_active_window) or self.affinity_active_window <= 0:
+            raise ValueError("session affinity active window must be positive and finite")
         self.affinity_attempts = int(a.get("wait_attempts", 4))
         self.affinity_max_wait = float(a.get("max_wait_seconds", 30))
         if (self.affinity_attempts < 0 or not math.isfinite(self.affinity_max_wait)

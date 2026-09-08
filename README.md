@@ -1114,13 +1114,28 @@ foreign=0.989 → 0.889 → 0.789 → 0.689 → 0.589      每分钟正好 -0.10
 主会话与 subagent 共享 endpoint，可选择其中不同模型和 deployment。
 routing 发布 deployment 权重，serving 逐请求抽样并在该 endpoint 内重试。
 
+Codex 的 `/btw`、`/side` 和 `/fork` 会生成新的会话标识。serving 从
+`x-codex-turn-metadata` header，或请求体
+`client_metadata["x-codex-turn-metadata"]` 的 JSON 字符串中读取
+`forked_from_thread_id`，原子地复制父会话的有效 endpoint 绑定和路由描述。
+每个分支独立续期，后续请求和重启均可复用新绑定。该逻辑适用于所有模型别名和
+endpoint 名称；目标模型需要在父会话绑定的 endpoint 上可用。
+如果分支尚无绑定且父绑定缺失或到期，携带旧状态的请求仍返回 `affinity_missing`。
+通过 copilot-api 等中间网关调用时，请保留上述 header 或请求体中的元数据副本。
+
 ```yaml
 routing:
   session_affinity:
     ttl_seconds: 172800
+    active_window_seconds: 300
     wait_attempts: 4
     max_wait_seconds: 30
 ```
+
+`active_window_seconds` 控制看板统计的活跃窗口，默认 300 秒，须为正有限数。
+窗口内有请求的绑定会话、以及仍有请求在途的会话计入总数、源和模型统计。
+`ttl_seconds` 独立控制持久化绑定的保留时间。超出活跃窗口后绑定继续保留，
+恢复请求时会重新出现在看板中。修改活跃窗口后执行 `./restart.sh serving` 滚动生效。
 
 `runtime/affinity.sqlite3` 使用 WAL、FULL 同步、短事务和 0600 文件权限。
 唯一 family 键保证并发首请求和多个 worker 只能提交一个绑定；提交成功后才允许派发。
@@ -1136,14 +1151,17 @@ routing:
 |---|---|
 | 状态请求缺少会话标识 | `session_id_required`（400） |
 | 携带密文或 previous_response_id，但绑定缺失或到期 | `affinity_missing`（409） |
+| 分支首次继承时，并发创建的绑定与父会话 endpoint 不一致 | `affinity_parent_conflict`（409） |
 | 原 endpoint 无法提供目标模型 | `bound_model_unavailable`（404） |
 | 同名 endpoint 资源身份改变 | `endpoint_identity_conflict`（409） |
 | 新绑定或必要续期无法提交 | `affinity_store_unavailable`（503） |
 
 绑定一经确定，限流、超时和兼容性错误均不改变 endpoint。所有重试保留加密字段与内容顺序；
 上游兼容性错误原样返回。旧配置中的模式开关不再改变绑定行为。
-`sessions_per_endpoint` 表示 endpoint 绑定数；`sessions_per_model` 按模型提供
-`total` 和 `endpoints` 明细。统计记录保存在绑定数据库内，随绑定过期清理。
+`live_sessions`、`sessions_per_endpoint` 和 `sessions_per_model` 均按活跃窗口筛选。
+模型统计提供 `total` 和 `endpoints` 明细；同一活跃会话可以出现在其使用过的多个模型中。
+`retained_sessions` 表示全部未过期绑定数，`active_window_seconds` 返回当前统计窗口。
+统计记录保存在绑定数据库内，随绑定过期清理。
 
 完整历史重放语义参考 [OpenAI reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)。
 同 endpoint 跨 deployment 兼容性以 [脱敏实验结果](test/results/) 为依据，不能据此保证

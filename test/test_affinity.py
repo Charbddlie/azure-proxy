@@ -20,7 +20,7 @@ from test_split import config_at, edit_models, fixture, wait_for, wait_routing
 from proxy.affinity import (AffinityStore, AffinityError, SessionAffinity,
                             carries_encrypted, digest, resource, weighted_order)
 from proxy.bridge import Target
-from proxy.config import TABLES
+from proxy.config import Config, TABLES
 from routing.engine import Engine, target_record
 
 
@@ -31,6 +31,115 @@ def bind_in_process(root, endpoint, queue):
 
 
 class StoreTests(unittest.TestCase):
+    def test_active_window_filters_all_counts_without_expiring_bindings(self):
+        with tempfile.TemporaryDirectory() as root:
+            now = [1000]
+            store = AffinityStore(root, clock=lambda: now[0], active_window=300)
+            for family in ("idle", "unattributed"):
+                store.bind(family, "alpha", "identity", {})
+            store.note_model("idle", "sol")
+            now[0] = 1300
+            self.assertEqual(store.report()["live_sessions"], 2)
+            now[0] += .01
+            report = store.report()
+            self.assertEqual(report["live_sessions"], 0)
+            self.assertEqual(report["sessions_per_endpoint"], {})
+            self.assertEqual(report["sessions_per_model"], {})
+            self.assertEqual(report["unattributed_sessions"], 0)
+            self.assertEqual(report["retained_sessions"], 2)
+            self.assertEqual(report["active_window_seconds"], 300)
+            binding = store.get("idle")
+            self.assertIsNotNone(binding)
+            store.touch("idle", binding["expires"])
+            store.flush()
+            report = store.report()
+            self.assertEqual(report["live_sessions"], 1)
+            self.assertEqual(report["sessions_per_endpoint"], dict(alpha=1))
+            self.assertEqual(report["sessions_per_model"], dict(sol=dict(total=1, endpoints=dict(alpha=1))))
+            store.close()
+            store = AffinityStore(root, clock=lambda: now[0], active_window=600)
+            self.assertEqual(store.report()["live_sessions"], 2)
+            store.close()
+
+    def test_invalid_active_window(self):
+        with tempfile.TemporaryDirectory() as root:
+            for window in (0, -1, float("nan"), float("inf")):
+                with self.assertRaisesRegex(ValueError, "active window"):
+                    AffinityStore(root, active_window=window)
+
+    def test_fork_inherits_durable_descriptor_and_has_independent_activity(self):
+        with tempfile.TemporaryDirectory() as root:
+            now = [1000]
+            store = AffinityStore(root, clock=lambda: now[0])
+            source = store.bind("parent", "alpha", "identity", {"tables": {"old": []}})
+            store.note_model("parent", "parent-model")
+            now[0] += 301
+            child = store.inherit("child", "parent")
+            self.assertEqual(child["catalog"], source["catalog"])
+            self.assertEqual(child["endpoint"], "alpha")
+            self.assertTrue(child["created"])
+            self.assertEqual(store.report()["live_sessions"], 1)
+            self.assertEqual(store.report()["sessions_per_model"], {})
+            self.assertEqual(store.report()["retained_sessions"], 2)
+            store.close()
+            store = AffinityStore(root, clock=lambda: now[0])
+            self.assertEqual(store.get("child")["endpoint"], "alpha")
+            self.assertEqual(store.inherit("grandchild", "child")["endpoint"], "alpha")
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM descriptors").fetchone()[0], 1)
+            self.assertFalse(store.inherit("child", "parent").get("created", False))
+            store.close()
+
+    def test_missing_or_expired_parent_is_not_used_to_create_a_binding(self):
+        with tempfile.TemporaryDirectory() as root:
+            now = [1000]
+            store = AffinityStore(root, ttl=10, clock=lambda: now[0])
+            self.assertIsNone(store.inherit("child", "missing"))
+            store.bind("parent", "alpha", "identity", {})
+            now[0] += 11
+            self.assertIsNone(store.inherit("child", "parent"))
+            self.assertIsNone(store.get("child"))
+            store.close()
+
+    def test_bound_fork_no_longer_depends_on_parent_lifetime(self):
+        affinity = SessionAffinity(SimpleNamespace(responses_routes={"model": []},
+            endpoint_identities={}, scope="scope", routes={}, image_routes={}, image_edit_routes={}), "unused")
+        target = Mock(endpoint="alpha", scope="scope", selection_weight=None,
+                      routing_data={"url": "https://alpha.example/"})
+        affinity.cfg.responses_routes["model"] = [target]
+        affinity.store = Mock()
+        binding = dict(endpoint="alpha", identity=resource(target, "scope"), expires=9999)
+        affinity.store.get.return_value = binding
+        routes, result = affinity.resolve("child", dict(model="model", input=[{"encrypted_content": "cipher"}]),
+                                          "responses_routes", parent="parent")
+        self.assertEqual(routes, [target])
+        self.assertIs(result, binding)
+        affinity.store.inherit.assert_not_called()
+
+    def test_inheritance_cannot_move_an_existing_child(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = AffinityStore(root)
+            store.bind("parent", "alpha", "identity", {})
+            store.bind("child", "beta", "other-identity", {})
+            with self.assertRaises(AffinityError) as error:
+                store.inherit("child", "parent")
+            self.assertEqual(error.exception.code, "affinity_parent_conflict")
+            self.assertEqual(store.get("child")["endpoint"], "beta")
+            store.close()
+
+    def test_parent_metadata_is_optional_and_validated(self):
+        for raw in (None, "", "broken", "[]", "null", '{"forked_from_thread_id":42}',
+                    '{"forked_from_thread_id":" "}', " " * 16385):
+            self.assertIsNone(SessionAffinity.parent_family(SimpleNamespace(
+                headers={"x-codex-turn-metadata": raw})))
+        self.assertEqual(SessionAffinity.parent_family(SimpleNamespace(headers={
+            "x-codex-turn-metadata": '{"forked_from_thread_id":" parent "}'})), digest("parent"))
+        body = dict(client_metadata={"x-codex-turn-metadata": '{"forked_from_thread_id":"parent"}'})
+        self.assertEqual(SessionAffinity.parent_family(SimpleNamespace(headers={}), body), digest("parent"))
+        for value in (None, [], "bad", {"x-codex-turn-metadata": 42},
+                      {"x-codex-turn-metadata": {"forked_from_thread_id": "parent"}}):
+            self.assertIsNone(SessionAffinity.parent_family(SimpleNamespace(headers={}),
+                                                           dict(client_metadata=value)))
+
     def test_model_counts_are_unique_per_family_endpoint_and_persist(self):
         with tempfile.TemporaryDirectory() as root:
             store = AffinityStore(root)
@@ -192,6 +301,89 @@ class StoreTests(unittest.TestCase):
 
 
 class AffinityIntegrationTests(unittest.TestCase):
+    def test_fork_inheritance_is_model_and_endpoint_name_agnostic(self):
+        a, b = FakeAzure("renamed-resource"), FakeAzure("future-backup")
+        a.start()
+        b.start()
+        p = None
+        try:
+            p = Proxy([("renamed-resource", a.url), ("future-backup", b.url)])
+            p.stop_routing()
+            edit_models(p, lambda doc: doc["models"].update({
+                name: copy.deepcopy(doc["models"][MODEL])
+                for name in ("gpt-7-azure", "arbitrary-model-alias")}))
+            p.start_routing()
+            wait_routing(p)
+            parent = dict(CODEX_BODY, prompt_cache_key="parent")
+            self.assertEqual(p.post(parent, path="/v1/responses")[0], 200)
+            for model in ("gpt-7-azure", "arbitrary-model-alias"):
+                body = dict(CODEX_BODY, model=model, prompt_cache_key=model,
+                            input=[{"encrypted_content": "parent-state"}],
+                            client_metadata={"x-codex-turn-metadata":
+                                             '{"forked_from_thread_id":"parent"}'})
+                result = p.post(body, path="/v1/responses")
+                self.assertEqual(result[0], 200, result)
+                self.assertEqual(result[2]["x-azure-proxy-route"], "renamed-resource/" + DEPLOYMENT)
+            self.assertEqual(b.hits, 0)
+        finally:
+            if p:
+                p.close()
+            a.stop()
+            b.stop()
+
+    def test_ephemeral_fork_inherits_parent_then_survives_restart_and_nested_forks(self):
+        from test_rolling import roll
+        with fixture() as (p, a, b):
+            self.assertEqual(p.post(dict(CODEX_BODY, prompt_cache_key="parent"),
+                                   path="/v1/responses")[0], 200)
+            p.stop_routing()
+            def retire(doc):
+                for entry in doc["models"].values():
+                    entry["routes"] = [route for route in entry["routes"] if route["endpoint"] == "beta"]
+            edit_models(p, retire)
+            p.start_routing()
+            wait_routing(p)
+            items = [{"type": "reasoning", "encrypted_content": "parent-cipher"}]
+            for parent, child in (("parent", "side"), ("side", "grandchild")):
+                body = dict(CODEX_BODY, stream=False, prompt_cache_key=child, input=items)
+                headers = {"session-id": child, "thread-id": child, "x-codex-turn-metadata":
+                           json.dumps(dict(forked_from_thread_id=parent, session_id=child))}
+                if child == "grandchild":
+                    body["client_metadata"] = {"x-codex-turn-metadata": headers["x-codex-turn-metadata"]}
+                    headers = {}  # copilot-api's provider route forwards only the body copy.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(lambda _: p.post(body, headers=headers, path="/v1/responses"), range(4)))
+                self.assertTrue(all(r[0] == 200 for r in results), results)
+                self.assertTrue(all(r[2]["x-azure-proxy-route"] == "alpha/" + DEPLOYMENT for r in results))
+                self.assertEqual(a.requests[-1]["body"]["input"], items)
+                self.assertTrue(roll(p)["ok"])
+                wait_for(lambda: not p.get_raw("/healthz")[1]["supervisor"]["draining"])
+                self.assertEqual(p.post(body, path="/v1/responses")[0], 200)
+            self.assertEqual(b.hits, 0)
+            self.assertEqual(p.get("/healthz")[1]["session_affinity"]["retained_sessions"], 3)
+
+    def test_unknown_fork_parent_fails_before_dispatch(self):
+        with fixture() as (p, a, b):
+            body = dict(CODEX_BODY, prompt_cache_key="side", input=[{"encrypted_content": "cipher"}])
+            result = p.post(body, headers={"x-codex-turn-metadata":
+                            '{"forked_from_thread_id":"unknown"}'}, path="/v1/responses")
+            self.assertEqual(result[0], 409)
+            self.assertEqual(result[1]["error"]["code"], "affinity_missing")
+            self.assertEqual(a.hits + b.hits, 0)
+
+    def test_active_window_setting_is_validated(self):
+        with fixture() as (p, a, b):
+            policy = config_at(p.home).policy
+            self.assertEqual(config_at(p.home).affinity_active_window, 300)
+            for window in (0, -1, float("nan"), float("inf")):
+                policy["routing"]["session_affinity"]["active_window_seconds"] = window
+                with patch("proxy.config.yaml.safe_load", return_value=policy):
+                    with self.assertRaisesRegex(ValueError, "active window"):
+                        Config(load_routes=False)
+            policy["routing"]["session_affinity"]["active_window_seconds"] = 600
+            with patch("proxy.config.yaml.safe_load", return_value=policy):
+                self.assertEqual(Config(load_routes=False).affinity_active_window, 600)
+
     def test_first_dispatch_is_committed_and_concurrent_family_never_splits(self):
         a, b = FakeAzure("alpha", [Behaviour(delay=.2)]).start(), FakeAzure("beta").start()
         p = Proxy([("alpha", a.url), ("beta", b.url)], balance="capacity")
@@ -296,7 +488,7 @@ class AffinityIntegrationTests(unittest.TestCase):
         import asyncio
         with tempfile.TemporaryDirectory() as root:
             async def run():
-                config = SimpleNamespace(affinity_ttl=.4)
+                config = SimpleNamespace(affinity_ttl=.4, affinity_active_window=.2)
                 affinity = SessionAffinity(config, root)
                 await affinity.start()
                 try:
@@ -305,6 +497,7 @@ class AffinityIntegrationTests(unittest.TestCase):
                     affinity.active[key] = 1
                     await asyncio.sleep(1.1)
                     self.assertIsNotNone(affinity.store.get(key))
+                    self.assertEqual((await affinity.status())["live_sessions"], 1)
                     affinity.active.clear()
                     await asyncio.sleep(.6)
                     self.assertIsNone(affinity.store.get(key))

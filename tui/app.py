@@ -343,8 +343,13 @@ def _status_line(snapshot: Snapshot) -> Text:
 
 def _proxy_status(snapshot: Snapshot):
     affinity = snapshot.affinity
-    pins = Text("会话绑定统计  {} pinned".format(affinity.get("live_sessions", "?")),
+    window = affinity.get("active_window_seconds")
+    label = "活跃会话绑定" if window is not None else "会话绑定统计"
+    pins = Text("{}  {} pinned".format(label, affinity.get("live_sessions", "?")),
                 style=theme.LABEL)
+    if window is not None:
+        duration = "{:g} 分钟".format(window / 60) if window >= 60 else "{:g} 秒".format(window)
+        pins.append("  近 {}，含进行中的请求".format(duration), style=theme.DIM)
     if not affinity.get("model_tracking"):
         pins.append("  源 × 模型明细等待 serving 升级", style=theme.DIM)
     elif affinity.get("unattributed_sessions"):

@@ -13,7 +13,7 @@ from rich.cells import cell_len
 
 from tui import theme
 from tui.app import (INPUT_HZ, Dashboard, _InputReader, _footer, _mouse_tracking,
-                     _processes, _status_line, _tabs, _top_bar)
+                     _processes, _proxy_status, _status_line, _tabs, _top_bar)
 from tui.bars import FACES, capacity_bar, rpm_capacity, legend
 from tui.boards import (BOARDS, render_groups, _source_card, _model_card, _row_pins,
                         _pinned_value, _route_rows, _usage_number, _card_widths)
@@ -722,6 +722,16 @@ class SourceLayoutTests(unittest.TestCase):
 
 
 class PinnedCardTests(unittest.TestCase):
+    def test_status_labels_the_configured_active_window(self):
+        snapshot = self.snapshot()
+        snapshot.affinity.update(active_window_seconds=300, retained_sessions=99)
+        text = render(_proxy_status(snapshot), 180)
+        self.assertIn("活跃会话绑定  9 pinned", text)
+        self.assertIn("近 5 分钟，含进行中的请求", text)
+        self.assertNotIn("99 pinned", text)
+        snapshot.affinity["active_window_seconds"] = 30
+        self.assertIn("近 30 秒", render(_proxy_status(snapshot), 180))
+
     def snapshot(self):
         return Snapshot({"routes": {
             "routes": {key: dict(capacity_rpm=10, model_version="2026-07-09") for key in (

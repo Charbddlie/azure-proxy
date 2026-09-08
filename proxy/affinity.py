@@ -55,10 +55,13 @@ def weighted_order(routes):
 
 
 class AffinityStore:
-    def __init__(self, root, ttl=172800, clock=time.time):
+    def __init__(self, root, ttl=172800, clock=time.time, active_window=300):
         if not math.isfinite(ttl) or ttl <= 0:
             raise ValueError("session affinity TTL must be positive and finite")
+        if not math.isfinite(active_window) or active_window <= 0:
+            raise ValueError("session affinity active window must be positive and finite")
         self.ttl, self.clock = ttl, clock
+        self.active_window = active_window
         self.lock = threading.RLock()
         self.dirty = {}
         self.catalog_cache = collections.OrderedDict()
@@ -84,6 +87,7 @@ class AffinityStore:
                 descriptor TEXT NOT NULL REFERENCES descriptors(id),
                 activity REAL NOT NULL, expires REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS bindings_expiry ON bindings(expires);
+            CREATE INDEX IF NOT EXISTS bindings_activity ON bindings(activity);
             CREATE INDEX IF NOT EXISTS bindings_descriptor ON bindings(descriptor);
             CREATE TABLE IF NOT EXISTS binding_models (
                 family TEXT NOT NULL REFERENCES bindings(family), model TEXT NOT NULL,
@@ -130,6 +134,26 @@ class AffinityStore:
         self.error = None
         return dict(endpoint=endpoint, identity=identity, catalog=catalog, expires=now + self.ttl, created=True)
 
+    def inherit(self, family, parent):
+        """Atomically give a fork its parent's endpoint and retained catalog."""
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            source = self._get(parent)
+            if not source:
+                return None
+            winner = self._get(family)
+            if winner:
+                if (winner["endpoint"], winner["identity"]) != (source["endpoint"], source["identity"]):
+                    raise AffinityError("affinity_parent_conflict", "fork and parent have different endpoint bindings")
+                return winner
+            now = self.clock()
+            self.db.execute("DELETE FROM binding_models WHERE family=?", (family,))
+            self.db.execute("INSERT OR REPLACE INTO bindings "
+                            "SELECT ?,endpoint,descriptor,?,? FROM bindings WHERE family=?",
+                            (family, now, now + self.ttl, parent))
+        self.error = None
+        return dict(source, expires=now + self.ttl, created=True)
+
     def note_model(self, family, model):
         """Remember each model used by an unexpired endpoint-bound family once."""
         with self.lock:
@@ -151,7 +175,7 @@ class AffinityStore:
                 self.flush_due()
 
     def flush_due(self):
-        if self.clock() - self.last_flush >= min(1.0, self.ttl / 4):
+        if self.clock() - self.last_flush >= min(1.0, self.ttl / 4, self.active_window / 4):
             self.flush()
 
     def flush(self):
@@ -187,21 +211,25 @@ class AffinityStore:
 
     def report(self):
         with self.lock:
+            self.flush_due()
             now = self.clock()
+            cutoff = now - self.active_window
             counts = dict(self.db.execute("SELECT endpoint,COUNT(*) FROM bindings "
-                                         "WHERE expires>? GROUP BY endpoint", (now,)))
+                                         "WHERE expires>? AND activity>=? GROUP BY endpoint", (now, cutoff)))
             models = {}
             for model, endpoint, count in self.db.execute(
                     "SELECT m.model,b.endpoint,COUNT(*) FROM binding_models m "
-                    "JOIN bindings b ON b.family=m.family WHERE b.expires>? "
-                    "GROUP BY m.model,b.endpoint", (now,)):
+                    "JOIN bindings b ON b.family=m.family WHERE b.expires>? AND b.activity>=? "
+                    "GROUP BY m.model,b.endpoint", (now, cutoff)):
                 entry = models.setdefault(model, dict(total=0, endpoints={}))
                 entry["total"] += count
                 entry["endpoints"][endpoint] = count
             unattributed = self.db.execute(
-                "SELECT COUNT(*) FROM bindings b WHERE b.expires>? AND NOT EXISTS "
-                "(SELECT 1 FROM binding_models m WHERE m.family=b.family)", (now,)).fetchone()[0]
+                "SELECT COUNT(*) FROM bindings b WHERE b.expires>? AND b.activity>=? AND NOT EXISTS "
+                "(SELECT 1 FROM binding_models m WHERE m.family=b.family)", (now, cutoff)).fetchone()[0]
+            retained = self.db.execute("SELECT COUNT(*) FROM bindings WHERE expires>?", (now,)).fetchone()[0]
             return dict(enabled=True, mode="endpoint", ttl_seconds=self.ttl,
+                        active_window_seconds=self.active_window, retained_sessions=retained,
                         live_sessions=sum(counts.values()), sessions_per_endpoint=counts,
                         sessions_per_model=models, model_tracking=True,
                         unattributed_sessions=unattributed,
@@ -243,8 +271,25 @@ class SessionAffinity:
                 or body.get("store") is True
                 or "reasoning.encrypted_content" in (body.get("include") or []))
 
+    @staticmethod
+    def parent_family(request, body=None):
+        """Read fork ancestry from Codex's header or its provider-forwarded body copy."""
+        client_metadata = (body or {}).get("client_metadata")
+        client_metadata = client_metadata if isinstance(client_metadata, dict) else {}
+        raw = request.headers.get("x-codex-turn-metadata")
+        raw = raw or client_metadata.get("x-codex-turn-metadata")
+        if not isinstance(raw, str) or not raw or len(raw) > 16384:
+            return None
+        try:
+            metadata = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        parent = metadata.get("forked_from_thread_id") if isinstance(metadata, dict) else None
+        return digest(parent.strip()) if isinstance(parent, str) and parent.strip() else None
+
     async def start(self):
-        self.store = await asyncio.to_thread(AffinityStore, self.root, self.cfg.affinity_ttl)
+        self.store = await asyncio.to_thread(AffinityStore, self.root, self.cfg.affinity_ttl,
+                                            active_window=getattr(self.cfg, "affinity_active_window", 300))
         self.last_report = await asyncio.to_thread(self.store.report)
         self.task = asyncio.create_task(self.run())
 
@@ -270,7 +315,7 @@ class SessionAffinity:
         return dict(tables=tables, images={endpoint: self.cfg.image_deployments[endpoint]}
                     if endpoint in self.cfg.image_deployments else {})
 
-    def resolve(self, family, body, table):
+    def resolve(self, family, body, table, parent=None):
         routes = list(getattr(self.cfg, table).get(body["model"], []))
         required = self.sticky(body)
         if not family:
@@ -278,6 +323,8 @@ class SessionAffinity:
                 raise AffinityError("session_id_required", "stateful request requires a session/family ID", 400)
             return routes, None
         binding = self.store.get(family)
+        if not binding and parent and parent != family:
+            binding = self.store.inherit(family, parent) or binding
         if not binding:
             if carries_encrypted(body) or body.get("previous_response_id"):
                 raise AffinityError("affinity_missing", "state has no unexpired endpoint binding")
@@ -308,7 +355,8 @@ class SessionAffinity:
     async def prepare(self, request, body, table):
         family = self.family(request, body)
         try:
-            routes, binding = await asyncio.to_thread(self.resolve, family, body, table)
+            routes, binding = await asyncio.to_thread(self.resolve, family, body, table,
+                                                     self.parent_family(request, body))
         except (sqlite3.Error, OSError) as exc:
             self.store.error = type(exc).__name__
             raise AffinityError("affinity_store_unavailable", "endpoint binding could not be persisted", 503) from exc
@@ -351,7 +399,7 @@ class SessionAffinity:
             except (sqlite3.Error, OSError) as exc:
                 self.store.error = type(exc).__name__
                 self.last_report["persistence"] = dict(ok=False, error=self.store.error)
-            await asyncio.sleep(min(0.5, self.cfg.affinity_ttl / 4))
+            await asyncio.sleep(min(0.5, self.cfg.affinity_ttl / 4, self.store.active_window / 4))
 
     def report(self):
         return self.last_report
