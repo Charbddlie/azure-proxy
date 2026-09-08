@@ -779,7 +779,7 @@ def test_unknown_model_is_rejected_locally():
         a.stop()
 
 
-def test_models_endpoint_lists_routes_in_priority_order():
+def test_models_endpoint_hides_routing_details():
     a = FakeAzure("alpha").start()
     b = FakeAzure("beta").start()
     try:
@@ -787,8 +787,11 @@ def test_models_endpoint_lists_routes_in_priority_order():
         try:
             status, body = p.get("/v1/models")
             assert status == 200
-            entry = next(m for m in body["data"] if m["id"] == MODEL)
-            assert entry["routes"] == ["alpha", "beta"], entry["routes"]
+            assert body == {
+                "object": "list",
+                "data": [{"id": MODEL, "object": "model", "owned_by": "azure",
+                          "faces": ["chat", "responses"]}],
+            }, body
         finally:
             p.close()
     finally:
@@ -3822,8 +3825,8 @@ def test_a_responses_only_model_is_listed_and_not_offered_on_chat():
         try:
             _s, models = p.get("/v1/models")
             entry, = models["data"]
-            assert entry["id"] == MODEL, entry
-            assert entry["faces"] == ["responses"], entry
+            assert entry == {"id": MODEL, "object": "model", "owned_by": "azure",
+                             "faces": ["responses"]}, entry
 
             status, body, _h = ask(p)
             assert status == 404, (status, body)
@@ -4309,8 +4312,12 @@ def test_image_models_are_listed_and_kept_off_the_text_faces():
         try:
             _status, listed = p.get("/v1/models")
             by_id = {m["id"]: m for m in listed["data"]}
-            assert by_id[IMAGE_MODEL]["faces"] == ["image", "image_edits"], by_id
-            assert by_id[MODEL]["faces"] == ["chat", "responses"], by_id
+            assert by_id == {
+                IMAGE_MODEL: {"id": IMAGE_MODEL, "object": "model", "owned_by": "azure",
+                              "faces": ["image", "image_edits"]},
+                MODEL: {"id": MODEL, "object": "model", "owned_by": "azure",
+                        "faces": ["chat", "responses"]},
+            }, by_id
 
             status, body = ask(p, model=IMAGE_MODEL)[:2]
             assert status == 404, body

@@ -501,13 +501,7 @@ async def list_models():
                 "id": name,
                 "object": "model",
                 "owned_by": "azure",
-                # Not part of the OpenAI schema; harmless to clients and the
-                # fastest way to see a model's failover depth and which of the
-                # faces it can be reached on.
-                "routes": [r.endpoint for r in
-                           (cfg.routes.get(name)
-                            or cfg.responses_routes.get(name)
-                            or cfg.image_routes.get(name) or [])],
+                # Publish client-facing capabilities; keep routing topology internal.
                 "faces": [f for f, table in tables if name in table],
             }
             for name in names

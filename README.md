@@ -286,7 +286,7 @@ serving 保持旧映射并显示告警。内存观测队列上限为 100,000 条
 | `POST /v1/responses` | Responses API，流式与非流式都支持 |
 | `POST /v1/images/generations` | 生图，JSON。字段就是 OpenAI 那套 `model/prompt/n/size/quality` |
 | `POST /v1/images/edits` | 改图，multipart。body 原样转发，只读出 `model` 用来选路由 |
-| `GET /v1/models` | 可用模型 + 每个模型的路由链和支持的面 |
+| `GET /v1/models` | 可用模型及支持的 API 类型；隐藏内部模型映射、部署名和 endpoint |
 | `GET /healthz` | 存活、每个面各有几个模型、凭据目录、上次探测时间、当前 `balance` 模式和溢出阈值、监听地址、已运行时长 |
 | `GET /routes` | 每条路由的当前 RPM、持久化的最大安全 RPM、限流时观测到的 `others` RPM、按五个「面」拆开的 RPM、当前权重、429 次数、降权状态、钉住的会话 |
 | `GET /events` | 最近的结构化事件环，看板的数据源。`?since=<游标>&limit=&kind=`，`kind=problems` 只要出问题的那几类 |
