@@ -35,8 +35,8 @@ from .snapshot import Group, RouteView, Snapshot
 BOARDS = ("sources", "models", "events", "proxy")
 BOARD_TITLES = {"sources": "源", "models": "模型", "events": "事件流", "proxy": "proxy 状态"}
 
-MIN_CARD = 46
-CARD_WIDTH_SCALE = 1.5
+MAX_CARD = 93
+CARD_GAP = 2
 ROW_GAP = 1
 CARD_SIDE_PADDING = 2
 
@@ -212,8 +212,8 @@ def _load_or_none(value: float) -> Optional[float]:
 # boards
 # --------------------------------------------------------------------------
 
-def _grid(cards, widths, gap: int = 2) -> Table:
-    """Lay one row of cards out so the row fills the width exactly."""
+def _grid(cards, widths, gap: int = CARD_GAP) -> Table:
+    """Lay one row of cards out at the supplied widths, aligned left."""
     table = Table.grid(padding=(0, 0))
     for i, w in enumerate(widths):
         if i:
@@ -259,14 +259,13 @@ class _SourceColumns:
 
 
 def _card_widths(width, snapshot, show_all):
-    """Widen the shared source/model grid, then fit whole columns to the terminal."""
+    """Add columns as needed to fill the terminal within the card width cap."""
     reference = snapshot.sources or snapshot.visible_groups(snapshot.models, show_all)
-    min_card = max(MIN_CARD, min(80, max((cell_len(g.name) + 20 for g in reference), default=MIN_CARD)))
-    original = column_widths(width, len(reference), min_card)
-    if not original:
-        return original
-    target = math.ceil(sum(original) / len(original) * CARD_WIDTH_SCALE)
-    return column_widths(width, len(reference), target)
+    if not reference or width <= 0:
+        return []
+    columns = min(len(reference), math.ceil((width + CARD_GAP) / (MAX_CARD + CARD_GAP)))
+    grid_width = min(width, columns * MAX_CARD + (columns - 1) * CARD_GAP)
+    return column_widths(grid_width, columns, min_card=1, gap=CARD_GAP)
 
 
 def render_groups(groups: List[Group], width: int, height: int, offset: int,

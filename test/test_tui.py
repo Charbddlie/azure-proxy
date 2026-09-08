@@ -15,7 +15,7 @@ from tui import theme
 from tui.app import (INPUT_HZ, Dashboard, _InputReader, _footer, _mouse_tracking,
                      _processes, _proxy_status, _status_line, _tabs, _top_bar)
 from tui.bars import FACES, capacity_bar, rpm_capacity, legend
-from tui.boards import (BOARDS, render_groups, _source_card, _model_card, _row_pins,
+from tui.boards import (BOARDS, MAX_CARD, render_groups, _source_card, _model_card, _row_pins,
                         _pinned_value, _route_rows, _usage_number, _card_widths)
 from tui.client import Poller
 from tui.snapshot import Snapshot, RouteView
@@ -670,13 +670,64 @@ class CompactStatusTests(unittest.TestCase):
 
 
 class SourceLayoutTests(unittest.TestCase):
-    def test_card_widths_keep_one_and_a_half_scale_and_fit_narrow_terminals(self):
+    def test_card_widths_are_capped_and_fit_narrow_terminals(self):
         routes = {"source-{}/deployment".format(i): {} for i in range(6)}
         snapshot = Snapshot(dict(routes=dict(routes=routes)))
         self.assertEqual(_card_widths(300, snapshot, True), [74, 74, 73, 73])
+        self.assertEqual(_card_widths(237, snapshot, True), [78, 78, 77])
+        self.assertEqual(_card_widths(2000, snapshot, True), [93] * 6)
+        self.assertEqual(_card_widths(137, snapshot, True), [68, 67])
         self.assertEqual(_card_widths(60, snapshot, True), [60])
         self.assertEqual(_card_widths(40, snapshot, True), [40])
+        self.assertEqual(_card_widths(0, snapshot, True), [])
         self.assertEqual(_card_widths(300, Snapshot({}), True), [])
+
+    def test_columns_are_added_as_soon_as_the_width_cap_is_exceeded(self):
+        routes = {"yifanyang-foundry-img-polandcentral-{}/deployment".format(i): {}
+                  for i in range(6)}
+        snapshot = Snapshot(dict(routes=dict(routes=routes)))
+        for width, expected in ((93, [93]), (94, [46, 46]),
+                                (160, [79, 79]), (188, [93, 93]),
+                                (189, [62, 62, 61]), (200, [66, 65, 65]),
+                                (250, [82, 82, 82]), (283, [93, 93, 93]),
+                                (284, [70, 70, 69, 69])):
+            with self.subTest(width=width):
+                self.assertEqual(_card_widths(width, snapshot, True), expected)
+
+    def test_resizing_preserves_width_cap_and_monotonic_column_count(self):
+        for count in (1, 2, 6):
+            for name in ("source", "yifanyang-foundry-img-polandcentral", "源" * 50):
+                routes = {"{}-{}/deployment".format(name, i): {} for i in range(count)}
+                snapshot = Snapshot(dict(routes=dict(routes=routes)))
+                previous_columns = 0
+                for width in range(1, 1001):
+                    with self.subTest(count=count, name=name, width=width):
+                        widths = _card_widths(width, snapshot, True)
+                        self.assertLessEqual(max(widths), MAX_CARD)
+                        self.assertGreaterEqual(min(widths), 1)
+                        self.assertLessEqual(max(widths) - min(widths), 1)
+                        self.assertEqual(sum(widths) + 2 * (len(widths) - 1),
+                                         min(width, count * MAX_CARD + 2 * (count - 1)))
+                        self.assertLessEqual(len(widths), count)
+                        self.assertGreaterEqual(len(widths), previous_columns)
+                        previous_columns = len(widths)
+
+    def test_rendered_cards_keep_the_width_cap_on_both_boards(self):
+        routes = {"source-{}/deployment".format(i): {} for i in range(6)}
+        models = {"model-{}".format(i): [dict(route=key)]
+                  for i, key in enumerate(routes)}
+        snapshot = Snapshot(dict(routes=dict(routes=routes, models=models)))
+        for width in (94, 137, 160, 188, 189, 200, 250, 282, 283, 284, 340, 1000):
+            for kind, groups in (("source", snapshot.sources), ("model", snapshot.models)):
+                with self.subTest(width=width, kind=kind):
+                    board, _ = render_groups(groups, width, 30, 0, "activity", snapshot, kind, True)
+                    text = render(board, width)
+                    borders = re.findall(r"╭[^╭╮\n]*╮", text)
+                    self.assertEqual(len(borders), len(groups))
+                    self.assertTrue(all(cell_len(border) <= MAX_CARD for border in borders))
+                    self.assertTrue(all(cell_len(line) <= width for line in text.splitlines()))
+                    self.assertEqual(max(cell_len(line.rstrip()) for line in text.splitlines()),
+                                     min(width, len(groups) * MAX_CARD + 2 * (len(groups) - 1)))
 
     def test_model_cards_share_source_column_widths_even_with_more_models(self):
         endpoints = ("long-source-foundry-eastus2", "another-source-foundry-westus")
@@ -696,7 +747,7 @@ class SourceLayoutTests(unittest.TestCase):
             self.assertEqual([call.args[1] for call in cards.call_args_list],
                              [sources.widths[i % len(sources.widths)] for i in range(len(snapshot.models))])
             if width == 160:
-                self.assertEqual(sources.widths, [160])
+                self.assertEqual(sources.widths, [79, 79])
 
     def test_long_source_stands_alone_and_short_sources_stack(self):
         routes, models = {}, {}
