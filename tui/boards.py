@@ -32,7 +32,7 @@ from .bars import capacity_bar, rpm_capacity, si
 from .layout import column_widths, rows, truncate
 from .snapshot import Group, RouteView, Snapshot
 
-BOARDS = ("sources", "models", "events", "proxy")
+BOARDS = ("models", "sources", "events", "proxy")
 BOARD_TITLES = {"sources": "源", "models": "模型", "events": "事件流", "proxy": "proxy 状态"}
 
 MAX_CARD = 93

@@ -11,7 +11,7 @@ from proxy.config import BALANCE_ALIASES, Config, Route, TABLES
 from proxy.events import event_level, normalized_event
 from proxy.state import SCHEMA_VERSION, Store
 from proxy.retention import CLEANUP_INTERVAL, RETENTION_SECONDS, prune_checkpoint, recent
-from .quota import DEFAULT_TPM, QuotaTracker, RouteState
+from .quota import DEFAULT_RPM, QuotaTracker, RouteState
 
 
 # These fields also describe deployments in v1 telemetry and checkpoints.
@@ -51,8 +51,8 @@ class Engine:
         if cfg.balance_configured != cfg.balance:
             level = logging.INFO if cfg.balance_configured in BALANCE_ALIASES else logging.WARNING
             log.log(level, "routing.balance=%r resolved to %s", cfg.balance_configured, cfg.balance)
-        log.info("routing balance=%s spill_threshold=%s load_window=%ss cold-start TPM=%s",
-                 cfg.balance, cfg.spill_threshold, cfg.load_window, DEFAULT_TPM)
+        log.info("routing balance=%s spill_threshold=%s rpm_window=%ss cold-start RPM=%s",
+                 cfg.balance, cfg.spill_threshold, cfg.rpm_window, DEFAULT_RPM)
         self.store = Store(root)
         self.instance = uuid.uuid4().hex
         self.now = time.time()
@@ -110,8 +110,9 @@ class Engine:
             state = RouteState(key)
             for name, value in record.items():
                 setattr(state, name, collections.deque(value) if name == "sent" else value)
-            # Older checkpoints retain the raw estimate even after its decay.
-            state.foreign_seen = state.foreign_seen or state.foreign > 0.0
+            # Explicit database values, including an initialized False, take precedence.
+            if "foreign_seen" not in record:
+                state.foreign_seen = state.other_rpm > 0.0
             self.quota.states[key] = state
             entries.update((item[4], item) for item in state.sent if len(item) > 4)
         self.pending = saved["pending"]

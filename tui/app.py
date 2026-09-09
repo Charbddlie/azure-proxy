@@ -48,7 +48,7 @@ class Dashboard:
         self.poller = poller
         self.console = console
         self.scroll_lines = scroll_lines
-        self.board = 0
+        self.board = BOARDS.index("models")
         self.offset = [0] * len(BOARDS)  # one scroll position per board
         self.filter = DEFAULT_EVENT_FILTER
         self.kind_filter = 0
@@ -158,10 +158,11 @@ class Dashboard:
                          self.show_all)
             cached = self._card_cache.get(self.board)
             if cached is None or cached[0] != cache_key:
+                is_model = BOARDS[self.board] == "models"
                 body, _ = render_groups(
-                    snapshot.models if self.board == 1 else snapshot.sources,
+                    snapshot.models if is_model else snapshot.sources,
                     width, height, 0, "activity", snapshot,
-                    "model" if self.board == 1 else "source", self.show_all)
+                    "model" if is_model else "source", self.show_all)
                 lines = self.console.render_lines(body, options)
                 self._card_cache[self.board] = (cache_key, lines)
             else:

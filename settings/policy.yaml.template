@@ -175,94 +175,22 @@ routing:
 
     # ---- other tenants on the same deployment ------------------------------
     #
-    # The load window above counts only what THIS proxy sent. Quota is granted
-    # per deployment and shared with anyone else holding credentials for it —
-    # on this box there are eight other proxies under a different account
-    # pointed at the same endpoints, and two of them could not be read to find
-    # out which deployments they use. Assuming we are alone means walking into a
-    # wall that is invisible from here.
-    #
-    # There is exactly one moment when the other tenants become observable: when
-    # Azure refuses. A throttle says total consumption hit the ceiling, and our
-    # own share of that total is already known, so
-    #
-    #     foreign = clamp(1 - our_load_at_throttle, 0, 1)
-    #
-    # A throttle while we are at 0.9 says it was mostly us. A throttle while we
-    # are at 0.05 says someone else has 95% of the deployment and we were just
-    # the request that arrived last. That second case is the whole point, and
-    # watching foreign_load in GET /routes over a long run is also how to settle
-    # whether anyone else is really on gpt-5.6-sol.
-    #
-    # priority_threshold spills on our_load + foreign_load. Capacity sampling
-    # subtracts foreign and current proxy usage from the estimated ceiling,
-    # then applies temporary failure penalties and the minimum weight.
+    # RPM estimates match the dashboard: safe_rpm is the maximum proven by
+    # completed requests; throttles reveal max(0, safe_rpm - dispatch RPM).
+    # Later successful requests can reduce the outside-RPM estimate.
     foreign_load:
-      # false disables the foreign-usage deduction in both routing modes.
+      # Legacy switches retained for configuration compatibility.
+      # Learned RPM observations are always used and persist until updated.
       enabled: true
+      reclaim_per_minute: 0.0
 
-      # How fast the estimate is given back, in units of "fraction of the
-      # ceiling per minute". 0.1 forgets a 100% estimate over ten minutes.
-      #
-      # This is the additive-increase half of AIMD, and the shape is chosen, not
-      # incidental. An exponential halflife returns capacity FASTEST in the
-      # minute right after a throttle — exactly when the deployment is known to
-      # be contended and caution is worth the most — and then trails off for a
-      # long time afterwards when the estimate is stale and worth the least. It
-      # is backwards in both halves. Linear reclaim is constant and gentle.
-      #
-      # AIMD is also the only increase/decrease pairing that converges to a fair
-      # split between controllers that cannot see each other; AIAD and MIMD do
-      # not. Several of the other proxies here are plausibly adaptive too, so
-      # this is load-bearing rather than tidy.
-      #
-      # OSCILLATION, at this rate. The loop is: throttle -> estimate jumps up ->
-      # we send less -> no more throttles -> estimate reclaims -> we send more
-      # -> throttle. Its period is (how far the estimate must fall before our
-      # traffic pushes the total back to 1.0) / rate. Against a steady foreign
-      # load of 0.8 the proxy overshoots by roughly the share it can add before
-      # hitting the ceiling — about 0.2 — so the cycle is ~2 minutes and costs
-      # ONE throttled request, which now fails over transparently. Worst case,
-      # a full 1.0 estimate, is 10 minutes. Both are an order of magnitude above
-      # demote_seconds (30s) and Retry-After (measured 1-8s), which is what
-      # keeps the fast controller and the slow one from fighting. Raising this
-      # much past 0.2 collapses that separation and produces the repeated
-      # wall-hitting it is meant to avoid.
-      reclaim_per_minute: 0.1
-
-      # Reclaim does not begin until the throttle's Retry-After has elapsed —
-      # Azure states how long this congestion is expected to last, so there is
-      # no reason to guess at that timescale. Set by the response, not here.
-      #
-      # IDLE ROUTES STILL RECLAIM. The alternative — freezing the estimate while
-      # a route receives no traffic — was considered and rejected: the estimate
-      # describes the world, and the world changes whether or not we are looking
-      # at it. Freezing also has a trap, in that a route we stopped using would
-      # stay suppressed forever precisely because we stopped using it. The cost
-      # of reclaiming while idle is that the first requests back may hit the
-      # wall once; that is a single transparent failover, and it is also
-      # information, since it immediately restores the estimate.
-      #
-      # After subtracting all usage and applying failure penalties, keep
-      # one weight_floor fraction of the estimated capacity as minimum weight.
-      # Sampling normalizes all route weights into probabilities, allowing
-      # real traffic to keep updating quota observations on constrained routes.
-
-    #
-    # ---- capacity, and the failover-order weights --------------------------
-    #
-    # Text routes use TPM: observed ceiling, then ARM-declared ceiling.
-    # Unknown deployments use the mean known ceiling for the same model;
-    # when every ceiling is unknown, each starts at 1,000,000 TPM.
-    # Capacity weights subtract foreign TPM and the proxy's current TPM.
-    # Current TPM = tokens dispatched in the load window * 60 / window seconds.
-    # Capacity mode visits three groups: never-contended routes uniformly,
+    # Capacity routing visits three groups: never-contended routes uniformly,
     # previously contended but currently zero-others routes uniformly, then
-    # currently contended routes by available capacity, without replacement.
-    # Positive history is retained across decay and routing restarts.
-    # Image routes use a separate RPM scale (unknown defaults to 1 RPM).
-    # Legacy static_weights and headroom_high_water keys are ignored.
-    # GET /routes exposes estimated_capacity_tpm, other_tpm, our_tpm, available_tpm.
+    # currently contended routes by available RPM, without replacement.
+    # Current RPM = dispatched requests in the RPM window * 60 / window seconds.
+    # Text and image routes use learned safe RPM, with a 1 RPM cold-start weight.
+    # History is retained in the database across routing restarts.
+    # GET /routes exposes capacity_rpm, other_rpm, current_rpm, available_rpm.
 
     # An observation older than this is treated as "unknown", not "empty". A
     # route that has gone quiet must not be starved for it.

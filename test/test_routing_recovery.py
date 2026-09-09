@@ -123,11 +123,10 @@ class RecoveryTests(unittest.TestCase):
             try:
                 # Learned history outlives the diagnostic retention window.
                 engine.now = time.time() - 2 * 86400
-                engine.quota.observed(route, 200, {"x-ratelimit-limit-tokens": "1000000"})
-                engine.quota.note_foreign(route)
+                engine.quota.state(route).safe_rpm = 100
+                engine.quota.note_foreign(route, observed_rpm=20)
                 engine.now += 601
-                engine.quota.charge(route, 1000000)
-                engine.quota.note_foreign(route)
+                engine.quota.note_foreign(route, observed_rpm=100)
                 self.assertEqual(engine.quota.state(route).foreign, 0)
                 report = engine.step()["report"]["routes"][str(route)]
                 self.assertTrue(report["foreign_seen"])
@@ -145,7 +144,7 @@ class RecoveryTests(unittest.TestCase):
                     self.assertEqual(engine.quota.selection_parameters([route])[0][0], 1)
                 snapshot = engine.step()
                 report = snapshot["report"]["routes"][str(route)]
-                self.assertEqual(report["other_tpm"], 0)
+                self.assertEqual(report["other_rpm"], 0)
                 self.assertTrue(report["foreign_seen"])
                 self.assertEqual(report["selection_priority"], 1)
                 targets = snapshot["tables"]["routes"][MODEL]
@@ -154,7 +153,7 @@ class RecoveryTests(unittest.TestCase):
             finally:
                 engine.close()
 
-    def test_legacy_checkpoint_recovers_others_history_from_raw_estimate(self):
+    def test_legacy_checkpoint_recovers_others_history_from_rpm(self):
         with fixture() as (p, a, b):
             p.sync()
             p.stop_routing()
@@ -166,21 +165,45 @@ class RecoveryTests(unittest.TestCase):
             try:
                 route = config.routes[MODEL][0]
                 engine.quota.state(route)
-                for foreign in (0.0, 0.25):
-                    with self.subTest(foreign=foreign):
+                for others in (0.0, 25.0):
+                    with self.subTest(others=others):
                         saved = engine.checkpoint()
                         state = saved["states"][str(route)]
                         state.pop("foreign_seen")
-                        state.update(foreign=foreign, foreign_at=time.time() - 2 * 86400,
-                                     foreign_hold_until=0)
+                        state.update(foreign=.9, foreign_at=time.time() - 2 * 86400,
+                                     foreign_hold_until=0, safe_rpm=100, other_rpm=others)
                         engine.restore(saved)
                         restored = engine.quota.state(route)
-                        self.assertEqual(engine.quota.foreign_load(restored, engine.now), 0)
-                        self.assertEqual(restored.foreign_seen, foreign > 0)
+                        self.assertEqual(engine.quota.foreign_load(restored, engine.now), others / 100)
+                        self.assertEqual(restored.foreign_seen, others > 0)
                         self.assertEqual(engine.quota.selection_parameters([route])[0][0],
-                                         int(foreign > 0))
+                                         2 if others > 0 else 0)
                         self.assertEqual(engine.checkpoint()["states"][str(route)]["foreign_seen"],
-                                         foreign > 0)
+                                         others > 0)
+            finally:
+                engine.close()
+
+    def test_explicitly_cleared_history_survives_database_reload(self):
+        with fixture() as (p, a, b):
+            p.sync()
+            p.stop_routing()
+            config = config_at(p.home)
+            config.balance = "capacity"
+            engine = Engine(p.home, config)
+            route = config.routes[MODEL][0]
+            try:
+                state = engine.quota.state(route)
+                state.safe_rpm, state.other_rpm = 27, 20
+                state.foreign, state.foreign_seen = .9, False
+                engine.step()
+                engine.close()
+                engine = Engine(p.home, config)
+                restored = engine.quota.state(route)
+                self.assertFalse(restored.foreign_seen)
+                self.assertEqual(restored.other_rpm, 20)
+                self.assertEqual(engine.quota.selection_parameters([route]), [(0, 1)])
+                engine.quota.note_foreign(route, observed_rpm=7)
+                self.assertTrue(restored.foreign_seen)
             finally:
                 engine.close()
 

@@ -268,6 +268,27 @@ class InteractionTests(unittest.TestCase):
         dash.show_all = True
         return dash, raw
 
+    def test_models_are_first_and_default_and_sources_remain_clickable(self):
+        self.assertEqual(BOARDS, ("models", "sources", "events", "proxy"))
+        for width in (60, 120):
+            with self.subTest(width=width):
+                dash, raw = self.dashboard(width=width, height=40)
+                self.assertEqual(dash.board, 0)
+                tabs = _tabs(dash.board, Snapshot(raw), True).plain
+                self.assertLess(tabs.index("模型"), tabs.index("源"))
+                with patch("tui.app.render_groups", wraps=render_groups) as build:
+                    model_frame = render(dash.render(), width)
+                    self.assertEqual(build.call_args.args[6], "model")
+                    self.assertTrue(all(group.kind == "model" for group in build.call_args.args[0]))
+                    self.assertIn("route prob.", model_frame)
+                    y, x, _, _ = next(region for region in dash._tab_regions if region[3] == 1)
+                    dash.key("\x1b[<0;{};{}M".format(x, y))
+                    self.assertEqual(dash.board, 1)
+                    source_frame = render(dash.render(), width)
+                    self.assertEqual(build.call_args.args[6], "source")
+                    self.assertTrue(all(group.kind == "source" for group in build.call_args.args[0]))
+                    self.assertNotIn("route prob.", source_frame)
+
     def test_tabs_use_rendered_cell_coordinates_even_when_wrapped(self):
         for width in (24, 60, 120, 180):
             with self.subTest(width=width):

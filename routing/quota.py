@@ -13,7 +13,7 @@ from proxy.config import Config, Route, FACES, _as_number
 from proxy.events import event_level
 
 log = logging.getLogger("azure-proxy.routing")
-DEFAULT_TPM = 1_000_000.0
+DEFAULT_RPM = 1.0
 
 
 def _ev(kind, level, msg, *args, **fields):
@@ -80,14 +80,11 @@ class RouteState:
         self.timeouts = 0
         self.last_timeout_rpm: Optional[float] = None
 
-        # What everyone ELSE is estimated to be taking from this deployment, as
-        # a fraction of its ceiling. Only ever learned at the moment of a
-        # throttle — see QuotaTracker.note_foreign — and decayed away in
-        # between, because nothing reports it and silence is not evidence that
-        # it is still there.
+        # Legacy checkpoint fields remain readable. Current routing fractions
+        # are derived from the learned safe_rpm and observed other_rpm.
         self.foreign = 0.0
         self.foreign_at = 0.0
-        self.foreign_hold_until = 0.0   # reclaim paused until Retry-After ends
+        self.foreign_hold_until = 0.0
         self.foreign_samples = 0
         self.foreign_our_load: Optional[float] = None   # our share last time
         # Monotonic history, retained in routing checkpoints across restarts.
@@ -102,8 +99,8 @@ class RouteState:
 
     def in_window(self, now: float, window: float) -> Tuple[int, float]:
         """(requests, tokens) dispatched here inside the window."""
-        self.prune(now, window)
-        return len(self.sent), sum(e[1] for e in self.sent)
+        entries = [e for e in self.sent if e[0] >= now - window]
+        return len(entries), sum(e[1] for e in entries)
 
     def in_window_by_face(self, now: float,
                           window: float) -> List[Tuple[int, float]]:
@@ -114,9 +111,10 @@ class RouteState:
         and spending it through /v1/responses leaves exactly as little for
         /v1/chat/completions as spending it the other way round.
         """
-        self.prune(now, window)
         out = [[0, 0.0] for _ in FACES]
         for entry in self.sent:
+            if entry[0] < now - window:
+                continue
             slot = out[entry[2] if len(entry) > 2 else 0]
             slot[0] += 1
             slot[1] += entry[1]
@@ -368,146 +366,26 @@ class QuotaTracker:
         st.token_samples += 1
 
     def load(self, st: RouteState, now: float) -> Optional[float]:
-        """How much of this route's own quota the proxy is currently using.
-
-        A fraction of *its own* ceiling, never an absolute figure: the three
-        endpoints in service differ by 3x in quota, so a shared number would
-        mean "spill at 70% of the smallest one" for two of them.
-
-        Both dimensions are computed and the larger wins — whichever ceiling is
-        reached first is the one that will produce the 429. In practice that is
-        tokens: the live run on 2026-08-20 sat at ~27% of endpoint-a's TPM while
-        using ~8% of its RPM, so TPM binds about 3x sooner.
-
-        Returns None when nothing is known about the ceiling, and None means
-        *unknown*, not *full*. The caller treats it as "not busy" on purpose: a
-        route that has never answered has to be tried before it can report a
-        ceiling, and a rule that read silence as saturation would make sure it
-        never got the chance.
-        """
-        requests, tokens = st.in_window(now, self.cfg.load_window)
-        fractions = []
-        if st.limit_requests:
-            fractions.append(requests / st.limit_requests)
-        if st.limit_tokens:
-            fractions.append(tokens / st.limit_tokens)
-        if not fractions:
-            return None
-        return max(fractions)
+        """Our current RPM as a fraction of the learned safe-RPM maximum."""
+        return self.rpm(st, now) / st.safe_rpm if st.safe_rpm > 0 else None
 
     def load_dimension(self, st: RouteState, now: float) -> Optional[str]:
-        """Which ceiling `load` is currently measuring against.
-
-        Reported so that a reader knows what the load figure IS. "38% of RPM"
-        and "38% of TPM" are the same number about two different walls, and
-        which wall it is decides what to do about it — an RPM-bound route wants
-        fewer, larger requests, a TPM-bound one wants the opposite.
-        """
-        requests, tokens = st.in_window(now, self.cfg.load_window)
-        by_requests = (requests / st.limit_requests) if st.limit_requests else None
-        by_tokens = (tokens / st.limit_tokens) if st.limit_tokens else None
-        if by_requests is None and by_tokens is None:
-            return None
-        if by_tokens is None:
-            return "requests"
-        if by_requests is None:
-            return "tokens"
-        return "tokens" if by_tokens >= by_requests else "requests"
+        return "requests" if st.safe_rpm > 0 else None
 
     def load_by_face(self, st: RouteState,
                      now: float) -> Optional[Dict[str, float]]:
-        """`load`, split into the four FACES. The four sum to `load` exactly.
-
-        Split along whichever dimension `load` itself used, not along a fixed
-        one. Splitting tokens while `load` reported requests would produce four
-        segments that add up to a different number than the total beside them,
-        which in a stacked bar is not a rounding quibble — it is a bar whose
-        segments do not fill it.
-        """
-        dimension = self.load_dimension(st, now)
-        if dimension is None:
+        if st.safe_rpm <= 0:
             return None
-        index = 0 if dimension == "requests" else 1
-        ceiling = (st.limit_requests if dimension == "requests"
-                   else st.limit_tokens)
-        per_face = st.in_window_by_face(now, self.cfg.load_window)
-        return {name: pair[index] / ceiling
-                for name, pair in zip(FACES, per_face)}
+        return {name: rpm / st.safe_rpm
+                for name, rpm in self.rpm_by_face(st, now).items()}
 
-    # -- everyone else ----------------------------------------------------
-    #
-    # The ledger above counts only what this proxy sent. Quota is granted per
-    # deployment and shared with whoever else holds credentials for it — on this
-    # box alone there are eight other proxies under a different account pointed
-    # at the same endpoints, and two of them could not be read to find out which
-    # deployments they use. A model that assumes the proxy is alone will keep
-    # walking into a wall it cannot see.
-    #
-    # There is exactly one moment when the other tenants become observable: the
-    # instant Azure refuses. A throttle means total consumption reached the
-    # ceiling, and our own share of that total is a number we already have, so
-    #
-    #     foreign = clamp(1 - our_load_at_throttle, 0, 1)
-    #
-    # A throttle at our_load 0.9 says almost all of it was us; a throttle at 0.05
-    # says someone else is using 95% of the deployment and we were merely the
-    # request that arrived last. Nothing else in the response carries this:
-    # x-ratelimit-remaining-* is measured to be a sub-second bucket quoted
-    # against a per-minute ceiling (it read 0.55% consumed at ~48% true load),
-    # so it cannot size a foreign share either. Deliberately not used — a signal
-    # already proven wrong by 90x does not deserve a second try.
-    #
-    # SYNTHETIC PROBES ARE USELESS HERE and the reason is worth writing down,
-    # because "just send a test request" is the obvious idea. Throttling fires on
-    # AGGREGATE consumption, so a single small request succeeds whether the other
-    # tenant is using 90% or 0%. A probe can only distinguish the two by being
-    # large enough to hit the ceiling, which spends real quota and disturbs the
-    # traffic it is trying to measure. The only informative probe is real
-    # traffic. This is TCP's problem exactly: available capacity is discoverable
-    # only by using it.
-    #
-    # So the control law is AIMD, for the same reason TCP uses it:
-    #
-    #   Multiplicative decrease — on a throttle, jump the estimate straight up
-    #     to the observation (and never down: max() with what is already held,
-    #     so a throttle that happens to catch us at high load cannot erase what
-    #     an earlier one revealed).
-    #   Additive increase — between throttles, give the capacity back LINEARLY,
-    #     at foreign_reclaim_per_minute.
-    #
-    # Linear, not an exponential halflife, and this is not a stylistic
-    # preference. An exponential gives back capacity fastest in the moments just
-    # after a throttle — precisely when the deployment is known to be contended
-    # and caution is worth most — and then trails off slowly for a long time
-    # afterwards, when the estimate is stale and worth the least. It is backwards
-    # in both halves. Linear reclaim is constant and gentle throughout.
-    #
-    # AIMD is also the only increase/decrease pairing that converges to a fair
-    # split between independent controllers that cannot see each other (AIAD and
-    # MIMD do not). That is not theoretical tidiness here: several of the other
-    # proxies on this box are plausibly doing something adaptive too, and this is
-    # what keeps two of them from settling into a permanently unfair share.
-    #
-    # Reclaim does not start until Retry-After has elapsed. Azure states how long
-    # this particular congestion is expected to last, so there is no reason to
-    # guess at that timescale.
+    def foreign_rpm(self, st: RouteState) -> float:
+        """The same current outside-RPM estimate used by routing and the TUI."""
+        return st.other_rpm
 
     def foreign_load(self, st: RouteState, now: float) -> float:
-        """The current estimate of what other tenants are taking.
-
-        Reclaimed linearly since the last throttle, after that throttle's
-        Retry-After has passed. This remains an internal routing signal; the
-        dashboard reports the separate safe-RPM observation.
-        """
-        if not self.cfg.foreign_enabled or st.foreign <= 0.0:
-            return 0.0
-        rate = self.cfg.foreign_reclaim
-        if rate <= 0:
-            return st.foreign
-        start = max(st.foreign_at, st.foreign_hold_until)
-        if now <= start:
-            return st.foreign
-        return max(0.0, st.foreign - (now - start) / 60.0 * rate)
+        """Outside RPM as a fraction of the learned safe-RPM maximum."""
+        return self.foreign_rpm(st) / st.safe_rpm if st.safe_rpm > 0 else 0.0
 
     def total_load(self, st: RouteState, now: float) -> Optional[float]:
         """Our load plus everyone else's. None only if the ceiling is unknown.
@@ -528,16 +406,13 @@ class QuotaTracker:
         our_rpm = (observed_rpm if observed_rpm is not None
                    else st.last_dispatch_rpm or self.rpm(st, now))
         st.last_throttle_rpm = our_rpm
-        before_rpm = st.other_rpm
+        held = self.foreign_load(st, now)
         outside_rpm = max(0.0, st.safe_rpm - our_rpm)
         st.other_rpm = outside_rpm
 
         ours = self.load(st, now)
-        held = self.foreign_load(st, now)
-        if self.cfg.foreign_enabled and ours is not None:
-            observed = min(1.0, max(0.0, 1.0 - ours))
-            st.foreign = max(held, observed)
-        st.foreign_seen = st.foreign_seen or st.foreign > 0.0
+        st.foreign = self.foreign_load(st, now)
+        st.foreign_seen = st.foreign_seen or outside_rpm > 0.0
         st.foreign_at = now
         park = _as_number(retry_after)
         st.foreign_hold_until = now + max(0.0, park or 0.0)
@@ -558,7 +433,7 @@ class QuotaTracker:
                 "the %.2f RPM difference is others",
                 route, our_rpm, st.safe_rpm, outside_rpm,
                 route=route, **moved)
-        return moved if ours is not None or st.safe_rpm > 0 else None
+        return moved if st.safe_rpm > 0 else None
 
     def demote(self, route: Route, reason: str, retry_after=None,
                observed_rpm: Optional[float] = None) -> None:
@@ -645,39 +520,8 @@ class QuotaTracker:
 
     # -- weights ----------------------------------------------------------
     def capacity_estimates(self, routes: List[Route]) -> List[float]:
-        """Per-model ceilings: observed, declared, known mean, then 1M TPM.
-
-        Image deployments use a separate RPM scale with a 1 RPM cold start.
-        Imputed capacities stay out of RouteState so only actual observations
-        and declarations contribute to subsequent means.
-        """
-        known = {}
-        units = {}
-        for route in routes:
-            key = str(route)
-            unit = units[key] = "requests" if key in self.image_routes else "tokens"
-            state = self.state(route)
-            for value in (getattr(state, "limit_" + unit),
-                          getattr(route, "capacity_" + unit)):
-                value = _as_number(value)
-                if value is not None and value > 0:
-                    known[key] = value
-                    break
-        defaults = {"tokens": DEFAULT_TPM, "requests": 1.0}
-        for unit in defaults:
-            values = [cap for key, cap in known.items() if units[key] == unit]
-            if values:
-                defaults[unit] = math.fsum(values) / len(values)
-        return [known.get(str(route), defaults[units[str(route)]]) for route in routes]
-
-    def usage_rate(self, route: Route, now: float) -> float:
-        """Our rolling dispatch usage in TPM (RPM for image deployments)."""
-        st = self.state(route)
-        if str(route) in self.image_routes:
-            return self.rpm(st, now)
-        cutoff = now - self.cfg.load_window
-        return sum(entry[1] for entry in st.sent if entry[0] >= cutoff) \
-            * 60.0 / self.cfg.load_window
+        """Learned safe-RPM maxima, with a 1 RPM cold-start sampling weight."""
+        return [self.state(route).safe_rpm or DEFAULT_RPM for route in routes]
 
     def headroom(self, st: RouteState, now: float) -> Optional[float]:
         """Diagnostic remaining fraction; expired observations are unknown."""
@@ -710,14 +554,13 @@ class QuotaTracker:
 
     def weights(self, routes: List[Route],
                 now: Optional[float] = None) -> List[float]:
-        """Sample capacity available to us, with failure backoff and one floor."""
+        """Weight available RPM, with failure backoff and one probing floor."""
         now = self.clock() if now is None else now
         out = []
         for route, capacity in zip(routes, self.capacity_estimates(routes)):
             st = self.state(route)
             self._decay(st, now)
-            other = capacity * self.foreign_load(st, now)
-            available = max(0.0, capacity - other - self.usage_rate(route, now))
+            available = max(0.0, capacity - self.foreign_rpm(st) - self.rpm(st, now))
             # Apply the floor once, after total usage and temporary failures.
             out.append(max(capacity * self.cfg.weight_floor,
                            available * self.effective_penalty(st, now)))
@@ -735,7 +578,7 @@ class QuotaTracker:
             state = self.state(route)
             if not state.foreign_seen:
                 parameters.append((0, 1.0))
-            elif self.foreign_load(state, now) <= 0.0:
+            elif self.foreign_rpm(state) <= 0.0:
                 parameters.append((1, 1.0))
             else:
                 parameters.append((2, weight))
@@ -821,9 +664,6 @@ class QuotaTracker:
             for r, weight, capacity, (priority, selection_weight) in zip(
                     routes, weights, capacities, parameters):
                 st = self.state(r)
-                tpm = capacity if str(r) not in self.image_routes else None
-                other_tpm = tpm * self.foreign_load(st, now) if tpm is not None else None
-                our_tpm = self.usage_rate(r, now) if tpm is not None else None
                 requests, tokens = st.in_window(now, self.cfg.load_window)
                 by_face = st.in_window_by_face(now, self.cfg.load_window)
                 load_by_face = self.load_by_face(st, now)
@@ -837,11 +677,9 @@ class QuotaTracker:
                     "weight": round(weight, 1),
                     "selection_priority": priority,
                     "selection_weight": selection_weight,
-                    "estimated_capacity_tpm": round(tpm, 1) if tpm is not None else None,
-                    "other_tpm": round(other_tpm, 1) if other_tpm is not None else None,
-                    "our_tpm": round(our_tpm, 1) if our_tpm is not None else None,
-                    "available_tpm": (round(max(0.0, tpm - other_tpm - our_tpm), 1)
-                                      if tpm is not None else None),
+                    "weight_unit": "rpm",
+                    "estimated_capacity_rpm": round(capacity, 4),
+                    "available_rpm": round(max(0.0, capacity - self.foreign_rpm(st) - current_rpm), 4),
                     # What ARM says this deployment was granted, from the probe.
                     # Reported next to the measured pair below because the two
                     # are the same quantity from two sources: a disagreement
@@ -855,7 +693,7 @@ class QuotaTracker:
                     "current_rpm": round(current_rpm, 4),
                     "capacity_rpm": (round(st.safe_rpm, 4)
                                      if st.safe_rpm > 0 else None),
-                    "other_rpm": round(st.other_rpm, 4),
+                    "other_rpm": round(self.foreign_rpm(st), 4),
                     "rpm_window_seconds": self.rpm_window,
                     "rpm_samples": st.rpm_samples,
                     "last_throttle_rpm": (round(st.last_throttle_rpm, 4)
@@ -916,9 +754,8 @@ class QuotaTracker:
                         None if not st.foreign_samples
                         else round(now - st.foreign_at, 1)),
                     "foreign_our_load_at_throttle": st.foreign_our_load,
-                    "foreign_reclaim_per_minute": self.cfg.foreign_reclaim,
-                    "foreign_reclaim_starts_in": max(
-                        0.0, round(st.foreign_hold_until - now, 1)),
+                    "foreign_reclaim_per_minute": 0.0,
+                    "foreign_reclaim_starts_in": 0.0,
                     "foreign_samples": st.foreign_samples,
                     "spill_threshold": self.cfg.spill_threshold,
                     "tokens_per_request_estimate": (
