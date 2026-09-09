@@ -188,7 +188,7 @@ def _source_card(group: Group, width: int, detail: bool, pinned: Optional[int],
     if hidden:
         subtitle.append("隐藏 {} 旧".format(hidden), style=theme.DIM)
     if group.troubled:
-        subtitle.append((" · " if subtitle.plain else "") + "{} demoted".format(group.troubled),
+        subtitle.append((" · " if subtitle.plain else "") + "{} 降权".format(group.troubled),
                         style=theme.WARN)
 
     body = _route_rows(rows_shown, width - 2 - 2 * CARD_SIDE_PADDING, _labels(rows_shown, "source"),
@@ -207,7 +207,7 @@ def _model_card(group: Group, width: int, detail: bool,
 
     subtitle = Text()
     if group.troubled:
-        subtitle.append("{} demoted".format(group.troubled),
+        subtitle.append("{} 降权".format(group.troubled),
                         style=theme.WARN)
 
     body = _route_rows(group.routes, width - 2 - 2 * CARD_SIDE_PADDING, _labels(group.routes, "model"),
