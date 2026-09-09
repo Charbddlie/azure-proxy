@@ -27,15 +27,42 @@ class EventTextTests(unittest.TestCase):
             self.assertEqual(event, before)
         self.assertEqual(_event_change(dict(route="source/a", to_route="source/a"), 26).plain, "同一部署")
 
-    def test_limit_and_lower_weight_are_different_actions(self):
+    def test_limit_description_is_independent_of_demotion_fields(self):
         limit = dict(kind="throttle", inband=True, header="10")
         lower = dict(kind="throttle", reason="429", penalty=.05, park_seconds=10)
         self.assertEqual(kind_label(limit), "上游限流")
         self.assertIn("HTTP 200", message(limit))
         self.assertIn("等待 10 秒", message(limit))
-        self.assertEqual(kind_label(lower), "降低权重")
-        self.assertIn("5%", message(lower))
-        self.assertIn("10 秒", message(lower))
+        self.assertEqual(kind_label(lower), "上游限流")
+        self.assertEqual(message(lower), "上游限流")
+        self.assertEqual(_event_change(lower, 100).plain, "")
+
+    def test_demotion_events_preserve_failure_reason_without_weight_claims(self):
+        for reason, expected in (("503", "上游返回 HTTP 503"),
+                                 ("transport: ConnectError", "上游连接异常"),
+                                 (None, "上游请求异常")):
+            event = dict(kind="demote", reason=reason, penalty=.25, park_seconds=30)
+            self.assertEqual(kind_label(event), "上游异常")
+            self.assertEqual(message(event), expected)
+            self.assertEqual(_event_change(event, 100).plain, "")
+
+    def test_demotion_metadata_preserves_warning_events_and_foreign_usage(self):
+        events = [dict(kind="throttle", level="warning", reason="429", seq=1,
+                       penalty=.25, park_seconds=30, foreign_updated=True,
+                       other_rpm=12, capacity_rpm=100),
+                  dict(kind="demote", level="warning", reason="503", seq=2,
+                       penalty=.25, park_seconds=30)]
+        for width in (80, 120, 180):
+            output = io.StringIO()
+            table, count = render_events(events, width, 10, 0, 2, True)
+            Console(file=output, width=width, color_system=None).print(table)
+            text = output.getvalue()
+            self.assertEqual(count, 2)
+            self.assertIn("上游限流", text)
+            self.assertIn("上游异常", text)
+            for removed in ("降权", "降低权重", "权重系数", "×0.25"):
+                self.assertNotIn(removed, text)
+        self.assertEqual(_event_change(events[0], 100).plain, "外部 12.0 RPM / 最大 100.0")
 
     def test_failed_and_streamed_responses_do_not_claim_success(self):
         event = dict(kind="response", status=429, seconds=12.1)
@@ -98,7 +125,7 @@ class EventTextTests(unittest.TestCase):
             (dict(kind="request", model="gpt-5.5"), "gpt-5.5"),
             (dict(kind="pin", endpoint="source", model="gpt-5.5"), "source"),
             (dict(kind="demote", route="source/gpt-5.5", park_seconds=18, penalty=.25),
-             "source/gpt-5.5 · 降权 18 秒 ×0.25"),
+             "source/gpt-5.5"),
             (dict(kind="foreign", route="source/gpt-5.5", other_rpm=12, capacity_rpm=100),
              "source/gpt-5.5 · 外部 12.0 RPM / 最大 100.0"),
             (dict(kind="boot"), ""),

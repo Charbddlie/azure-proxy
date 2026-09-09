@@ -187,9 +187,6 @@ def _source_card(group: Group, width: int, detail: bool, pinned: Optional[int],
     hidden = len(group.routes) - len(rows_shown)
     if hidden:
         subtitle.append("隐藏 {} 旧".format(hidden), style=theme.DIM)
-    if group.troubled:
-        subtitle.append((" · " if subtitle.plain else "") + "{} 降权".format(group.troubled),
-                        style=theme.WARN)
 
     body = _route_rows(rows_shown, width - 2 - 2 * CARD_SIDE_PADDING, _labels(rows_shown, "source"),
                        _row_pins(rows_shown, snapshot), detail)
@@ -205,14 +202,9 @@ def _model_card(group: Group, width: int, detail: bool,
                 snapshot: Snapshot) -> Panel:
     title = _card_title(group)
 
-    subtitle = Text()
-    if group.troubled:
-        subtitle.append("{} 降权".format(group.troubled),
-                        style=theme.WARN)
-
     body = _route_rows(group.routes, width - 2 - 2 * CARD_SIDE_PADDING, _labels(group.routes, "model"),
                        _row_pins(group.routes, snapshot, group.name), detail, show_share=True)
-    return Panel(RichGroup(_card_summary(group, subtitle, snapshot.pinned(group.name)),
+    return Panel(RichGroup(_card_summary(group, Text(), snapshot.pinned(group.name)),
                            *([Text("")] if group.routes else []), body),
                  title=title, width=width,
                  border_style=theme.severity(
@@ -444,14 +436,6 @@ def _event_change(event: dict, width: int) -> Text:
             if ours is not None:
                 out.append("（本机 {:.0f}%）".format(ours * 100), style=theme.DIM)
             return out
-
-    park = event.get("park_seconds")
-    if park:
-        out.append("降权 {:.0f} 秒".format(park), style=theme.WARN)
-        penalty = event.get("penalty")
-        if penalty is not None:
-            out.append(" ×{:.2f}".format(penalty), style=theme.DIM)
-        return out
 
     to_route = event.get("to_route")
     if to_route:

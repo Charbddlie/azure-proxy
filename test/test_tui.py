@@ -857,16 +857,17 @@ class PinnedCardTests(unittest.TestCase):
         self.assertTrue(all(p > r for p, r in zip(pinned_rgb, rpm_rgb)))
         self.assertGreater(pinned_rgb[2], pinned_rgb[0])
 
-    def test_demoted_routes_use_chinese_label_on_both_boards(self):
+    def test_cards_omit_demotion_state(self):
         snapshot = self.snapshot()
         snapshot._views["alpha/sol-a"].data["penalty"] = .5
         snapshot._views["alpha/sol-b"].data["parked_for_seconds"] = 30
-        for width in (64, 80, 93):
+        for width in (46, 64, 80, 93):
             for card in (_source_card(snapshot.sources[0], width, False, 7, snapshot, True),
                          _model_card(snapshot.models[0], width, False, snapshot)):
                 text = render(card, width)
-                self.assertIn("2 降权", text.splitlines()[1])
+                self.assertNotIn("降权", text)
                 self.assertNotIn("demoted", text)
+                self.assertIn("pinned", text.splitlines()[1])
                 self.assertTrue(all(cell_len(line) == width for line in text.splitlines()))
 
     def test_zero_and_missing_pins_use_dots_in_every_row_and_summary(self):
@@ -989,6 +990,16 @@ class PinnedCardTests(unittest.TestCase):
 
 
 class RouteProbabilityTests(unittest.TestCase):
+    def test_probability_colour_is_independent_of_demotion(self):
+        route = RouteView("source/deploy", "model", .46, {})
+        console = Console(file=io.StringIO(), width=64)
+        for state in ({}, dict(penalty=.25), dict(parked_for_seconds=30)):
+            route.data = state
+            table = _route_rows([route], 64, {route.key: "deploy"}, {}, False, show_share=True)
+            segments = console.render_lines(table, console.options.update(height=None))[0]
+            probability = next(segment for segment in segments if segment.text == ".46")
+            self.assertEqual(probability.style.color, console.get_style(theme.ACCENT).color)
+
     def test_compact_probability_format(self):
         for value, expected in ((None, "·"), (0, "0"), (1, "1"), (.5, ".5"),
                                 (.25, ".25"), (.46, ".46"), (1 / 3, ".33"),

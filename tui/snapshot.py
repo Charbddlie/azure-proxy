@@ -128,10 +128,6 @@ class RouteView:
         return bool(self.data.get("sent_requests_in_window"))
 
     @property
-    def parked(self) -> float:
-        return self.data.get("parked_for_seconds") or 0.0
-
-    @property
     def sort_load(self) -> float:
         """Load for ordering. Unknown sorts below idle, not above."""
         value = self.data.get("total_load")
@@ -200,12 +196,6 @@ class Group:
     def sent_tokens(self) -> float:
         return sum(r.data.get("sent_tokens_in_window") or 0.0
                    for r in self.routes)
-
-    @property
-    def troubled(self) -> int:
-        """Routes currently parked or carrying a penalty."""
-        return sum(1 for r in self.routes
-                   if r.parked > 0 or (r.data.get("penalty") or 1.0) < 0.999)
 
     @property
     def peak_load(self) -> float:

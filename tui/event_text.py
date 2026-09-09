@@ -4,7 +4,7 @@ import re
 
 KIND_LABELS = {
     "boot": "服务启动", "request": "收到请求", "response": "请求结果",
-    "capacity": "容量更新", "throttle": "上游限流", "demote": "降低权重",
+    "capacity": "容量更新", "throttle": "上游限流", "demote": "上游异常",
     "foreign": "外部用量", "failover": "等待重试", "pin": "会话绑定",
     "upstream_error": "上游错误", "timeout": "请求超时",
     "exhausted": "重试耗尽", "image_tool": "图像工具", "token": "访问凭据",
@@ -35,8 +35,6 @@ def kind_label(event):
     kind = event.get("kind")
     if kind == "failover":
         return retry_action(event)[0]
-    if kind == "throttle" and ("penalty" in event or "park_seconds" in event):
-        return "降低权重"
     if kind == "response" and event.get("broke"):
         return "流连接中断"
     if kind == "response" and event.get("status") == 429:
@@ -68,18 +66,17 @@ def message(event):
     if kind == "failover":
         return "{}；{} 秒后{}".format(reason_text(event.get("reason")),
                                      number(event.get("wait_seconds")), retry_action(event)[1])
-    if kind in ("throttle", "demote"):
-        if "penalty" in event or "park_seconds" in event:
-            return "{}，权重系数降为 {}%，持续 {} 秒".format(
-                reason_text(event.get("reason")), number(event["penalty"] * 100)
-                if isinstance(event.get("penalty"), (int, float)) else "未知",
-                number(event.get("park_seconds")))
+    if kind == "demote":
+        return reason_text(event.get("reason"))
+    if kind == "throttle":
         if event.get("inband") and event.get("header") is not None:
             return "上游返回 HTTP 200，要求等待 {} 秒；代理判为限流".format(number(event["header"]))
         if event.get("last_route"):
             return "重试机会已用完，将上游限流响应返回客户端"
         if event.get("in_stream"):
             return "响应流中报告限流"
+        if event.get("reason"):
+            return reason_text(event["reason"])
         return "上游触发限流"
     if kind == "timeout":
         operation = {"ReadTimeout": "读取上游响应", "ConnectTimeout": "连接上游",

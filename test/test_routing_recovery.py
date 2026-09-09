@@ -132,8 +132,17 @@ class RecoveryTests(unittest.TestCase):
                 report = engine.step()["report"]["routes"][str(route)]
                 self.assertTrue(report["foreign_seen"])
                 self.assertEqual(report["selection_priority"], 1)
+                with sqlite3.connect(os.path.join(p.home, "runtime", "control.sqlite3")) as db:
+                    saved = json.loads(db.execute(
+                        "SELECT payload FROM state WHERE name='checkpoint'").fetchone()[0])
+                self.assertTrue(saved["states"][str(route)]["foreign_seen"])
+                self.assertEqual(saved["states"][str(route)]["foreign"], 0)
                 engine.close()
                 engine = Engine(p.home, config)
+                self.assertTrue(engine.quota.state(route).foreign_seen)
+                with patch.object(engine.store, "get", side_effect=AssertionError(
+                        "selection must use the history restored into memory")):
+                    self.assertEqual(engine.quota.selection_parameters([route])[0][0], 1)
                 snapshot = engine.step()
                 report = snapshot["report"]["routes"][str(route)]
                 self.assertEqual(report["other_tpm"], 0)
