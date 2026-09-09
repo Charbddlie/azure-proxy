@@ -16,8 +16,9 @@ from tui.app import (INPUT_HZ, Dashboard, _InputReader, _footer, _mouse_tracking
                      _processes, _proxy_status, _status_line, _tabs, _top_bar)
 from tui.bars import FACES, capacity_bar, rpm_capacity, legend
 from tui.boards import (BOARDS, MAX_CARD, render_groups, _source_card, _model_card, _row_pins,
-                        _pinned_value, _route_rows, _usage_number, _card_widths)
+                        _pinned_value, _route_rows, _usage_number, _card_widths, _share_number)
 from tui.client import Poller
+from tui.layout import truncate
 from tui.snapshot import Snapshot, RouteView
 
 
@@ -973,6 +974,84 @@ class PinnedCardTests(unittest.TestCase):
                         self.assertNotIn("others", lines[0])
                         self.assertIn(_usage_number(ours), lines[0])
                         self.assertIn(_usage_number(others), lines[0])
+
+
+class RouteProbabilityTests(unittest.TestCase):
+    def test_compact_probability_format(self):
+        for value, expected in ((None, "·"), (0, "0"), (1, "1"), (.5, ".5"),
+                                (.25, ".25"), (.46, ".46"), (1 / 3, ".33"),
+                                (2 / 3, ".67"), (.4567, ".46"), (.004, "0")):
+            with self.subTest(value=value):
+                self.assertEqual(_share_number(value), expected)
+
+    def test_model_card_uses_reported_probability_as_first_column(self):
+        keys = ("alpha/deploy-a", "beta/deploy-b", "gamma/deploy-c")
+        snapshot = Snapshot({"routes": {
+            "routes": {key: dict(capacity_rpm=100, current_rpm=rpm)
+                       for key, rpm in zip(keys, (7, 23, 1))},
+            "models": {"model": [dict(route=key, share=share)
+                                  for key, share in zip(keys, (.4567, .5433, 0))]}}})
+        for width in (40, 46, 64, 93):
+            for detail in (False, True):
+                with self.subTest(width=width, detail=detail):
+                    text = render(_model_card(snapshot.models[0], width, detail, snapshot), width)
+                    self.assertTrue(text.splitlines()[1].startswith("│  route prob.  "))
+                    self.assertEqual(text.count("route prob."), 1)
+                    for probability, endpoint in ((".46", "alpha"), (".54", "beta"), ("0", "gamma")):
+                        self.assertRegex(text, r"(?m)^│\s+{}\s+{}\s".format(
+                            re.escape(probability), endpoint))
+                    self.assertNotIn("0.46", text)
+                    self.assertTrue(all(cell_len(line) == width for line in text.splitlines()))
+        source = render(_source_card(snapshot.sources[0], 64, False, None, snapshot, True), 64)
+        self.assertRegex(source, r"(?m)^│\s+model\s")
+        self.assertNotIn(".46", source)
+        self.assertNotIn("route prob.", source)
+
+    def test_probability_column_preserves_row_spacing_and_alignment(self):
+        routes = [RouteView(key, "model", share, dict(capacity_rpm=100, current_rpm=23,
+                           other_rpm=47, rpm_by_face=dict(chat=23)))
+                  for key, share in (("a/deploy", .46), ("long-name/deploy", 1), ("模型/deploy", None))]
+        for width in (34, 42, 64, 96):
+            table = _route_rows(routes, width, {r.key: r.endpoint for r in routes},
+                                {r.key: 7 for r in routes}, False, show_share=True)
+            lines = render(table, width).splitlines()
+            self.assertEqual(len(table.columns), 7)
+            self.assertEqual(len(lines), 5)
+            self.assertTrue(all(not line.strip() for line in lines[1::2]))
+            edges = []
+            for line, route in zip(lines[::2], Snapshot.sorted_routes(routes)):
+                self.assertTrue(line.lstrip().startswith(_share_number(route.share) + " "))
+                pin = re.search(r"\b7\b", line)
+                edges.append(cell_len(line[:pin.end()]))
+                self.assertIn("23", line)
+                self.assertIn("47", line)
+                self.assertLessEqual(cell_len(line), width)
+            self.assertEqual(len(set(edges)), 1)
+
+    def test_middle_ellipsis_keeps_both_ends_and_fits_terminal_cells(self):
+        for text, width, expected in (("abcdef", 6, "abcdef"), ("abcdef", 5, "ab…ef"),
+                                      ("abcdef", 4, "ab…f"), ("abcdef", 1, "…"),
+                                      ("abcdef", 0, ""), ("abcdef", -1, ""),
+                                      ("模型部署名称", 7, "模…名称")):
+            with self.subTest(text=text, width=width):
+                self.assertEqual(truncate(text, width, middle=True), expected)
+        self.assertEqual(truncate("abcdef", 4), "abc…")
+        for name in ("yifanyang-foundry-resource·gpt-5.6-sol-deploy-west",
+                     "模型部署名称" * 10):
+            for width in range(1, 80):
+                self.assertLessEqual(cell_len(truncate(name, width, middle=True)), width)
+
+    def test_long_deployment_labels_use_middle_ellipsis(self):
+        endpoint = "yifanyang-foundry-resource"
+        keys = [endpoint + "/gpt-5.6-sol-deploy-" + suffix for suffix in ("east", "west")]
+        snapshot = Snapshot({"routes": {
+            "routes": {key: dict(capacity_rpm=100) for key in keys},
+            "models": {"model": [dict(route=key, share=.5) for key in keys]}}})
+        for width in (46, 64, 93):
+            text = render(_model_card(snapshot.models[0], width, False, snapshot), width)
+            for suffix in ("east", "west"):
+                self.assertRegex(text, r"\.5\s+yifa\S*…\S*{}\s".format(suffix))
+            self.assertTrue(all(cell_len(line) == width for line in text.splitlines()))
 
 
 class ScrollConfigurationTests(unittest.TestCase):
