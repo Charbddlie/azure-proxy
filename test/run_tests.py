@@ -2344,7 +2344,7 @@ def test_all_contended_deployments_fall_back_to_available_tpm():
             assert ask(p)[0] == 429
             _status, report = p.get("/routes")
             candidates = report["models"][MODEL]
-            assert all(r["selection_priority"] == 1 for r in candidates), candidates
+            assert all(r["selection_priority"] == 2 for r in candidates), candidates
             assert all(r["other_tpm"] > 0 for r in report["routes"].values()), report
             counts = spread(p, 120)
             assert 0.52 < counts.get("beta", 0) / 120.0 < 0.8, counts
@@ -2478,13 +2478,7 @@ def test_a_persistent_foreign_load_settles_instead_of_relearning():
 
 
 def test_capacity_returns_when_the_foreign_load_goes_away():
-    """The loop has to close: reclaim, then real traffic proves it is free.
-
-    alpha throttles once, loses almost all its weight, and then stops
-    throttling — which is what a foreign job finishing looks like from here.
-    After the estimate is reclaimed the split must return to even, because the
-    probe traffic that kept flowing is what discovers it.
-    """
+    """A recovered deployment follows peers that have never seen others."""
     a = FakeAzure("alpha", [Behaviour(headers=ratelimit_throttled(
         retry_after=0, limit_tokens=1000000, remaining_tokens=1000000))]
         + [Behaviour(headers=ratelimit(limit_tokens=1000000))] * 500).start()
@@ -2500,11 +2494,41 @@ def test_capacity_returns_when_the_foreign_load_goes_away():
             time.sleep(12)              # 6.0/min for 12s reclaims everything
             st = route_state(p)
             assert st["foreign_load"] == 0.0, st
+            assert st["foreign_seen"] is True, st
+            assert st["selection_priority"] == 1, st
+            assert st["selection_weight"] == 1, st
 
             before = a.hits
             counts = spread(p, 200)
             share = (a.hits - before) / 200.0
-            assert 0.3 < share < 0.7, (counts, share)
+            assert share == 0.0, (counts, share)
+            assert counts == {"beta": 200}, counts
+        finally:
+            p.close()
+    finally:
+        a.stop(); b.stop()
+
+
+def test_currently_zero_others_routes_recover_to_uniform_second_group():
+    """After both deployments recover, the second group ignores their TPM sizes."""
+    a = FakeAzure("alpha", [Behaviour(status=429, headers={"Retry-After": "0"}),
+                            Behaviour()], headers=ratelimit(limit_tokens=1000000)).start()
+    b = FakeAzure("beta", [Behaviour(status=429, headers={"Retry-After": "0"}),
+                           Behaviour()], headers=ratelimit(limit_tokens=9000000)).start()
+    try:
+        p = Proxy([("alpha", a.url), ("beta", b.url)], balance="capacity", foreign_reclaim=60.0)
+        try:
+            assert ask(p)[0] == 429
+            time.sleep(2)
+            _status, report = p.get("/routes")
+            candidates = report["models"][MODEL]
+            assert all(r["selection_priority"] == 1 for r in candidates), candidates
+            assert all(r["selection_weight"] == 1 for r in candidates), candidates
+            assert all(r["share"] == .5 for r in candidates), candidates
+            assert all(r["foreign_seen"] and r["other_tpm"] == 0
+                       for r in report["routes"].values()), report
+            counts = spread(p, 200)
+            assert .35 < counts.get("beta", 0) / 200.0 < .65, counts
         finally:
             p.close()
     finally:

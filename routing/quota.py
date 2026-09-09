@@ -132,8 +132,9 @@ class QuotaTracker:
     `strict_priority` returns the probe's order untouched.
 
     `capacity` samples deployments with no history of positive others usage
-    uniformly first, followed by previously contended deployments weighted by
-    available capacity. Both groups are sampled without replacement.
+    uniformly first, then previously contended deployments whose current others
+    usage is zero uniformly, then currently contended deployments weighted by
+    available capacity. All three groups are sampled without replacement.
 
     `priority_threshold` walks the priority order and heads for the first route
     that is not already carrying more than `spill_threshold` of its own quota.
@@ -724,13 +725,21 @@ class QuotaTracker:
 
     # -- selection --------------------------------------------------------
     def selection_parameters(self, routes: List[Route], now=None):
-        """Routes whose others usage has always been zero are explored uniformly."""
+        """Prefer never-contended, then currently clear, then available capacity."""
         now = self.clock() if now is None else now
         weights = self.weights(routes, now)
         if self.cfg.balance != "capacity":
             return [(0, weight) for weight in weights]
-        return [(0, 1.0) if not self.state(route).foreign_seen
-                else (1, weight) for route, weight in zip(routes, weights)]
+        parameters = []
+        for route, weight in zip(routes, weights):
+            state = self.state(route)
+            if not state.foreign_seen:
+                parameters.append((0, 1.0))
+            elif self.foreign_load(state, now) <= 0.0:
+                parameters.append((1, 1.0))
+            else:
+                parameters.append((2, weight))
+        return parameters
 
     def order(self, routes: List[Route]) -> List[Route]:
         """The order to try `routes` in. Never drops or duplicates one."""

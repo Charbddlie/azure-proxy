@@ -976,12 +976,18 @@ Sol 的多个独立会话可使用 `balance: capacity`。当前规则先对历�
 图像 deployment 单独使用 RPM，未知时取已知 RPM 的均值，全未知时取 `1 RPM`。
 旧配置项 `static_weights` 和 `headroom_high_water` 已忽略。
 
-`capacity` 模式优先探索：当候选 deployment 中存在历史上 `others TPM` 始终为 0 的部署时，
-从这组中等概率选择，容量大小、自身占用和短时降权均不改变组内概率。
-只要曾观测到正的外部负载，部署就保持在可用容量组；后续外部负载归零也保留该分组。
+`capacity` 模式按以下三级顺序选择部署：
+
+1. 历史上 `others TPM` 始终为 0：组内等概率选择。
+2. 历史上出现过外部负载、当前 `others TPM` 为 0：组内等概率选择。
+3. 当前 `others TPM` 大于 0：按可用容量加权选择。
+
+前两组的概率独立于容量大小、自身占用和短时降权。
+当前外部负载使用 `foreign_load` 估计值，包含线性回收；归零后进入第二组，
+再次观测到正的外部负载时进入第三组。历史标记为真的部署始终保留历史记录。
 历史标记 `foreign_seen` 随 routing checkpoint 持久化，重启和诊断历史清理均保留。
 旧 checkpoint 根据仍保存的正外部负载估计补全标记。
-当所有候选部署都曾观测到正的外部负载时，按以下可用容量权重计算概率：
+第三组按以下可用容量权重计算概率：
 
 ```
 other_tpm = estimated_capacity_tpm × foreign_load
@@ -995,10 +1001,11 @@ weight = max(estimated_capacity_tpm × weight_floor, available_tpm × penalty)
 `GET /routes` 返回 `estimated_capacity_tpm`、`other_tpm`、`our_tpm`、`available_tpm` 和最终权重，
 并保留 ARM 声明的 `capacity_*` 与响应头观测的 `limit_*`。
 
-`selection_priority` 为探索组 0、可用容量组 1；`selection_weight` 为组内抽样权重。
+`selection_priority` 为历史无外部负载组 0、当前无外部负载组 1、可用容量组 2；
+`selection_weight` 为组内抽样权重，前两组固定为 1。
 `routes[].foreign_seen` 表示该部署是否曾观测到正的外部负载。
 `models[].share` 显示首选概率，`weight` 保留可用容量公式的结果。
-重试先遍历探索组，再遍历可用容量组，每个 deployment 最多出现一次。
+重试按 0、1、2 的顺序逐组遍历，每个 deployment 最多出现一次。
 已有会话先按绑定 endpoint 筛选候选，再在该 endpoint 内执行同样的分组选择。
 
 后备链的排序也用同一份容量：**endpoint 优先级在前，容量只在同一个 endpoint 内部

@@ -169,7 +169,7 @@ class CapacityWeightTests(unittest.TestCase):
         self.q.state(routes[0]).foreign_seen = True
         self.q.state(routes[0]).foreign_at = self.now
         params = self.q.selection_parameters(routes)
-        self.assertEqual(params, [(1, 900000), (0, 1), (0, 1)])
+        self.assertEqual(params, [(2, 900000), (0, 1), (0, 1)])
         with patch("routing.quota.random.random", return_value=0.0):
             self.assertEqual(self.q.order(routes), [routes[1], routes[2], routes[0]])
         shares = self.q.report({"sol": routes})["models"]["sol"]
@@ -182,13 +182,13 @@ class CapacityWeightTests(unittest.TestCase):
             self.q.state(r).foreign_seen = True
             self.q.state(r).foreign_at = self.now
         self.q.charge(routes[0], 250000)
-        self.assertEqual(self.q.selection_parameters(routes), [(1, 500000), (1, 1500000)])
+        self.assertEqual(self.q.selection_parameters(routes), [(2, 500000), (2, 1500000)])
         shares = self.q.report({"sol": routes})["models"]["sol"]
         self.assertEqual([r["share"] for r in shares], [0.25, 0.75])
         self.now += 150
-        self.assertEqual(self.q.selection_parameters(routes), [(1, 1e6), (1, 2e6)])
+        self.assertEqual(self.q.selection_parameters(routes), [(1, 1), (1, 1)])
         shares = self.q.report({"sol": routes})["models"]["sol"]
-        self.assertEqual([r["share"] for r in shares], [0.3333, 0.6667])
+        self.assertEqual([r["share"] for r in shares], [0.5, 0.5])
 
     def test_positive_others_history_survives_decay_and_zero_observations(self):
         a, b = route("a", tokens=1e6), route("a", "sol-dz", tokens=1e6)
@@ -202,7 +202,7 @@ class CapacityWeightTests(unittest.TestCase):
         self.q.note_foreign(a)
         self.assertEqual(self.q.state(a).foreign, 0)
         self.now += 61
-        self.assertEqual(self.q.selection_parameters([a, b]), [(1, 1e6), (0, 1)])
+        self.assertEqual(self.q.selection_parameters([a, b]), [(1, 1), (0, 1)])
         report = self.q.report({"sol": [a, b]})
         self.assertTrue(report["routes"][str(a)]["foreign_seen"])
         self.assertEqual(report["routes"][str(a)]["other_tpm"], 0)
@@ -223,19 +223,65 @@ class CapacityWeightTests(unittest.TestCase):
         self.q.note_foreign(a)
         self.cfg.foreign_enabled = False
         self.assertEqual(self.q.foreign_load(self.q.state(a), self.now), 0)
-        self.assertEqual(self.q.selection_parameters([a, b]), [(1, 1e6), (0, 1)])
+        self.assertEqual(self.q.selection_parameters([a, b]), [(1, 1), (0, 1)])
+
+    def test_currently_clear_routes_are_uniform_despite_capacity_load_and_penalty(self):
+        routes = [route("a", tokens=1e5), route("b", tokens=1e6), route("c", tokens=9e6)]
+        for r in routes:
+            self.q.state(r).foreign_seen = True
+        self.q.charge(routes[0], 2e5)
+        self.q.demote(routes[0], "503", "30")
+        self.assertEqual(self.q.selection_parameters(routes), [(1, 1)] * 3)
+        shares = self.q.report({"sol": routes})["models"]["sol"]
+        self.assertEqual([r["share"] for r in shares], [.3333] * 3)
+        rng = random.Random(42)
+        with patch("routing.quota.random.random", side_effect=rng.random):
+            counts = collections.Counter(str(self.q.order(routes)[0]) for _ in range(1200))
+        self.assertTrue(all(330 < n < 470 for n in counts.values()), counts)
+        self.assertEqual(len(counts), 3)
+
+    def test_three_groups_keep_priority_order_and_fallback_probabilities(self):
+        contended, clear, fresh = [route(name, tokens=1e6) for name in ("a", "b", "c")]
+        state = self.q.state(contended)
+        state.foreign_seen, state.foreign, state.foreign_at = True, .25, self.now
+        self.q.state(clear).foreign_seen = True
+        routes = [contended, clear, fresh]
+        self.assertEqual(self.q.selection_parameters(routes), [(2, 750000), (1, 1), (0, 1)])
+        for random_value in (0, .5, .999):
+            with patch("routing.quota.random.random", return_value=random_value):
+                self.assertEqual(self.q.order(routes), [fresh, clear, contended])
+        for candidates, expected in ((routes, [0, 0, 1]), (routes[:2], [0, 1]), (routes[:1], [1])):
+            report = self.q.report({"sol": candidates})["models"]["sol"]
+            self.assertEqual([r["share"] for r in report], expected)
+
+    def test_recovered_route_returns_to_weighted_group_on_new_others_observation(self):
+        r = route("a", tokens=1e6)
+        self.observe(r, 1e6)
+        self.q.note_foreign(r)
+        self.assertEqual(self.q.selection_parameters([r])[0][0], 2)
+        self.now += 601
+        self.assertEqual(self.q.selection_parameters([r]), [(1, 1)])
+        self.assertTrue(self.q.state(r).foreign_seen)
+        self.q.note_foreign(r)
+        self.assertEqual(self.q.selection_parameters([r])[0][0], 2)
 
     def test_serving_samples_groups_after_endpoint_filtering(self):
         targets = [Target("other", "zero", None, {}, {}, 1, 0),
-                   Target("bound", "small", None, {}, {}, 100, 1),
-                   Target("bound", "large", None, {}, {}, 900, 1)]
+                   Target("bound", "clear-small", None, {}, {}, 1, 1),
+                   Target("bound", "clear-large", None, {}, {}, 1, 1),
+                   Target("bound", "small", None, {}, {}, 100, 2),
+                   Target("bound", "large", None, {}, {}, 900, 2)]
         self.assertEqual(weighted_order(targets)[0], targets[0])
         rng = random.Random(42)
         with patch("proxy.affinity.random.choices", side_effect=rng.choices):
             counts = collections.Counter(weighted_order(targets[1:])[0].deployment for _ in range(1000))
+            self.assertEqual(set(counts), {"clear-small", "clear-large"})
+            self.assertTrue(450 < counts["clear-large"] < 550, counts)
+            counts = collections.Counter(weighted_order(targets[3:])[0].deployment for _ in range(1000))
         self.assertTrue(850 < counts["large"] < 950, counts)
         self.assertEqual({str(r) for r in weighted_order(targets)[1:]},
                          {str(r) for r in targets[1:]})
+        self.assertEqual([r.selection_priority for r in weighted_order(targets)], [0, 1, 1, 2, 2])
 
     def test_empty_route_set(self):
         self.assertEqual(self.q.weights([]), [])
