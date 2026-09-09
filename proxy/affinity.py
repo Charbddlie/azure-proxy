@@ -40,15 +40,20 @@ def carries_encrypted(value):
 
 
 def weighted_order(routes):
-    """Sample published deployment weights without doing quota arithmetic."""
+    """Sample the earliest published priority group, then its failover groups."""
     pool, chosen = list(routes), []
     while pool:
         weights = [r.selection_weight for r in pool]
         if all(w is None for w in weights):
             return chosen + pool   # compatibility with the previous publisher
         weights = [w if w is not None else 1.0 for w in weights]
+        priority = min(r.selection_priority for r in pool)
+        weights = [w if r.selection_priority == priority else 0.0
+                   for r, w in zip(pool, weights)]
         if not sum(weights):
-            return chosen + pool
+            index = next(i for i, r in enumerate(pool) if r.selection_priority == priority)
+            chosen.append(pool.pop(index))
+            continue
         index = random.choices(range(len(pool)), weights=weights)[0]
         chosen.append(pool.pop(index))
     return chosen

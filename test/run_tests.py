@@ -981,12 +981,7 @@ def test_strict_priority_ignores_load_entirely():
 
 
 def test_capacity_mode_ignores_priority_from_the_first_request():
-    """The third mode: no priority at all, just size.
-
-    Distinct from priority_threshold, which would have put all 40 of these on
-    alpha — nothing here is anywhere near a threshold. beta is nine times the
-    size, so it should take most of them while alpha keeps a real share.
-    """
+    """Zero-others deployments are explored uniformly from the first request."""
     a = FakeAzure("alpha", headers=ratelimit(limit_tokens=100000)).start()
     b = FakeAzure("beta", headers=ratelimit(limit_tokens=900000)).start()
     try:
@@ -996,7 +991,7 @@ def test_capacity_mode_ignores_priority_from_the_first_request():
             spread(p, 10)                       # let both report a ceiling
             counts = spread(p, 200)
             share = counts.get("beta", 0) / 200.0
-            assert 0.80 < share < 0.98, counts
+            assert 0.35 < share < 0.65, counts
             assert counts.get("alpha", 0) > 0, counts
         finally:
             p.close()
@@ -1126,14 +1121,8 @@ def test_load_falls_out_of_the_window():
         a.stop(); b.stop()
 
 
-def test_weighted_split_follows_observed_quota():
-    """Weights come from x-ratelimit-limit-*, not from the config order.
-
-    Both endpoints start on the same static weight, so the only thing that can
-    pull the split away from 50/50 is what Azure said about their ceilings. The
-    small endpoint here is also the priority-1 one — under the old routing it
-    would take all of it.
-    """
+def test_zero_others_split_is_uniform_despite_observed_quota():
+    """Observed ceilings remain diagnostic while both routes are explored."""
     a = FakeAzure("alpha", headers=ratelimit(limit_requests=100,
                                              limit_tokens=100000)).start()
     b = FakeAzure("beta", headers=ratelimit(limit_requests=900,
@@ -1145,8 +1134,7 @@ def test_weighted_split_follows_observed_quota():
             spread(p, 10)               # let both report their ceilings
             counts = spread(p, 300)
             share = counts.get("beta", 0) / 300.0
-            # Expected 0.9; sd is 0.017, so this is ~6 sd of slack either way.
-            assert 0.80 < share < 0.98, counts
+            assert 0.35 < share < 0.65, counts
             assert counts.get("alpha", 0) > 0, "the small route is not banned"
         finally:
             p.close()
@@ -1154,13 +1142,8 @@ def test_weighted_split_follows_observed_quota():
         a.stop(); b.stop()
 
 
-def test_cold_start_falls_back_to_static_weights():
-    """No quota headers anywhere: the config table has to carry the split.
-
-    A real endpoint reports its limits on the first response, but until then —
-    and forever, if a deployment never sends the headers — the proxy has only
-    what policy.yaml told it.
-    """
+def test_cold_start_uses_equal_tpm_despite_legacy_static_weights():
+    """Every unknown text deployment starts at 1M TPM."""
     a = FakeAzure("alpha").start()          # no x-ratelimit-* at all
     b = FakeAzure("beta").start()
     try:
@@ -1169,7 +1152,10 @@ def test_cold_start_falls_back_to_static_weights():
         try:
             counts = spread(p, 300)
             share = counts.get("beta", 0) / 300.0
-            assert 0.80 < share < 0.98, counts
+            assert 0.35 < share < 0.65, counts
+            _status, report = p.get("/routes")
+            assert all(r["estimated_capacity_tpm"] == 1000000
+                       for r in report["routes"].values()), report
         finally:
             p.close()
     finally:
@@ -1197,12 +1183,12 @@ def test_429_demotes_the_route_and_it_recovers():
                   demote_seconds=2, demote_halflife=0.5)
         try:
             # Provoke the 429. It fails over, and alpha is now parked.
-            status, body, _ = ask(p)
-            assert status == 200 and who(body) == "beta", (status, body)
+            provoke_throttle(p, a)
 
             parked = spread(p, 40)
-            # Parked means floored at 0.05 against beta's 1.0, i.e. ~4.8%.
-            assert parked.get("alpha", 0) <= 8, parked
+            # With no quota observation, both others estimates remain zero.
+            # Uniform exploration takes precedence over capacity penalties.
+            assert 8 <= parked.get("alpha", 0) <= 32, parked
 
             # Retry-After was 2s and the weight doubles every 0.5s after that,
             # so the sleep leaves three halflives of slack.
@@ -1253,13 +1239,8 @@ def test_weighted_never_tries_the_same_endpoint_twice():
         a.stop(); b.stop(); c.stop()
 
 
-def test_low_remaining_quota_reduces_a_routes_share():
-    """`remaining` is a brake, and only near the bottom of its range.
-
-    Sampled against the live service these counters read near-full on almost
-    every response, so the proxy ignores the top half outright. An endpoint
-    genuinely down to a tenth of its window is the case that has to bite.
-    """
+def test_remaining_quota_is_diagnostic_only_for_capacity_weights():
+    """Equal ceilings and comparable usage keep traffic balanced."""
     a = FakeAzure("alpha", headers=ratelimit(limit_tokens=100000,
                                              remaining_tokens=10000)).start()
     b = FakeAzure("beta", headers=ratelimit(limit_tokens=100000,
@@ -1269,11 +1250,8 @@ def test_low_remaining_quota_reduces_a_routes_share():
         try:
             spread(p, 10)
             counts = spread(p, 200)
-            # Equal ceilings, so priority order and static weights say 50/50.
-            # alpha is at 0.1 headroom against a 0.5 high-water mark: 0.2 of
-            # its capacity, i.e. an expected share of 1/6.
             share = counts.get("alpha", 0) / 200.0
-            assert 0.05 < share < 0.32, counts
+            assert 0.35 < share < 0.65, counts
         finally:
             p.close()
     finally:
@@ -1332,14 +1310,8 @@ def test_an_unmeasured_route_is_not_starved_by_a_measured_one():
         a.stop(); b.stop()
 
 
-def test_static_weights_are_converted_into_measured_units():
-    """The cold-start table is a prior about capacity, not a raw weight.
-
-    One route has been measured and one has not, and the table says the
-    unmeasured one is three times the size. That ratio is what has to survive
-    the unit conversion — the measured route's own limit/prior pair is the
-    exchange rate.
-    """
+def test_unknown_tpm_uses_known_mean_despite_legacy_static_weights():
+    """A lone measured deployment sets the estimate for its unknown peer."""
     a = FakeAzure("alpha", headers=ratelimit(limit_tokens=100000)).start()
     b = FakeAzure("beta").start()
     try:
@@ -1347,10 +1319,8 @@ def test_static_weights_are_converted_into_measured_units():
                   static_weights={"alpha": 100, "beta": 300})
         try:
             counts = spread(p, 200)
-            # alpha measures 100000 against a prior of 100, so beta's prior of
-            # 300 is worth 300000: an expected share of 0.75.
             share = counts.get("beta", 0) / 200.0
-            assert 0.62 < share < 0.88, counts
+            assert 0.35 < share < 0.65, counts
         finally:
             p.close()
     finally:
@@ -2336,13 +2306,7 @@ def provoke_throttle(proxy, fake, name="alpha", tries=25):
 
 
 def test_capacity_mode_samples_by_what_is_left_not_by_size():
-    """A route someone else is using is smaller than its ceiling says.
-
-    Both endpoints report the same 1M ceiling, so the nominal split is 50/50.
-    alpha then reveals ~100% foreign load by throttling while we are idle, and
-    the traffic has to move to beta — but not all of it, because alpha keeps
-    its weight_floor share as a probe.
-    """
+    """A zero-others peer takes precedence over a contended deployment."""
     a = FakeAzure("alpha", [Behaviour(headers=ratelimit_throttled(
         retry_after=1, limit_tokens=1000000, remaining_tokens=1000000))]
         + [Behaviour(headers=ratelimit(limit_tokens=1000000))] * 400).start()
@@ -2359,12 +2323,31 @@ def test_capacity_mode_samples_by_what_is_left_not_by_size():
             before = a.hits
             counts = spread(p, 200)
             alpha_share = (a.hits - before) / 200.0
-            # Nominally 50%. Believed full, so it should collapse towards the
-            # floor — but NOT to zero, or nothing would ever discover that the
-            # other tenant had left.
-            assert alpha_share < 0.25, counts
-            assert alpha_share > 0.0, "the probe channel was starved shut"
-            assert counts.get("beta", 0) > 140, counts
+            assert alpha_share == 0.0, counts
+            assert counts == {"beta": 200}, counts
+        finally:
+            p.close()
+    finally:
+        a.stop(); b.stop()
+
+
+def test_all_contended_deployments_fall_back_to_available_tpm():
+    """After both peers reveal others usage, capacity weights control traffic."""
+    a = FakeAzure("alpha", [Behaviour(status=429, headers={"Retry-After": "1"}),
+                            Behaviour()], headers=ratelimit(limit_tokens=1000000)).start()
+    b = FakeAzure("beta", [Behaviour(status=429, headers={"Retry-After": "1"}),
+                           Behaviour()], headers=ratelimit(limit_tokens=2000000)).start()
+    try:
+        p = Proxy([("alpha", a.url), ("beta", b.url)], balance="capacity",
+                  foreign_reclaim=0.0)
+        try:
+            assert ask(p)[0] == 429
+            _status, report = p.get("/routes")
+            candidates = report["models"][MODEL]
+            assert all(r["selection_priority"] == 1 for r in candidates), candidates
+            assert all(r["other_tpm"] > 0 for r in report["routes"].values()), report
+            counts = spread(p, 120)
+            assert 0.52 < counts.get("beta", 0) / 120.0 < 0.8, counts
         finally:
             p.close()
     finally:
@@ -2713,7 +2696,7 @@ def test_requests_without_encrypted_reasoning_are_never_pinned():
                 name = who(body)
                 counts[name] = counts.get(name, 0) + 1
             assert len(counts) == 2, "balancing was suppressed: {}".format(counts)
-            assert counts.get("beta", 0) > counts.get("alpha", 0), counts
+            assert 0.2 < counts.get("beta", 0) / 60.0 < 0.8, counts
 
             _s, health = p.get("/healthz")
             assert health["session_affinity"]["live_sessions"] == 0, health
@@ -2771,8 +2754,7 @@ def test_pinned_session_waits_out_a_throttle_instead_of_moving():
                             Behaviour()]).start()
     b = FakeAzure("beta").start()
     try:
-        p = Proxy([("alpha", a.url), ("beta", b.url)], balance="capacity",
-                  static_weights={"alpha": 1, "beta": 0.0001},
+        p = Proxy([("alpha", a.url), ("beta", b.url)], balance="strict_priority",
                   affinity_attempts=4, affinity_max_wait=3)
         try:
             _s, _b, headers = sticky_ask(p)
@@ -2828,8 +2810,7 @@ def test_affinity_survives_the_inband_throttle_failover():
                             Behaviour(events=sse("alpha"))]).start()
     b = FakeAzure("beta", [Behaviour(events=sse("beta"))]).start()
     try:
-        p = Proxy([("alpha", a.url), ("beta", b.url)], balance="capacity",
-                  static_weights={"alpha": 1, "beta": 0.0001},
+        p = Proxy([("alpha", a.url), ("beta", b.url)], balance="strict_priority",
                   affinity_attempts=4, affinity_max_wait=3)
         try:
             body = codex_turn(stream=True)
@@ -3729,15 +3710,35 @@ def test_the_larger_deployment_on_an_endpoint_is_reached_for_first():
         a.stop()
 
 
-def test_declared_capacity_is_the_cold_start_prior():
-    """Before any response has been seen, the split is ARM's numbers.
+def test_unknown_deployments_receive_traffic_alongside_declared_tpm():
+    """Three known TPM ceilings give both unknown deployments their mean."""
+    a = FakeAzure("alpha").start()
+    b = FakeAzure("beta").start()
+    try:
+        p = Proxy([("alpha", a.url), ("beta", b.url)], balance="capacity",
+                  static_weights={"alpha": 333, "beta": 850},
+                  deployments={
+                      "alpha": [{"name": "small", "capacity_tokens": 333000},
+                                {"name": "large", "capacity_tokens": 1000000},
+                                {"name": "medium", "capacity_tokens": 499000}],
+                      "beta": [{"name": "sol"}, {"name": "sol-dz"}]})
+        try:
+            _status, report = p.get("/routes")
+            for r in report["models"][MODEL]:
+                if r["route"].startswith("beta/"):
+                    assert r["weight"] == round(1832000 / 3, 1), r
+                    assert r["share"] == 0.2, r
+            spread(p, 120)
+            hits = deployment_hits(b)
+            assert hits.get("sol", 0) > 0 and hits.get("sol-dz", 0) > 0, hits
+        finally:
+            p.close()
+    finally:
+        a.stop(); b.stop()
 
-    Neither fake sends x-ratelimit-limit-*, so nothing is ever measured and the
-    prior is all there is — which is the point: a fresh process should already
-    be sending three times as much at a route that is three times the size,
-    rather than discovering it. No static_weights are configured at all, so a
-    fall-through to the per-endpoint table would split this 50/50.
-    """
+
+def test_declared_capacity_is_the_cold_start_prior():
+    """Declared TPM is available at startup; zero-others exploration is uniform."""
     a = FakeAzure("alpha").start()
     b = FakeAzure("beta").start()
     try:
@@ -3750,9 +3751,10 @@ def test_declared_capacity_is_the_cold_start_prior():
         try:
             counts = spread(p, 200)
             share = counts.get("alpha", 0) / 200.0
-            # Expected 0.75, sd 0.031. A prior that ignored capacity lands at
-            # 0.5 and a strict-priority regression lands at 1.0.
-            assert 0.65 < share < 0.85, counts
+            assert 0.35 < share < 0.65, counts
+            _status, report = p.get("/routes")
+            assert report["routes"]["alpha/" + DEPLOYMENT]["estimated_capacity_tpm"] == 15000000
+            assert report["routes"]["beta/" + DEPLOYMENT]["estimated_capacity_tpm"] == 5000000
         finally:
             p.close()
     finally:
@@ -3760,7 +3762,7 @@ def test_declared_capacity_is_the_cold_start_prior():
 
 
 def test_capacity_mode_balances_two_deployments_on_the_same_endpoint():
-    """Separate deployments share traffic in proportion to their own quotas."""
+    """Zero-others deployments on one endpoint receive uniform exploration."""
     a = FakeAzure("alpha").start()
     try:
         p = Proxy([("alpha", a.url)], balance="capacity",
@@ -3772,7 +3774,7 @@ def test_capacity_mode_balances_two_deployments_on_the_same_endpoint():
                 assert ask(p)[0] == 200
             hits = deployment_hits(a)
             assert set(hits) == {"small", "big"}, hits
-            assert 0.62 < hits["big"] / 200.0 < 0.88, hits
+            assert 0.35 < hits["big"] / 200.0 < 0.65, hits
             _status, report = p.get("/routes")
             for deployment, count in hits.items():
                 assert report["routes"]["alpha/" + deployment]["attempts"] == count

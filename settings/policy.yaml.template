@@ -79,11 +79,10 @@ routing:
   #                        Traffic concentrates on the best endpoint while there
   #                        is room, and starts spreading BEFORE anything is full
   #                        rather than after the first 429.
-  #   capacity             priority is ignored entirely; every request samples
-  #                        the routes in proportion to their measured quota. The
-  #                        widest spread, and the right answer when the routes
-  #                        are interchangeable and the load is high enough that
-  #                        all of them are needed all of the time.
+  #   capacity             uniformly explore routes with zero estimated others
+  #                        usage first; when none remain, sample by available
+  #                        capacity. Published groups also govern local choices
+  #                        within an endpoint-bound session.
   #
   # `priority` and `weighted` are the previous names for strict_priority and
   # capacity and still work.
@@ -195,12 +194,11 @@ routing:
     # watching foreign_load in GET /routes over a long run is also how to settle
     # whether anyone else is really on gpt-5.6-sol.
     #
-    # Both routing modes act on our_load + foreign_load rather than on our_load:
-    # `priority_threshold` spills at the combined figure, and `capacity` samples
-    # by limit x (1 - total_load) — what is actually left — instead of by the
-    # deployment's nominal size.
+    # priority_threshold spills on our_load + foreign_load. Capacity sampling
+    # subtracts foreign and current proxy usage from the estimated ceiling,
+    # then applies temporary failure penalties and the minimum weight.
     foreign_load:
-      # false reverts to counting only our own traffic.
+      # false disables the foreign-usage deduction in both routing modes.
       enabled: true
 
       # How fast the estimate is given back, in units of "fraction of the
@@ -245,59 +243,25 @@ routing:
       # wall once; that is a single transparent failover, and it is also
       # information, since it immediately restores the estimate.
       #
-      # The probe channel that closes this loop is `weight_floor` above: a route
-      # believed to be completely full still draws that fraction of its capacity
-      # in ordinary traffic. Those requests are the probe — real work, no extra
-      # cost, and if the other tenant has left they simply succeed. Note the
-      # floor is applied to the PRODUCT of all the reductions, not to each in
-      # turn, or a route that is loaded and parked and short of headroom would
-      # be floored three times over and starve at 0.05^3.
+      # After subtracting all usage and applying failure penalties, keep
+      # one weight_floor fraction of the estimated capacity as minimum weight.
+      # Sampling normalizes all route weights into probabilities, allowing
+      # real traffic to keep updating quota observations on constrained routes.
 
     #
     # ---- capacity, and the failover-order weights --------------------------
     #
-    # The LAST RESORT for a cold-start prior, per endpoint, in RPM.
-    #
-    # It is rarely reached now. A route's prior comes from ARM by way of the
-    # probe: runtime/models.json carries capacity_requests / capacity_tokens for
-    # every deployment, quoted in the same units as x-ratelimit-limit-*, so a
-    # fresh process starts out knowing each route's real ceiling and the first
-    # response only confirms it. This table is what is left when that is
-    # missing — an endpoint with no subscription/resource_group in
-    # endpoints.yaml, a principal without ARM read on the account, or a
-    # runtime/ written before any of this existed.
-    #
-    # It is a worse answer by construction, and not because the numbers are old:
-    # quota is granted per DEPLOYMENT, and one endpoint's deployments do not
-    # share a ceiling. endpoint-b is 1000 RPM for gpt-5.6-sol and 2000 for
-    # gpt-4.1-mini; a single number per endpoint cannot be right for both.
-    #
-    # Whatever the prior, it governs only until the route has returned one
-    # response carrying x-ratelimit-limit-*, at which point the measured value
-    # replaces it permanently. Wrong numbers here cost a few seconds of skew,
-    # not a wrong steady state.
-    #
-    # Both are readable at any time from GET /routes, side by side:
-    # capacity_* is what ARM declared, limit_* is what the traffic measured.
-    #
-    # The unit does not have to match what Azure reports. These are converted
-    # into measured units using the routes where both numbers are known, so
-    # only the ratios between them matter.
-    static_weights:
-      endpoint-a: 333
-      endpoint-b: 1000
-      endpoint-c: 499
-
-    # x-ratelimit-remaining-* only gets to *reduce* a weight, and only once it
-    # is below this fraction of the limit; above it the route is treated as
-    # fully available.
-    #
-    # Given the measurement recorded under load_window_seconds above, this will
-    # essentially never fire — `remaining` did not drop below 99% even at half
-    # the stated ceiling. It is kept because it costs nothing and because on the
-    # one occasion it does fire it is reporting a real instantaneous burst. Do
-    # not mistake it for the load signal; that is the ledger.
-    headroom_high_water: 0.5
+    # Text routes use TPM: observed ceiling, then ARM-declared ceiling.
+    # Unknown deployments use the mean known ceiling for the same model;
+    # when every ceiling is unknown, each starts at 1,000,000 TPM.
+    # Capacity weights subtract foreign TPM and the proxy's current TPM.
+    # Current TPM = tokens dispatched in the load window * 60 / window seconds.
+    # In capacity mode, routes whose estimated others usage is zero form the
+    # first group and are sampled uniformly. When this group is empty, sample
+    # by available capacity. Retry chains visit both groups in that order.
+    # Image routes use a separate RPM scale (unknown defaults to 1 RPM).
+    # Legacy static_weights and headroom_high_water keys are ignored.
+    # GET /routes exposes estimated_capacity_tpm, other_tpm, our_tpm, available_tpm.
 
     # An observation older than this is treated as "unknown", not "empty". A
     # route that has gone quiet must not be starved for it.

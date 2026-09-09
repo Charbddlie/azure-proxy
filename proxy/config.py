@@ -255,8 +255,6 @@ class Config:
             self.balance = "strict_priority"
 
         b = r.get("balancing") or {}
-        self.static_weights = b.get("static_weights") or {}
-        self.headroom_high_water = float(b.get("headroom_high_water", 0.5))
         self.weight_floor = float(b.get("weight_floor", 0.05))
         self.observation_ttl = float(b.get("observation_ttl_seconds", 120))
         self.demote_multiplier = float(b.get("demote_multiplier", 0.25))

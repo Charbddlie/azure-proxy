@@ -11,7 +11,7 @@ from proxy.config import BALANCE_ALIASES, Config, Route, TABLES
 from proxy.events import event_level, normalized_event
 from proxy.state import SCHEMA_VERSION, Store
 from proxy.retention import CLEANUP_INTERVAL, RETENTION_SECONDS, prune_checkpoint, recent
-from .quota import QuotaTracker, RouteState
+from .quota import DEFAULT_TPM, QuotaTracker, RouteState
 
 
 # These fields also describe deployments in v1 telemetry and checkpoints.
@@ -51,8 +51,8 @@ class Engine:
         if cfg.balance_configured != cfg.balance:
             level = logging.INFO if cfg.balance_configured in BALANCE_ALIASES else logging.WARNING
             log.log(level, "routing.balance=%r resolved to %s", cfg.balance_configured, cfg.balance)
-        log.info("routing balance=%s spill_threshold=%s load_window=%ss cold-start weights=%s",
-                 cfg.balance, cfg.spill_threshold, cfg.load_window, cfg.static_weights)
+        log.info("routing balance=%s spill_threshold=%s load_window=%ss cold-start TPM=%s",
+                 cfg.balance, cfg.spill_threshold, cfg.load_window, DEFAULT_TPM)
         self.store = Store(root)
         self.instance = uuid.uuid4().hex
         self.now = time.time()
@@ -185,7 +185,8 @@ class Engine:
 
     def weighted_targets(self, routes):
         ordered = self.quota.order(routes)
-        return list(zip(ordered, self.quota.weights(ordered)))
+        return [(route, weight, priority) for route, (priority, weight)
+                in zip(ordered, self.quota.selection_parameters(ordered))]
 
     def snapshot(self, ready=True):
         for producer, state in list(self.producers.items()):
@@ -209,8 +210,9 @@ class Engine:
         for state in self.quota.states.values():
             state.sent = collections.deque(entry for entry in state.sent if entry[0] > cutoff)
         cfg = self.config
-        tables = {name: {model: [dict(target_record(route), selection_weight=weight)
-                                for route, weight in self.weighted_targets(routes)]
+        tables = {name: {model: [dict(target_record(route), selection_weight=weight,
+                                    selection_priority=priority)
+                                for route, weight, priority in self.weighted_targets(routes)]
                          for model, routes in getattr(cfg, name).items()} for name in TABLES}
         merged = {}
         for name in TABLES:

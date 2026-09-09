@@ -119,11 +119,15 @@ class ProtocolTests(unittest.TestCase):
         metadata = {"future_algorithm": {"weights": [1, None, {"other": True}]}}
         self.record["routing_data"].update(metadata)
         self.record["future_optional_field"] = [1, 2]
+        self.record["selection_priority"] = 1
+        self.record["selection_weight"] = 1234.5
         self.snapshot["config"]["future_optional_field"] = {"v": 2}
         self.snapshot["report"] = dict(balance="future-mode", metrics=metadata)
         cfg = decode_snapshot(self.snapshot, SimpleNamespace())
         target = cfg.routes[MODEL][0]
         self.assertIsInstance(target, Target)
+        self.assertEqual(target.selection_priority, 1)
+        self.assertEqual(target.selection_weight, 1234.5)
         self.assertEqual(cfg.routing_report, self.snapshot["report"])
         bridge = ServingBridge("unused", None)
         telemetry = Telemetry(bridge)
@@ -161,7 +165,8 @@ class ProtocolTests(unittest.TestCase):
                 ("scope", "unpublished-scope"), ("targets", {}),
                 ("targets", {"/v1/chat/completions": "file:///tmp/example"}),
                 ("targets", {"/v1/chat/completions": "https://"}),
-                ("routing_data", [])):
+                ("routing_data", []), ("selection_priority", -1),
+                ("selection_priority", True), ("selection_priority", "zero")):
             with self.subTest(field=field, value=value):
                 bad = copy.deepcopy(original)
                 bad["revision"] = 2

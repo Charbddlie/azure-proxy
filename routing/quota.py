@@ -13,6 +13,7 @@ from proxy.config import Config, Route, FACES, _as_number
 from proxy.events import event_level
 
 log = logging.getLogger("azure-proxy.routing")
+DEFAULT_TPM = 1_000_000.0
 
 
 def _ev(kind, level, msg, *args, **fields):
@@ -124,16 +125,13 @@ class QuotaTracker:
     """Chooses the attempt order, and remembers why.
 
     Three modes, all of which produce a full permutation of the model's routes
-    so the failover chain stays intact and no endpoint can be tried twice:
+    so the failover chain stays intact and no deployment can be tried twice:
 
     `strict_priority` returns the probe's order untouched.
 
-    `capacity` samples the list without replacement in proportion to weight.
-    Sampling rather than "send to whoever has the most headroom left": every
-    in-flight request would compute the same answer from the same shared state
-    and pile onto the same endpoint, and the correction only arrives after the
-    responses do. Sampling has no such feedback delay — it needs no in-flight
-    accounting, and over a run the split converges on the weights.
+    `capacity` samples zero-others deployments uniformly first, followed by
+    contended deployments weighted by available capacity. Both groups are
+    sampled without replacement.
 
     `priority_threshold` walks the priority order and heads for the first route
     that is not already carrying more than `spill_threshold` of its own quota.
@@ -144,8 +142,7 @@ class QuotaTracker:
     therefore per-request rather than in blocks, the top route stabilises at
     exactly the threshold, and the overflow — and only the overflow — moves
     down the chain. If every route is over its threshold there is no overflow
-    destination left, so it falls back to `capacity`: spreading the excess in
-    proportion to size is better than putting all of it back on route one.
+    destination left, so it falls back to available-capacity-weighted sampling.
     """
 
     def __init__(self, config: Config, clock=None, emit=None, persist_capacity=True):
@@ -156,6 +153,11 @@ class QuotaTracker:
         self.rpm_window = max(1.0, float(getattr(config, "rpm_window", 60.0)))
         self.capacity_state_file = getattr(config, "capacity_state_file", None)
         self.states: Dict[str, RouteState] = {}
+        self.image_routes = {
+            str(route)
+            for table in ("image_routes", "image_edit_routes")
+            for routes in getattr(config, table, {}).values()
+            for route in routes}
         self._legacy_qps_capacity = False
         self._saved_capacity = self._load_capacity()
         if self._legacy_qps_capacity:
@@ -507,9 +509,8 @@ class QuotaTracker:
     def total_load(self, st: RouteState, now: float) -> Optional[float]:
         """Our load plus everyone else's. None only if the ceiling is unknown.
 
-        This — not `load` — is what both routing modes act on. A route that is
-        60% consumed by someone else has 40% left to offer, whatever our own
-        ledger says about it.
+        priority_threshold uses this combined load to decide when to spill.
+        Capacity sampling subtracts foreign and current usage in capacity units.
         """
         ours = self.load(st, now)
         if ours is None:
@@ -639,53 +640,43 @@ class QuotaTracker:
         st.penalty_at = now
 
     # -- weights ----------------------------------------------------------
-    def measured_capacity(self, st: RouteState) -> Optional[float]:
-        """What Azure said this deployment's ceiling is, or None.
+    def capacity_estimates(self, routes: List[Route]) -> List[float]:
+        """Per-model ceilings: observed, declared, known mean, then 1M TPM.
 
-        Tokens first: TPM is the constraint that binds. The live run on
-        2026-08-20 sat at ~27% of endpoint-a's TPM ceiling while using ~8% of its
-        RPM one, so a request-count weight would be tracking the limit that is
-        not the limit. The two are not reliably proportional across deployments,
-        so which one is used has to be decided rather than assumed.
-
-        This value remains the routing signal. The dashboard uses the separate,
-        persisted safe-RPM maximum learned from successful traffic.
+        Image deployments use a separate RPM scale with a 1 RPM cold start.
+        Imputed capacities stay out of RouteState so only actual observations
+        and declarations contribute to subsequent means.
         """
-        return st.limit_tokens or st.limit_requests or None
+        known = {}
+        units = {}
+        for route in routes:
+            key = str(route)
+            unit = units[key] = "requests" if key in self.image_routes else "tokens"
+            state = self.state(route)
+            for value in (getattr(state, "limit_" + unit),
+                          getattr(route, "capacity_" + unit)):
+                value = _as_number(value)
+                if value is not None and value > 0:
+                    known[key] = value
+                    break
+        defaults = {"tokens": DEFAULT_TPM, "requests": 1.0}
+        for unit in defaults:
+            values = [cap for key, cap in known.items() if units[key] == unit]
+            if values:
+                defaults[unit] = math.fsum(values) / len(values)
+        return [known.get(str(route), defaults[units[str(route)]]) for route in routes]
 
-    def static_prior(self, route: Route) -> float:
-        """The cold-start guess for a route Azure has not described yet.
-
-        The probe's ARM figure first, and it is barely a guess: `rateLimits` is
-        quoted in the same units as x-ratelimit-limit-*, per deployment, so a
-        route starts out knowing its real ceiling and the first response merely
-        confirms it. Tokens before requests, matching measured_capacity, so the
-        prior and the measurement are on one scale and the conversion in
-        weights() is an identity for these routes.
-
-        The per-endpoint table in policy.yaml is what is left for a route ARM
-        could not describe: an endpoint with no coordinates, no ARM permission,
-        or a runtime/ written before any of this. It is a worse answer by
-        construction — quota is granted per deployment, and one endpoint's
-        deployments do not share a number.
-        """
-        capacity = route.capacity_tokens or route.capacity_requests
-        if capacity:
-            return float(capacity)
-        static = self.cfg.static_weights.get(route.endpoint)
-        try:
-            static = float(static)
-        except (TypeError, ValueError):
-            return 1.0
-        return static if static > 0 else 1.0
+    def usage_rate(self, route: Route, now: float) -> float:
+        """Our rolling dispatch usage in TPM (RPM for image deployments)."""
+        st = self.state(route)
+        if str(route) in self.image_routes:
+            return self.rpm(st, now)
+        cutoff = now - self.cfg.load_window
+        return sum(entry[1] for entry in st.sent if entry[0] >= cutoff) \
+            * 60.0 / self.cfg.load_window
 
     def headroom(self, st: RouteState, now: float) -> Optional[float]:
-        """Fraction of the window still unspent, or None if we cannot say.
-
-        None and 1.0 are different answers and the caller treats them the same
-        on purpose: an observation older than the TTL means *unknown*, not
-        *empty*, and a route must not be starved for having gone quiet.
-        """
+        """Diagnostic remaining fraction; expired observations are unknown."""
         if st.observed_at is None:
             return None
         if now - st.observed_at > self.cfg.observation_ttl:
@@ -715,94 +706,29 @@ class QuotaTracker:
 
     def weights(self, routes: List[Route],
                 now: Optional[float] = None) -> List[float]:
-        """Weights for one model's routes, on one scale.
-
-        The whole set has to be computed together, because a measured route and
-        an unmeasured one are not quoted in the same units. Azure reports TPM in
-        the hundreds of thousands; the static table in policy.yaml is a handful
-        of RPM figures someone typed. Scoring them against each other directly
-        is a trap that closes immediately: the first response to arrive gives
-        one route a ceiling of 333000 while every route still unmeasured sits at
-        333, the sampler never picks any of them again, and they never get a
-        chance to report a ceiling of their own. Strict priority with extra
-        steps — which is exactly what this was supposed to replace.
-
-        So the priors are converted into measured units first, using the routes
-        where both numbers are known. When nothing has been measured yet the
-        priors are already mutually consistent and are used as they are; when
-        the priors are equal or absent, an unmeasured route inherits the mean
-        measured capacity. That last case is the important one, because it is
-        the default: a route nobody has numbers for is assumed average, tried,
-        and thereby measured.
-        """
+        """Sample capacity available to us, with failure backoff and one floor."""
         now = self.clock() if now is None else now
-        states = [self.state(r) for r in routes]
-        for st in states:
-            self._decay(st, now)
-
-        measured = [self.measured_capacity(st) for st in states]
-        priors = [self.static_prior(r) for r in routes]
-
-        both = [(m, p) for m, p in zip(measured, priors) if m]
-        if both:
-            scale = (sum(m for m, _ in both) / len(both)
-                     / (sum(p for _, p in both) / len(both)))
-        else:
-            scale = 1.0
-
         out = []
-        for st, cap, prior in zip(states, measured, priors):
-            capacity = cap if cap else prior * scale
-
-            # Everything below only ever REDUCES a route, and the reductions are
-            # collected into one factor rather than applied one at a time. That
-            # matters because they stack: a route that is fully loaded AND
-            # parked AND low on headroom would otherwise be floored three times
-            # over and end up at 0.05^3 of its size — 1 request in 8000, which
-            # is starvation with extra steps.
-            #
-            # Flooring the PRODUCT is what makes weight_floor mean what
-            # policy.yaml says it means, and it is what keeps the control loop
-            # closed. A route believed to be full still receives 5% of its
-            # capacity in real traffic, and those requests are the probe: they
-            # cost nothing extra, they are indistinguishable from ordinary work,
-            # and if the other tenant has gone away they simply succeed and the
-            # reclaim above starts giving the route back. Without a floor here
-            # the estimate could only ever go up, because the only thing that
-            # can lower it is traffic we would no longer be sending.
-            reduction = 1.0
-
-            # Sample by what is actually LEFT, not by how big the deployment is
-            # on paper. A route 60% consumed by other tenants has 40% to offer,
-            # and weighting it at its full ceiling is how the proxy used to keep
-            # pushing into a wall it could not see.
-            #
-            # Our own load is in here too, which makes this a closed loop rather
-            # than a static split: sending to a route lowers its weight, so
-            # traffic settles where every route carries the same FRACTION of its
-            # own ceiling. That is the fixed point of weight_i = L_i(1 - f_i)
-            # under proportional sampling, and it is the right definition of
-            # balanced. It does not oscillate: the load it reads is a 60s
-            # sliding average and the sampler is stochastic, so there is no
-            # synchronised herd to swing.
-            total = self.total_load(st, now)
-            if total is not None:
-                reduction *= max(0.0, 1.0 - total)
-
-            head = self.headroom(st, now)
-            high = self.cfg.headroom_high_water
-            if head is not None and high > 0 and head < high:
-                # Flat above the high-water mark, linear below it. Anything
-                # smoother would be reacting to noise: `remaining` reads
-                # near-full nearly always, so the only part of its range that
-                # carries information is the bottom.
-                reduction *= head / high
-
-            reduction *= self.effective_penalty(st, now)
-            out.append(capacity * max(self.cfg.weight_floor, reduction))
+        for route, capacity in zip(routes, self.capacity_estimates(routes)):
+            st = self.state(route)
+            self._decay(st, now)
+            other = capacity * self.foreign_load(st, now)
+            available = max(0.0, capacity - other - self.usage_rate(route, now))
+            # Apply the floor once, after total usage and temporary failures.
+            out.append(max(capacity * self.cfg.weight_floor,
+                           available * self.effective_penalty(st, now)))
         return out
 
     # -- selection --------------------------------------------------------
+    def selection_parameters(self, routes: List[Route], now=None):
+        """Zero-others routes form a uniform exploration group before capacity."""
+        now = self.clock() if now is None else now
+        weights = self.weights(routes, now)
+        if self.cfg.balance != "capacity":
+            return [(0, weight) for weight in weights]
+        return [(0, 1.0) if self.foreign_load(self.state(route), now) == 0.0
+                else (1, weight) for route, weight in zip(routes, weights)]
+
     def order(self, routes: List[Route]) -> List[Route]:
         """The order to try `routes` in. Never drops or duplicates one."""
         if len(routes) < 2 or self.cfg.balance == "strict_priority":
@@ -835,31 +761,28 @@ class QuotaTracker:
         return self._sample(routes)
 
     def _sample(self, routes: List[Route]) -> List[Route]:
-        """Draw the whole list without replacement, in proportion to weight.
-
-        Without replacement is what keeps the failover chain intact: the first
-        draw is where the request goes, the rest are the order it falls back
-        through, and no endpoint appears twice.
-        """
+        """Draw each selection group without replacement, in priority order."""
         pool = list(routes)
-        weights = self.weights(pool)
+        parameters = self.selection_parameters(pool)
         chosen: List[Route] = []
         while pool:
+            priority = min(p for p, _ in parameters)
+            weights = [w if p == priority else 0.0 for p, w in parameters]
             total = sum(weights)
             if total <= 0:
-                # Every candidate is parked. Priority order is as good an answer
-                # as any, and better than none: something has to be tried.
-                chosen.extend(pool)
-                break
+                index = next(i for i, (p, _) in enumerate(parameters) if p == priority)
+                chosen.append(pool.pop(index))
+                parameters.pop(index)
+                continue
             target = random.random() * total
-            index = len(pool) - 1
+            index = max(i for i, w in enumerate(weights) if w > 0)
             for i, w in enumerate(weights):
-                target -= w
-                if target <= 0:
+                if w > 0 and target < w:
                     index = i
                     break
+                target -= w
             chosen.append(pool.pop(index))
-            weights.pop(index)
+            parameters.pop(index)
         return chosen
 
     def note_attempt(self, route: Route) -> None:
@@ -872,14 +795,23 @@ class QuotaTracker:
         models = {}
         for model, routes in sorted(routes_by_model.items()):
             weights = self.weights(routes, now)
-            total = sum(weights) or 1.0
+            capacities = self.capacity_estimates(routes)
+            parameters = self.selection_parameters(routes, now)
+            first_priority = min((p for p, _ in parameters), default=0)
+            total = sum(w for p, w in parameters if p == first_priority) or 1.0
             models[model] = [
                 {"route": str(r), "weight": round(w, 1),
-                 "share": round(w / total, 4)}
-                for r, w in zip(routes, weights)
+                 "selection_priority": priority, "selection_weight": selection_weight,
+                 "share": (round(selection_weight / total, 4)
+                           if priority == first_priority else 0.0)}
+                for r, w, (priority, selection_weight) in zip(routes, weights, parameters)
             ]
-            for r, weight in zip(routes, weights):
+            for r, weight, capacity, (priority, selection_weight) in zip(
+                    routes, weights, capacities, parameters):
                 st = self.state(r)
+                tpm = capacity if str(r) not in self.image_routes else None
+                other_tpm = tpm * self.foreign_load(st, now) if tpm is not None else None
+                our_tpm = self.usage_rate(r, now) if tpm is not None else None
                 requests, tokens = st.in_window(now, self.cfg.load_window)
                 by_face = st.in_window_by_face(now, self.cfg.load_window)
                 load_by_face = self.load_by_face(st, now)
@@ -891,6 +823,13 @@ class QuotaTracker:
                     "model_version": r.model_version,
                     "priority": r.priority,
                     "weight": round(weight, 1),
+                    "selection_priority": priority,
+                    "selection_weight": selection_weight,
+                    "estimated_capacity_tpm": round(tpm, 1) if tpm is not None else None,
+                    "other_tpm": round(other_tpm, 1) if other_tpm is not None else None,
+                    "our_tpm": round(our_tpm, 1) if our_tpm is not None else None,
+                    "available_tpm": (round(max(0.0, tpm - other_tpm - our_tpm), 1)
+                                      if tpm is not None else None),
                     # What ARM says this deployment was granted, from the probe.
                     # Reported next to the measured pair below because the two
                     # are the same quantity from two sources: a disagreement

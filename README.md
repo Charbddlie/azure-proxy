@@ -847,7 +847,7 @@ codex 的 `include: ["reasoning.encrypted_content"]` 照常工作。
 | --- | --- |
 | `strict_priority` | 严格优先级。优先级 1 吃下 100% 流量，只有它出错才往下走。这是 kill switch |
 | `priority_threshold` | **默认。** 按优先级走，但一条路由用掉自己配额的 `spill_threshold`（默认 70%）之后就跳过它，发给下一条 |
-| `capacity` | routing 按实测配额抽样计算当前目标和备用顺序 |
+| `capacity` | 优先对 others 为 0 的部署等概率探索；探索组为空时按可用 TPM 加权 |
 
 `priority` / `weighted` 是前两个和最后一个的旧名字，仍然有效。
 
@@ -936,10 +936,9 @@ TPM ≈ 单请求 token 数 × 轮次频率 × 并发，和 n 只是线性关系
 **但对 gpt-5.6-sol + codex 这种「单请求占 15% 上限」的负载，它只能减少限流、不能消灭
 限流**——限流照样会发生，只是现在会被透明地切走，调用方看不到。
 
-**建议：gpt-5.6-sol 跑 codex 且 n≥4 时用 `balance: capacity`。** 三条路由的容量是
-333k / 1M / 499k，`capacity` 从第一个请求就按 18% / 55% / 27% 分，谁都不会贴着自己的
-天花板跑；`priority_threshold` 则会让最小的那条（swc，只占总量 18%）长期停在 79% 并
-反复触发限流——虽然每次都被透明处理掉，但每次都要多付一个往返加一次退避。
+Sol 的多个独立会话可使用 `balance: capacity`。当前规则先对 others 为 0 的部署
+等概率探索；当探索组为空时，依据扣除外部及本代理用量后的可用 TPM 分流。
+已有会话保持 endpoint 绑定，选择和重试均限定在该 endpoint 内。
 
 `gpt-5.5` 有 5 条路由（swc 和 scus 各有两个部署）；`gpt-5.4` `gpt-5.4-mini`
 `gpt-5.4-nano` `gpt-5.6-sol` `gpt-5.6-luna` `gpt-5.6-terra` `o3` 有 3 条；
@@ -966,37 +965,45 @@ TPM ≈ 单请求 token 数 × 轮次频率 × 并发，和 n 只是线性关系
 
 ### 权重是怎么来的（`capacity` 模式，以及后备链的排序）
 
-权重来自 Azure 每个响应都带的 `x-ratelimit-limit-tokens`（没有就退回
-`-limit-requests`）。没被观测过的路由用先验，而**先验现在几乎不是猜的**：探测已经从
-ARM 拿到了每个部署的 `rateLimits`，和响应头同单位，写在 `runtime/models.json` 的
-`capacity_requests` / `capacity_tokens` 里——进程刚起来就知道每条路由的真实上限，
-第一个响应只是确认它。`GET /routes` 把两者并排列出：`capacity_*` 是 ARM 声明的，
-`limit_*` 是流量实测的，对不上就说明配额在上次探测之后动过。
+文本 deployment 统一用 TPM 计算容量，按以下顺序取值：
 
-`policy.yaml` 的 `static_weights` 退成**最后的兜底**，只在 ARM 给不出容量时才用到
-（endpoint 没填订阅坐标、没有 ARM 读权限、或者 `runtime/` 是旧的）。它天生更差，
-不是因为数字旧：**配额是按部署给的**，同一个 endpoint 的不同部署根本不共享一个
-天花板——`endpoint-b` 对 gpt-5.6-sol 是 1000 RPM，对 gpt-4.1-mini 是 2000。
-一个 endpoint 一个数字，不可能对两者都成立。
+1. 响应头 `x-ratelimit-limit-tokens` 给出的上限。
+2. ARM 探测记录的 `capacity_tokens`。
+3. 同模型当前候选部署中，已有已知 TPM 上限的部署的算术均值。
+4. 当所有部署都缺少 TPM 时，每个部署初始化为 `1,000,000 TPM`。
 
-走到兜底那条路时，**先验会先被换算成实测的单位**再参与比较：Azure 报的是几十万的
-TPM，配置里写的是几百的 RPM，直接放在一起比，第一个应答的路由会拿到 100000 的权重、
-其余的还停在 1，从此再也抽不到——那就是「优先级路由多绕一圈」而已。换算的汇率取自
-那些两个数都已知的路由。ARM 来的先验本来就同单位，这个汇率对它们退化成 1。
+均值只包含有效的正数上限，填补值保持为估计；后续有新观测时重新计算。
+图像 deployment 单独使用 RPM，未知时取已知 RPM 的均值，全未知时取 `1 RPM`。
+旧配置项 `static_weights` 和 `headroom_high_water` 已忽略。
+
+`capacity` 模式优先探索：当候选 deployment 中存在 `others TPM = 0` 的部署时，
+从这组中等概率选择，容量大小、自身占用和短时降权均不改变组内概率。
+当所有候选部署的 others TPM 都大于 0 时，按以下可用容量权重计算概率：
+
+```
+other_tpm = estimated_capacity_tpm × foreign_load
+our_tpm = 滑动窗口内本代理派发的 token 总量 × 60 / 窗口秒数
+available_tpm = max(0, estimated_capacity_tpm - other_tpm - our_tpm)
+weight = max(estimated_capacity_tpm × weight_floor, available_tpm × penalty)
+```
+
+`foreign_load` 继续使用现有外部负载估计和线性回收机制。自身已占用量按派发账本计算，
+包括在途请求的 token 估计，完成后由实际 usage 修正；`remaining_*` 用于诊断。
+`GET /routes` 返回 `estimated_capacity_tpm`、`other_tpm`、`our_tpm`、`available_tpm` 和最终权重，
+并保留 ARM 声明的 `capacity_*` 与响应头观测的 `limit_*`。
+
+`selection_priority` 为探索组 0、可用容量组 1；`selection_weight` 为组内抽样权重。
+`models[].share` 显示首选概率，`weight` 保留可用容量公式的结果。
+重试先遍历探索组，再遍历可用容量组，每个 deployment 最多出现一次。
+已有会话先按绑定 endpoint 筛选候选，再在该 endpoint 内执行同样的分组选择。
 
 后备链的排序也用同一份容量：**endpoint 优先级在前，容量只在同一个 endpoint 内部
 打破平手**。`endpoint-a` 上 gpt-5.5 有 5000 和 15000 两个部署，没有理由先去够小的
 那个。
 
-另外两个信号：
-
-- `x-ratelimit-remaining-*` 只在**掉到上限的一半以下**时才降权，线性降到地板。按上面
-  实测的语义，这一条基本永远不会触发；留着是因为它不花钱，而且真触发的那一次它报的
-  是一个真实的瞬时突发。**别把它当成负载信号**，负载信号是账本
-- **429 会临时降权**（乘 0.25 并按 `Retry-After` 停发），不只是这一次请求绕开它。
-  停发窗口结束后按半衰期指数恢复。5xx、连接错误和流内限流走同一条路径。停发中的路由
-  在 `priority_threshold` 里也不会被选作链头——账本只知道自己的流量，`Retry-After`
-  说的是所有人的
+可用容量组的 429 会临时降权（乘 0.25，`Retry-After` 窗口内使用最低权重），
+窗口结束后按半衰期恢复。5xx、连接错误和流内限流使用相同的短时降权机制。
+在 `priority_threshold` 模式中，退避窗口内的路由跳过链头选择。
 
 抽样而不是「谁剩得多发给谁」：后者在并发下所有在飞的请求会算出同一个答案、一起压向
 同一个 endpoint，而修正要等响应回来才发生。抽样没有这个反馈延迟，也不需要记在途请求。
@@ -1022,8 +1029,10 @@ foreign = clamp(1 - our_load_at_throttle, 0, 1)
 我们负载 0.9 时被限流 → 基本是自己撑满的。我们负载 0.05 时被限流 → **别人占了 95%**，
 我们只是最后到的那个请求。后者正是重点。
 
-两个模式都改成看 `our_load + foreign_load`：`priority_threshold` 按合计值溢出，
-`capacity` 按 `limit × (1 - total_load)`（**实际剩下的**）抽样，而不是按名义上限。
+`priority_threshold` 按 `our_load + foreign_load` 判断溢出；
+`capacity` 优先在 others 为 0 的部署间等概率探索。当探索组为空时，
+按 `TPM 上限估计 - others TPM 估计 - 本代理已占用 TPM` 加权，
+再应用短时降权和最低权重。
 
 实测验证（2026-08-21，直连 Azure 打满 swc 扮演「别人」，同时让代理只发几个请求）：
 
@@ -1067,12 +1076,9 @@ foreign=0.989 → 0.889 → 0.789 → 0.689 → 0.589      每分钟正好 -0.10
 
 ### 闭环靠 `weight_floor` 收敛
 
-一条被判定为满载的路由**仍然保底拿到 `weight_floor`（5%）的流量**。那些请求就是探针
-——是真实流量，零额外成本，别人真走了它们就会成功，估计值随之回收、容量拿回来。
-
-**注意 floor 是对所有削减因子的乘积生效，不是对每一项分别生效。** 之前是后者：一条
-又满载、又停发中、又低 headroom 的路由会被 floor 三次，落到 `0.05³` ≈ 万分之一，
-那不叫探针那叫饿死。
+可用容量组的最低权重为部署容量估计的 `weight_floor`（默认 5%），组内流量概率还要除以组内总权重。
+扣除外部和本代理用量并应用短时降权后，统一应用一次下限。这样真实流量仍有机会到达受限路由，
+帮助更新容量观测。
 
 ### 两个取舍
 

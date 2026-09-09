@@ -36,6 +36,7 @@ class Target:
     targets: dict
     routing_data: dict
     selection_weight: Optional[float] = None
+    selection_priority: int = 0
 
     def __repr__(self):
         return "{}/{}".format(self.endpoint, self.deployment)
@@ -99,7 +100,8 @@ def decode_snapshot(snapshot, base):
                 route = Target(endpoint=record["endpoint"], deployment=record["deployment"],
                                scope=record.get("scope"), targets=record["targets"],
                                routing_data=record["routing_data"],
-                               selection_weight=record.get("selection_weight"))
+                               selection_weight=record.get("selection_weight"),
+                               selection_priority=record.get("selection_priority", 0))
                 if not all(isinstance(v, str) and v for v in
                            (route.endpoint, route.deployment)):
                     raise ValueError("incomplete route descriptor")
@@ -120,6 +122,8 @@ def decode_snapshot(snapshot, base):
                         not isinstance(route.selection_weight, (int, float))
                         or not math.isfinite(route.selection_weight) or route.selection_weight < 0):
                     raise ValueError("invalid deployment selection weight")
+                if type(route.selection_priority) is not int or route.selection_priority < 0:
+                    raise ValueError("invalid deployment selection priority")
                 routes.append(route)
             if len({str(route) for route in routes}) != len(routes):
                 raise ValueError("duplicate deployment in model mapping")
