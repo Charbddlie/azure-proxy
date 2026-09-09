@@ -33,7 +33,7 @@ class RouteState:
                  "last_dispatch_rpm", "last_throttle_rpm",
                  "timeouts", "last_timeout_rpm",
                  "foreign", "foreign_at", "foreign_hold_until",
-                 "foreign_samples", "foreign_our_load")
+                 "foreign_samples", "foreign_our_load", "foreign_seen")
 
     def __init__(self, key: str):
         self.key = key
@@ -90,6 +90,8 @@ class RouteState:
         self.foreign_hold_until = 0.0   # reclaim paused until Retry-After ends
         self.foreign_samples = 0
         self.foreign_our_load: Optional[float] = None   # our share last time
+        # Monotonic history, retained in routing checkpoints across restarts.
+        self.foreign_seen = False
 
     # -- ledger -----------------------------------------------------------
     def prune(self, now: float, window: float) -> None:
@@ -129,9 +131,9 @@ class QuotaTracker:
 
     `strict_priority` returns the probe's order untouched.
 
-    `capacity` samples zero-others deployments uniformly first, followed by
-    contended deployments weighted by available capacity. Both groups are
-    sampled without replacement.
+    `capacity` samples deployments with no history of positive others usage
+    uniformly first, followed by previously contended deployments weighted by
+    available capacity. Both groups are sampled without replacement.
 
     `priority_threshold` walks the priority order and heads for the first route
     that is not already carrying more than `spill_threshold` of its own quota.
@@ -534,6 +536,7 @@ class QuotaTracker:
         if self.cfg.foreign_enabled and ours is not None:
             observed = min(1.0, max(0.0, 1.0 - ours))
             st.foreign = max(held, observed)
+        st.foreign_seen = st.foreign_seen or st.foreign > 0.0
         st.foreign_at = now
         park = _as_number(retry_after)
         st.foreign_hold_until = now + max(0.0, park or 0.0)
@@ -721,12 +724,12 @@ class QuotaTracker:
 
     # -- selection --------------------------------------------------------
     def selection_parameters(self, routes: List[Route], now=None):
-        """Zero-others routes form a uniform exploration group before capacity."""
+        """Routes whose others usage has always been zero are explored uniformly."""
         now = self.clock() if now is None else now
         weights = self.weights(routes, now)
         if self.cfg.balance != "capacity":
             return [(0, weight) for weight in weights]
-        return [(0, 1.0) if self.foreign_load(self.state(route), now) == 0.0
+        return [(0, 1.0) if not self.state(route).foreign_seen
                 else (1, weight) for route, weight in zip(routes, weights)]
 
     def order(self, routes: List[Route]) -> List[Route]:
@@ -897,6 +900,7 @@ class QuotaTracker:
                     "our_load": (lambda l: None if l is None else round(l, 4))(
                         self.load(st, now)),
                     "foreign_load": round(self.foreign_load(st, now), 4),
+                    "foreign_seen": st.foreign_seen,
                     "total_load": (lambda l: None if l is None else round(l, 4))(
                         self.total_load(st, now)),
                     "foreign_observed_age_seconds": (

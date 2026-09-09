@@ -137,8 +137,10 @@ class CapacityWeightTests(unittest.TestCase):
     def test_report_exposes_capacity_foreign_and_available_tpm(self):
         a, b = route("a", tokens=600000), route("b")
         self.q.state(a).foreign = 0.2
+        self.q.state(a).foreign_seen = True
         self.q.state(a).foreign_at = self.now
         self.q.state(b).foreign = 0.25
+        self.q.state(b).foreign_seen = True
         self.q.state(b).foreign_at = self.now
         self.q.charge(b, 100000)
         report = self.q.report({"sol": [a, b]})
@@ -164,6 +166,7 @@ class CapacityWeightTests(unittest.TestCase):
     def test_exploration_precedes_contended_routes_and_keeps_failover(self):
         routes = [route("a", tokens=1e6), route("b", tokens=1e5), route("c", tokens=9e6)]
         self.q.state(routes[0]).foreign = 0.1
+        self.q.state(routes[0]).foreign_seen = True
         self.q.state(routes[0]).foreign_at = self.now
         params = self.q.selection_parameters(routes)
         self.assertEqual(params, [(1, 900000), (0, 1), (0, 1)])
@@ -176,13 +179,51 @@ class CapacityWeightTests(unittest.TestCase):
         routes = [route("a", tokens=1e6), route("b", tokens=2e6)]
         for r in routes:
             self.q.state(r).foreign = 0.25
+            self.q.state(r).foreign_seen = True
             self.q.state(r).foreign_at = self.now
         self.q.charge(routes[0], 250000)
         self.assertEqual(self.q.selection_parameters(routes), [(1, 500000), (1, 1500000)])
         shares = self.q.report({"sol": routes})["models"]["sol"]
         self.assertEqual([r["share"] for r in shares], [0.25, 0.75])
         self.now += 150
-        self.assertEqual(self.q.selection_parameters(routes), [(0, 1), (0, 1)])
+        self.assertEqual(self.q.selection_parameters(routes), [(1, 1e6), (1, 2e6)])
+        shares = self.q.report({"sol": routes})["models"]["sol"]
+        self.assertEqual([r["share"] for r in shares], [0.3333, 0.6667])
+
+    def test_positive_others_history_survives_decay_and_zero_observations(self):
+        a, b = route("a", tokens=1e6), route("a", "sol-dz", tokens=1e6)
+        self.observe(a, 1e6)
+        self.q.note_foreign(a)
+        self.assertTrue(self.q.state(a).foreign_seen)
+        self.now += 601
+        self.assertEqual(self.q.foreign_load(self.q.state(a), self.now), 0)
+        # Another throttle at full own load replaces the raw estimate with zero.
+        self.q.charge(a, 1e6)
+        self.q.note_foreign(a)
+        self.assertEqual(self.q.state(a).foreign, 0)
+        self.now += 61
+        self.assertEqual(self.q.selection_parameters([a, b]), [(1, 1e6), (0, 1)])
+        report = self.q.report({"sol": [a, b]})
+        self.assertTrue(report["routes"][str(a)]["foreign_seen"])
+        self.assertEqual(report["routes"][str(a)]["other_tpm"], 0)
+        self.assertEqual([r["share"] for r in report["models"]["sol"]], [0, 1])
+        self.assertEqual(self.q.order([a, b]), [b, a])
+
+    def test_zero_others_throttles_keep_uniform_exploration(self):
+        a, b = route("a", tokens=1e6), route("b", tokens=2e6)
+        self.observe(a, 1e6)
+        self.q.charge(a, 1e6)
+        self.q.demote(a, "429", "30")
+        self.assertFalse(self.q.state(a).foreign_seen)
+        self.assertEqual(self.q.selection_parameters([a, b]), [(0, 1), (0, 1)])
+
+    def test_disabling_foreign_estimation_keeps_positive_history(self):
+        a, b = route("a", tokens=1e6), route("b", tokens=2e6)
+        self.observe(a, 1e6)
+        self.q.note_foreign(a)
+        self.cfg.foreign_enabled = False
+        self.assertEqual(self.q.foreign_load(self.q.state(a), self.now), 0)
+        self.assertEqual(self.q.selection_parameters([a, b]), [(1, 1e6), (0, 1)])
 
     def test_serving_samples_groups_after_endpoint_filtering(self):
         targets = [Target("other", "zero", None, {}, {}, 1, 0),

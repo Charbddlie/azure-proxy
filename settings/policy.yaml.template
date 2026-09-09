@@ -79,10 +79,10 @@ routing:
   #                        Traffic concentrates on the best endpoint while there
   #                        is room, and starts spreading BEFORE anything is full
   #                        rather than after the first 429.
-  #   capacity             uniformly explore routes with zero estimated others
-  #                        usage first; when none remain, sample by available
-  #                        capacity. Published groups also govern local choices
-  #                        within an endpoint-bound session.
+  #   capacity             uniformly explore routes whose estimated others usage
+  #                        has always been zero; when none remain, sample by
+  #                        available capacity. Published groups also govern local
+  #                        choices within an endpoint-bound session.
   #
   # `priority` and `weighted` are the previous names for strict_priority and
   # capacity and still work.
@@ -256,9 +256,10 @@ routing:
     # when every ceiling is unknown, each starts at 1,000,000 TPM.
     # Capacity weights subtract foreign TPM and the proxy's current TPM.
     # Current TPM = tokens dispatched in the load window * 60 / window seconds.
-    # In capacity mode, routes whose estimated others usage is zero form the
-    # first group and are sampled uniformly. When this group is empty, sample
-    # by available capacity. Retry chains visit both groups in that order.
+    # In capacity mode, routes whose estimated others usage has always been zero
+    # form the first group and are sampled uniformly. Positive observations are
+    # remembered across decay and routing restarts. When this group is empty,
+    # sample by available capacity. Retry chains visit both groups in that order.
     # Image routes use a separate RPM scale (unknown defaults to 1 RPM).
     # Legacy static_weights and headroom_high_water keys are ignored.
     # GET /routes exposes estimated_capacity_tpm, other_tpm, our_tpm, available_tpm.

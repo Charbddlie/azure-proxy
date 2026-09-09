@@ -847,7 +847,7 @@ codex 的 `include: ["reasoning.encrypted_content"]` 照常工作。
 | --- | --- |
 | `strict_priority` | 严格优先级。优先级 1 吃下 100% 流量，只有它出错才往下走。这是 kill switch |
 | `priority_threshold` | **默认。** 按优先级走，但一条路由用掉自己配额的 `spill_threshold`（默认 70%）之后就跳过它，发给下一条 |
-| `capacity` | 优先对 others 为 0 的部署等概率探索；探索组为空时按可用 TPM 加权 |
+| `capacity` | 优先对历史上 others 始终为 0 的部署等概率探索；探索组为空时按可用 TPM 加权 |
 
 `priority` / `weighted` 是前两个和最后一个的旧名字，仍然有效。
 
@@ -936,7 +936,7 @@ TPM ≈ 单请求 token 数 × 轮次频率 × 并发，和 n 只是线性关系
 **但对 gpt-5.6-sol + codex 这种「单请求占 15% 上限」的负载，它只能减少限流、不能消灭
 限流**——限流照样会发生，只是现在会被透明地切走，调用方看不到。
 
-Sol 的多个独立会话可使用 `balance: capacity`。当前规则先对 others 为 0 的部署
+Sol 的多个独立会话可使用 `balance: capacity`。当前规则先对历史上 others 始终为 0 的部署
 等概率探索；当探索组为空时，依据扣除外部及本代理用量后的可用 TPM 分流。
 已有会话保持 endpoint 绑定，选择和重试均限定在该 endpoint 内。
 
@@ -976,9 +976,12 @@ Sol 的多个独立会话可使用 `balance: capacity`。当前规则先对 othe
 图像 deployment 单独使用 RPM，未知时取已知 RPM 的均值，全未知时取 `1 RPM`。
 旧配置项 `static_weights` 和 `headroom_high_water` 已忽略。
 
-`capacity` 模式优先探索：当候选 deployment 中存在 `others TPM = 0` 的部署时，
+`capacity` 模式优先探索：当候选 deployment 中存在历史上 `others TPM` 始终为 0 的部署时，
 从这组中等概率选择，容量大小、自身占用和短时降权均不改变组内概率。
-当所有候选部署的 others TPM 都大于 0 时，按以下可用容量权重计算概率：
+只要曾观测到正的外部负载，部署就保持在可用容量组；后续外部负载归零也保留该分组。
+历史标记 `foreign_seen` 随 routing checkpoint 持久化，重启和诊断历史清理均保留。
+旧 checkpoint 根据仍保存的正外部负载估计补全标记。
+当所有候选部署都曾观测到正的外部负载时，按以下可用容量权重计算概率：
 
 ```
 other_tpm = estimated_capacity_tpm × foreign_load
@@ -993,6 +996,7 @@ weight = max(estimated_capacity_tpm × weight_floor, available_tpm × penalty)
 并保留 ARM 声明的 `capacity_*` 与响应头观测的 `limit_*`。
 
 `selection_priority` 为探索组 0、可用容量组 1；`selection_weight` 为组内抽样权重。
+`routes[].foreign_seen` 表示该部署是否曾观测到正的外部负载。
 `models[].share` 显示首选概率，`weight` 保留可用容量公式的结果。
 重试先遍历探索组，再遍历可用容量组，每个 deployment 最多出现一次。
 已有会话先按绑定 endpoint 筛选候选，再在该 endpoint 内执行同样的分组选择。
@@ -1030,7 +1034,7 @@ foreign = clamp(1 - our_load_at_throttle, 0, 1)
 我们只是最后到的那个请求。后者正是重点。
 
 `priority_threshold` 按 `our_load + foreign_load` 判断溢出；
-`capacity` 优先在 others 为 0 的部署间等概率探索。当探索组为空时，
+`capacity` 优先在历史上 others 始终为 0 的部署间等概率探索。当探索组为空时，
 按 `TPM 上限估计 - others TPM 估计 - 本代理已占用 TPM` 加权，
 再应用短时降权和最低权重。
 

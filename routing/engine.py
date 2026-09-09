@@ -110,6 +110,8 @@ class Engine:
             state = RouteState(key)
             for name, value in record.items():
                 setattr(state, name, collections.deque(value) if name == "sent" else value)
+            # Older checkpoints retain the raw estimate even after its decay.
+            state.foreign_seen = state.foreign_seen or state.foreign > 0.0
             self.quota.states[key] = state
             entries.update((item[4], item) for item in state.sent if len(item) > 4)
         self.pending = saved["pending"]

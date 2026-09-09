@@ -110,6 +110,71 @@ class RetryLoopTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_others_history_survives_zero_estimate_and_restart(self):
+        with fixture() as (p, a, b):
+            p.sync()
+            p.stop_routing()
+            config = config_at(p.home)
+            config.balance = "capacity"
+            config.foreign_enabled = True
+            config.foreign_reclaim = 0.1
+            engine = Engine(p.home, config)
+            route = config.routes[MODEL][0]
+            try:
+                # Learned history outlives the diagnostic retention window.
+                engine.now = time.time() - 2 * 86400
+                engine.quota.observed(route, 200, {"x-ratelimit-limit-tokens": "1000000"})
+                engine.quota.note_foreign(route)
+                engine.now += 601
+                engine.quota.charge(route, 1000000)
+                engine.quota.note_foreign(route)
+                self.assertEqual(engine.quota.state(route).foreign, 0)
+                report = engine.step()["report"]["routes"][str(route)]
+                self.assertTrue(report["foreign_seen"])
+                self.assertEqual(report["selection_priority"], 1)
+                engine.close()
+                engine = Engine(p.home, config)
+                snapshot = engine.step()
+                report = snapshot["report"]["routes"][str(route)]
+                self.assertEqual(report["other_tpm"], 0)
+                self.assertTrue(report["foreign_seen"])
+                self.assertEqual(report["selection_priority"], 1)
+                targets = snapshot["tables"]["routes"][MODEL]
+                self.assertEqual({t["endpoint"]: t["selection_priority"] for t in targets},
+                                 {"alpha": 1, "beta": 0})
+            finally:
+                engine.close()
+
+    def test_legacy_checkpoint_recovers_others_history_from_raw_estimate(self):
+        with fixture() as (p, a, b):
+            p.sync()
+            p.stop_routing()
+            config = config_at(p.home)
+            config.balance = "capacity"
+            config.foreign_enabled = True
+            config.foreign_reclaim = 0.1
+            engine = Engine(p.home, config)
+            try:
+                route = config.routes[MODEL][0]
+                engine.quota.state(route)
+                for foreign in (0.0, 0.25):
+                    with self.subTest(foreign=foreign):
+                        saved = engine.checkpoint()
+                        state = saved["states"][str(route)]
+                        state.pop("foreign_seen")
+                        state.update(foreign=foreign, foreign_at=time.time() - 2 * 86400,
+                                     foreign_hold_until=0)
+                        engine.restore(saved)
+                        restored = engine.quota.state(route)
+                        self.assertEqual(engine.quota.foreign_load(restored, engine.now), 0)
+                        self.assertEqual(restored.foreign_seen, foreign > 0)
+                        self.assertEqual(engine.quota.selection_parameters([route])[0][0],
+                                         int(foreign > 0))
+                        self.assertEqual(engine.checkpoint()["states"][str(route)]["foreign_seen"],
+                                         foreign > 0)
+            finally:
+                engine.close()
+
     def test_expired_demotions_are_excluded_from_replay(self):
         with fixture() as (p, a, b):
             p.sync()
