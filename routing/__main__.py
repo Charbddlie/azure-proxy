@@ -13,10 +13,12 @@ from proxy.state import is_busy
 from proxy.state import Store
 from proxy.retention import CLEANUP_INTERVAL
 from .engine import Engine
+from .discovery import RouteRefresher
 
 
 def run(root, stop):
     engine = None
+    refresher = None
     waiting = False
     log = logging.getLogger(__name__)
     try:
@@ -24,6 +26,19 @@ def run(root, stop):
             try:
                 if engine is None:
                     engine = Engine(root)
+                    if engine.config.route_refresh_enabled:
+                        refresher = RouteRefresher(root, engine.config.route_refresh_interval,
+                                                   engine.config.route_refresh_timeout)
+                        refresher.start()
+                if refresher:
+                    discovery = refresher.take()
+                    if discovery is not None:
+                        try:
+                            engine.reload_routes(discovery)
+                            refresher.accepted()
+                        except Exception as error:
+                            refresher.rejected(error)
+                    engine.route_refresh = refresher.status()
                 engine.step()
             except sqlite3.OperationalError as error:
                 if not is_busy(error):
@@ -45,6 +60,8 @@ def run(root, stop):
                     raise
                 log.warning("routing stopped while database busy; last heartbeat will expire")
     finally:
+        if refresher:
+            refresher.close()
         if engine is not None:
             engine.close()
 

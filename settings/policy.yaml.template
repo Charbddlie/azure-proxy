@@ -49,6 +49,12 @@ server:
   capture_limit: 40
 
 routing:
+  # Refresh once in the background at startup, then hourly; load without restart.
+  route_refresh:
+    enabled: true
+    interval_seconds: 3600
+    timeout_seconds: 900
+
   # Failover fires on these, and only these.
   retry_on_status: [429, 500, 502, 503, 504]
   retry_on_transport_error: true      # connection reset / DNS / TLS

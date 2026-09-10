@@ -1085,7 +1085,7 @@ class RouteProbabilityTests(unittest.TestCase):
             for width in range(1, 80):
                 self.assertLessEqual(cell_len(truncate(name, width, middle=True)), width)
 
-    def test_long_deployment_labels_use_middle_ellipsis(self):
+    def test_long_model_card_labels_use_prefix_ellipsis(self):
         endpoint = "yifanyang-foundry-resource"
         keys = [endpoint + "/gpt-5.6-sol-deploy-" + suffix for suffix in ("east", "west")]
         snapshot = Snapshot({"routes": {
@@ -1094,8 +1094,16 @@ class RouteProbabilityTests(unittest.TestCase):
         for width in (46, 64, 93):
             text = render(_model_card(snapshot.models[0], width, False, snapshot), width)
             for suffix in ("east", "west"):
-                self.assertRegex(text, r"\.5\s+yifa\S*…\S*{}\s".format(suffix))
+                self.assertRegex(text, r"\.5\s+…\S*{}\s".format(suffix))
             self.assertTrue(all(cell_len(line) == width for line in text.splitlines()))
+
+    def test_prefix_ellipsis_preserves_suffix_and_terminal_width(self):
+        for name, width, expected in (("abcdef", 5, "…cdef"), ("abcdef", 1, "…"),
+                                      ("abcdef", 0, ""), ("abc", 3, "abc"),
+                                      ("模型部署名称", 5, "…名称")):
+            self.assertEqual(truncate(name, width, prefix=True), expected)
+        for width in range(1, 30):
+            self.assertLessEqual(cell_len(truncate("模型部署名称" * 10, width, prefix=True)), width)
 
 
 class ScrollConfigurationTests(unittest.TestCase):

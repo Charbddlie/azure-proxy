@@ -3,6 +3,7 @@
 import re
 
 KIND_LABELS = {
+    "route_refresh": "路由更新",
     "boot": "服务启动", "request": "收到请求", "response": "请求结果",
     "capacity": "容量更新", "throttle": "上游限流", "demote": "上游异常",
     "foreign": "外部用量", "failover": "等待重试", "pin": "会话绑定",
@@ -62,6 +63,9 @@ def reason_text(value):
 def message(event):
     """Describe the observation/action without inferring a successful model turn."""
     kind = event.get("kind")
+    if kind == "route_refresh":
+        return "路由已更新：新增 {}，移除 {}，当前 {} 个部署".format(
+            number(event.get("added")), number(event.get("removed")), number(event.get("total")))
     seconds = number(event.get("seconds"))
     if kind == "failover":
         return "{}；{} 秒后{}".format(reason_text(event.get("reason")),

@@ -104,10 +104,11 @@ def allocate(total: int, fractions: List[float]) -> List[int]:
     return floors
 
 
-def truncate(text: str, width: int, *, middle: bool = False) -> str:
+def truncate(text: str, width: int, *, middle: bool = False, prefix: bool = False) -> str:
     """Cut to `width` terminal cells, marking the cut.
 
     With `middle=True`, retain both ends around the ellipsis.
+    With `prefix=True`, retain the suffix after the ellipsis.
 
     Cells, not characters. A CJK glyph occupies two columns, so `len()` under-
     counts it by half and a label measured that way overruns the column it was
@@ -121,7 +122,7 @@ def truncate(text: str, width: int, *, middle: bool = False) -> str:
         return text
     if width == 1:
         return "…"
-    prefix_width = width // 2 if middle else width - 1
+    prefix_width = 0 if prefix else width // 2 if middle else width - 1
     out = ""
     used = 0
     for char in text:
@@ -131,7 +132,7 @@ def truncate(text: str, width: int, *, middle: bool = False) -> str:
         out += char
         used += size
     suffix = ""
-    if middle:
+    if middle or prefix:
         for char in reversed(text):
             size = cell_len(char)
             if used + size > width - 1:

@@ -121,7 +121,7 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
         label = labels.get(route.key, route.key)
         label_style = theme.TEXT if route.busy else theme.LABEL
         table.add_row(*([shares[route.key]] if show_share else []),
-                      Text(truncate(label, label_width, middle=True), style=label_style),
+                      Text(truncate(label, label_width, middle=not show_share, prefix=show_share), style=label_style),
                       pin_cells.get(route.key, _pinned_value(None)),
                       ours[route.key],
                       capacity_bar(bar_width, route.rpm_load_by_face, route.rpm_other_load),

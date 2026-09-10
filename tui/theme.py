@@ -97,6 +97,7 @@ UNKNOWN_GLYPH = "─"          # the ceiling is not known, so nothing can be sho
 # sinking into the ordinary traffic.
 
 EVENT_STYLE = {
+    "route_refresh": ("↻", ACCENT),
     "boot":      ("•", ACCENT),
     "request":   ("→", DIM),
     "response":  ("←", DIM),

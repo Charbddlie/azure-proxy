@@ -44,7 +44,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+sys.path.insert(0, os.path.dirname(HERE))
+ROOT = os.environ.get("AZURE_PROXY_HOME", os.path.dirname(HERE))
 SETTINGS = os.path.join(ROOT, "settings")
 RUNTIME = os.path.join(ROOT, "runtime")
 
@@ -608,7 +609,7 @@ def probe_responses(candidates, plans, live):
     return paths, attempts, alive
 
 
-def discover(candidates, fallback_names, arm_token):
+def discover(candidates, fallback_names, arm_token, strict=False):
     """Per endpoint: what to probe, and where the list came from.
 
     Returns {endpoint: (plan, "arm"|"list")}. The source is recorded rather than
@@ -619,6 +620,8 @@ def discover(candidates, fallback_names, arm_token):
     plans = {}
     for c in candidates:
         items = arm_deployments(c, arm_token) if arm_token else None
+        if strict and items is None and c.get("subscription") and c.get("resource_group"):
+            raise RuntimeError("ARM discovery failed for " + c["name"])
         if items is None:
             # A candidate may carry its own deployment list (an endpoint ARM
             # will not list for us); otherwise fall back to the shared guesses.
@@ -630,8 +633,10 @@ def discover(candidates, fallback_names, arm_token):
 
 
 def main():
-    global KEYS
+    global KEYS, RUNTIME
     ap = argparse.ArgumentParser()
+    ap.add_argument("--output-dir", help="write staged results to this directory")
+    ap.add_argument("--strict", action="store_true", help="reject incomplete discovery and transient probe failures")
     ap.add_argument("--only", help="probe a single endpoint by name")
     ap.add_argument("--no-responses", action="store_true",
                     help="skip the Responses API pass")
@@ -640,6 +645,8 @@ def main():
     ap.add_argument("--no-arm", action="store_true",
                     help="skip ARM discovery and guess from the name list")
     args = ap.parse_args()
+    if args.output_dir:
+        RUNTIME = os.path.abspath(args.output_dir)
 
     with open(os.path.join(SETTINGS, "endpoints.yaml")) as f:
         inv = yaml.safe_load(f)
@@ -661,7 +668,7 @@ def main():
             KEYS = json.load(f)
 
     arm_token = None if args.no_arm else get_cli_token(ARM_RESOURCE)
-    plans = discover(candidates, inv["deployments"], arm_token)
+    plans = discover(candidates, inv["deployments"], arm_token, strict=args.strict)
     # Per face, because they no longer cover the same deployments: an image
     # deployment has no chat face to probe and a chat one has no image face.
     pairs = [(c, d) for c in candidates
@@ -697,6 +704,13 @@ def main():
     else:
         print("image face: {} deployments to probe".format(image_pairs))
         i_attempts, i_live = probe_images(candidates, plans)
+
+    if args.strict:
+        failed = [(endpoint, status) for results in (attempts, r_attempts, i_attempts)
+                  for endpoint, values in results.items() for status, _code, _message in values
+                  if status in (0, 401, 403, 429) or status >= 500]
+        if failed:
+            raise RuntimeError("probe incomplete; retaining previous routes: " + str(failed))
 
     # A deployment is usable if ANY face answered. The chat pass is what settles
     # limit_param, so a deployment found on another face has no measured answer
@@ -792,10 +806,15 @@ def main():
                 sum(1 for (ep, _d) in i_live if ep == c["name"]))
             if "ok" in (status, r_status, i_status) else (reason or "")))
 
-    write_json("sources.json", dict(header, endpoints=endpoints))
-    write_json("models.json", dict(
+    sources_doc = dict(header, endpoints=endpoints)
+    models_doc = dict(
         header, models={k: {"routes": order_routes(v)}
-                        for k, v in sorted(models.items())}))
+                        for k, v in sorted(models.items())})
+    write_json("sources.json", sources_doc)
+    write_json("models.json", models_doc)
+    from routing.discovery import persist_discovery
+    persist_discovery(ROOT, dict(sources=sources_doc, models=models_doc),
+                      directory=RUNTIME)
     responses_only = sorted(dep for (_ep, dep), info in usable.items()
                             if (_ep, dep) not in live
                             and (_ep, dep) not in i_live)

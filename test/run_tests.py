@@ -116,6 +116,7 @@ class Proxy:
                 "  host: 127.0.0.1\n"
                 "  port: {port}\n"
                 "routing:\n"
+                "  route_refresh: {{enabled: false}}\n"
                 "  retry_on_status: [429, 500, 502, 503, 504]\n"
                 "  retry_on_transport_error: true\n"
                 "  retry_on_timeout: false\n"

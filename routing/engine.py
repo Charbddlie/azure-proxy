@@ -1,6 +1,7 @@
 """Replay observations, calculate targets, and atomically publish a generation."""
 
 import collections
+import copy
 import logging
 import os
 import time
@@ -45,7 +46,8 @@ def target_record(route):
 
 class Engine:
     def __init__(self, root, config=None):
-        self.config = config or Config()
+        self.root = root
+        self.config = config or Config(root=root)
         cfg = self.config
         log = logging.getLogger(__name__)
         if cfg.balance_configured != cfg.balance:
@@ -60,6 +62,8 @@ class Engine:
         self.pending = {}
         self.producers = {}
         self.catalog = {}
+        self.retired_routes = set()
+        self.route_refresh = dict(enabled=self.config.route_refresh_enabled)
         self.sessions = {}
         self.events = collections.deque(maxlen=2000)
         self.event_seq = 0
@@ -73,6 +77,10 @@ class Engine:
             saved = self.store.get("checkpoint")
             if saved:
                 self.restore(saved)
+            active = {str(route) for name in TABLES
+                      for routes in getattr(self.config, name).values() for route in routes}
+            self.retired_routes = (self.retired_routes | (set(self.catalog) - active)) - active
+            self.catalog = {key: value for key, value in self.catalog.items() if key in active}
         except Exception:
             self.store.close()
             raise
@@ -104,6 +112,7 @@ class Engine:
         self.stream_id = saved.get("stream_id", self.stream_id)
         self.retention_through = saved.get("retention_through", 0)
         self.catalog = saved.get("catalog", {})
+        self.retired_routes = set(saved.get("retired_routes", []))
         self.quota._saved_capacity = saved["capacity"]
         entries = {}
         for key, record in saved["states"].items():
@@ -125,12 +134,48 @@ class Engine:
                     retention_epoch=int(self.now // CLEANUP_INTERVAL),
                     capacity=dict(self.quota._saved_capacity), pending=self.pending,
                     catalog=self.catalog, sessions=self.sessions, producers=self.producers,
+                    retired_routes=sorted(self.retired_routes),
                     events=list(self.events), event_seq=self.event_seq,
                     stream_id=self.stream_id, retention_through=self.retention_through,
                     states={key: {name: list(value) if isinstance(value, collections.deque)
                                   else value for name in RouteState.__slots__
                                   for value in [getattr(state, name)]}
                             for key, state in self.quota.states.items()})
+
+    def reload_routes(self, discovery):
+        """Validate and swap discovery only, retaining in-flight accounting."""
+        if discovery["sources"].get("_generated_at") != discovery["models"].get("_generated_at"):
+            raise ValueError("discovery files belong to different generations")
+        loaded = Config(root=self.root, discovery=discovery)
+        candidate = copy.copy(self.config)
+        for name in (*TABLES, "endpoints", "scopes", "endpoint_identities",
+                     "image_deployments", "generated_at", "discovery"):
+            setattr(candidate, name, getattr(loaded, name))
+        tables = {name: {model: [target_record(route) for route in routes]
+                         for model, routes in getattr(candidate, name).items()} for name in TABLES}
+        fields = {name: sorted(value) if isinstance(value, set) else value
+                  for name in SNAPSHOT_FIELDS for value in [getattr(candidate, name)]}
+        fields["endpoint_identities"] = candidate.endpoint_identities
+        decode_snapshot(dict(schema_version=SNAPSHOT_VERSION, revision=self.revision + 1,
+                             config=fields, tables=tables, report={}, events={},
+                             routing=dict(heartbeat=self.now, processed_seq=self.cursor,
+                                          pid=os.getpid(), ready=True)), candidate)
+        def keys(config):
+            return {str(route) for name in TABLES
+                    for routes in getattr(config, name).values() for route in routes}
+        old, new = keys(self.config), keys(candidate)
+        from .discovery import persist_discovery
+        persist_discovery(self.root, discovery)
+        self.retired_routes = (self.retired_routes | (old - new)) - new
+        self.catalog = {key: value for key, value in self.catalog.items() if key not in self.retired_routes}
+        self.config = candidate
+        self.quota.cfg = candidate
+        self.last_publication = None
+        self.event("route_refresh", "info", "routes refreshed: %s added, %s removed, %s total",
+                   len(new - old), len(old - new), len(new),
+                   added=len(new - old), removed=len(old - new), total=len(new))
+        logging.getLogger(__name__).info("routes refreshed: %s added, %s removed, %s total",
+                                         len(new - old), len(old - new), len(new))
 
     def consume(self, event):
         self.now = event["at"]
@@ -226,10 +271,11 @@ class Engine:
         for item in self.catalog.values():
             model = item["model"]
             route = route_from_record(item["route"])
-            if model and str(route) not in {str(r) for r in merged.get(model, [])}:
+            if model and str(route) not in self.retired_routes and str(route) not in {str(r) for r in merged.get(model, [])}:
                 merged.setdefault(model, []).append(route)
         report = self.quota.report(merged)
         report.update(session_affinity=self.sessions,
+                      route_refresh=self.route_refresh,
                       spill_threshold=cfg.spill_threshold, probed_at=cfg.generated_at,
                       model_faces={model: [face for face, name in zip(
                           ("chat", "responses", "image", "image_edits"), TABLES)
@@ -244,7 +290,8 @@ class Engine:
         return dict(schema_version=SNAPSHOT_VERSION, revision=self.revision + 1,
                     config=config, tables=tables, report=report,
                     routing=dict(pid=os.getpid(), instance_id=self.instance,
-                                 heartbeat=self.now, processed_seq=self.cursor, ready=ready),
+                                 heartbeat=self.now, processed_seq=self.cursor, ready=ready,
+                                 route_refresh=self.route_refresh),
                     events=dict(events=list(self.events), next=self.event_seq,
                                 stream_id=self.stream_id, retention_through=self.retention_through,
                                 counts=dict(collections.Counter(e["kind"] for e in self.events))))

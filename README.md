@@ -510,6 +510,18 @@ responses 那组用例发的是**实测抓到的 codex 0.148.0 请求体**，逐
 
 ## 探测
 
+运行中的 routing 会在启动后立即后台探测一次，此后每小时探测并动态加载新路由。
+可在 `routing.route_refresh` 配置 `enabled`、`interval_seconds`（默认 3600）和
+`timeout_seconds`（默认 900）。探测与路由统计分别运行，新结果完整且校验成功后切换，
+正在执行的请求继续使用自己的配置快照，RPM 历史和 endpoint 会话绑定保留。
+当 ARM 查询失败、探测超时或遇到临时限流等错误时，保留上一版路由，下一周期重试。
+`/routes` 和 `/healthz` 的 routing 状态包含 `route_refresh`，记录上次成功时间、
+下次刷新时间和最近错误；成功加载会产生“路由更新”事件。
+
+`runtime/discovery.json` 原子保存完整的 sources/models 配对，是路由加载的事实来源；
+`runtime/sources.json`、`runtime/models.json` 同步保留为可读副本。
+上一版保存在 `runtime/discovery.previous.json`。首次升级会兼容原有两份文件。
+
 **新 clone 的第一步。** `runtime/` 不进版本库（那是环境状态不是代码，签进去只会
 慢慢和现实脱节），而代理启动时要读 `runtime/models.json`——所以没跑过探测之前
 `./start.sh` 起不来。

@@ -23,6 +23,7 @@ umask on it. The fields below are names, numbers and statuses.
 # colours by has to be one of these, so keeping the set closed is what stops a
 # typo'd kind from becoming an event that no filter ever matches.
 KINDS = (
+    "route_refresh", # a new discovery generation was loaded without restarting
     "boot",         # startup narration: identity, endpoints, mode
     "request",      # a request arrived; face + model, before any route is picked
     "response",     # a request finished; the route that answered and the status
@@ -72,6 +73,7 @@ PROBLEM_KINDS = frozenset(
 LEVELS = ("debug", "info", "warning", "error")
 LEVEL_RANK = {name: index for index, name in enumerate(LEVELS)}
 EVENT_LEVELS = {
+    "route_refresh": "info",
     "request": "debug",
     "boot": "info", "response": "info", "capacity": "info", "foreign": "info",
     "held": "info", "pin": "info", "inherited": "info", "image_tool": "info", "token": "info",

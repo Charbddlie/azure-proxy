@@ -126,15 +126,26 @@ class Route:
 class Config:
     """With load_routes=False, parse serving startup settings only."""
 
-    def __init__(self, load_routes=True):
-        with open(os.path.join(SETTINGS, "policy.yaml")) as f:
+    def __init__(self, load_routes=True, *, root=None, discovery=None):
+        self.root = ROOT if root is None else root
+        settings = SETTINGS if root is None else os.path.join(root, "settings")
+        runtime = RUNTIME if root is None else os.path.join(root, "runtime")
+        with open(os.path.join(settings, "policy.yaml")) as f:
             policy = yaml.safe_load(f)
         sources, models = {"endpoints": []}, {"models": {}}
         if load_routes:
-            with open(os.path.join(RUNTIME, "sources.json")) as f:
-                sources = json.load(f)
-            with open(os.path.join(RUNTIME, "models.json")) as f:
-                models = json.load(f)
+            if discovery is None:
+                try:
+                    with open(os.path.join(runtime, "discovery.json")) as f:
+                        discovery = json.load(f)
+                except FileNotFoundError:
+                    with open(os.path.join(runtime, "sources.json")) as f:
+                        sources = json.load(f)
+                    with open(os.path.join(runtime, "models.json")) as f:
+                        models = json.load(f)
+                    discovery = dict(sources=sources, models=models)
+            sources, models = discovery["sources"], discovery["models"]
+        self.discovery = dict(sources=sources, models=models)
 
         self.policy = policy
         self.host = policy["server"]["host"]
@@ -234,7 +245,7 @@ class Config:
             # be moved to another path, or handed to another account, without a
             # setting that points back at where it used to live.
             if not os.path.isabs(self.az_config_dir):
-                self.az_config_dir = os.path.join(ROOT, self.az_config_dir)
+                self.az_config_dir = os.path.join(self.root, self.az_config_dir)
             os.environ["AZURE_CONFIG_DIR"] = self.az_config_dir
 
         self.routes: Dict[str, List[Route]] = {}
@@ -245,6 +256,16 @@ class Config:
         self.routing_report = {}
         if not load_routes:
             return
+
+        refresh = r.get("route_refresh") or {}
+        self.route_refresh_enabled = refresh.get("enabled", True)
+        self.route_refresh_interval = float(refresh.get("interval_seconds", 3600))
+        self.route_refresh_timeout = float(refresh.get("timeout_seconds", 900))
+        if type(self.route_refresh_enabled) is not bool:
+            raise ValueError("route_refresh.enabled must be boolean")
+        for value in (self.route_refresh_interval, self.route_refresh_timeout):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("route refresh interval and timeout must be positive and finite")
 
         # Routing owns algorithm settings and deployment discovery. Serving
         # receives their results in snapshots and can boot without parsing them.
@@ -271,7 +292,7 @@ class Config:
         capacity_file = b.get("capacity_state_file", "runtime/capacity.json")
         self.capacity_state_file = os.path.expanduser(str(capacity_file))
         if not os.path.isabs(self.capacity_state_file):
-            self.capacity_state_file = os.path.join(ROOT, self.capacity_state_file)
+            self.capacity_state_file = os.path.join(self.root, self.capacity_state_file)
         self.chars_per_token = float(b.get("assumed_chars_per_token", 4)) or 4.0
 
         f = b.get("foreign_load") or {}
