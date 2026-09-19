@@ -80,6 +80,41 @@ def config_at(root):
         return Config()
 
 
+class FaceProbabilityTests(unittest.TestCase):
+    def test_report_probabilities_use_each_published_api_candidate_set(self):
+        with fixture() as (p, _a, _b):
+            p.sync()
+            p.stop_routing()
+            config = config_at(p.home)
+            config.balance = "capacity"
+            chat = config.routes[MODEL]
+            responses_only = copy.copy(chat[0])
+            responses_only.endpoint = "responses-only"
+            config.responses_routes[MODEL] = chat + [responses_only]
+            with contextlib.closing(Engine(p.home, config)) as engine:
+                for route, capacity in zip(chat, (100, 300)):
+                    state = engine.quota.state(route)
+                    state.safe_rpm = capacity
+                    state.other_rpm = capacity / 2
+                    state.foreign_seen = True
+                snapshot = engine.snapshot()
+                entries = {entry["route"]: entry for entry in snapshot["report"]["models"][MODEL]}
+                self.assertEqual(entries[str(chat[0])]["share_by_face"], dict(chat=.25, responses=0))
+                self.assertEqual(entries[str(chat[1])]["share_by_face"], dict(chat=.75, responses=0))
+                self.assertEqual(entries[str(responses_only)]["share_by_face"], dict(responses=1))
+                # The legacy merged share remains compatible with old consumers.
+                self.assertEqual(entries[str(responses_only)]["share"], 1)
+                for face, table in (("chat", "routes"), ("responses", "responses_routes")):
+                    candidates = snapshot["tables"][table][MODEL]
+                    self.assertEqual(sum(e["share_by_face"].get(face, 0) for e in entries.values()), 1)
+                    for target in candidates:
+                        key = target["endpoint"] + "/" + target["deployment"]
+                        self.assertIn(face, entries[key]["share_by_face"])
+                del config.responses_routes[MODEL]
+                report = engine.snapshot()["report"]["models"][MODEL]
+                self.assertTrue(all("responses" not in entry["share_by_face"] for entry in report))
+
+
 class ProtocolTests(unittest.TestCase):
     def setUp(self):
         self.route = Route("alpha", "http://localhost/", "v", DEPLOYMENT,

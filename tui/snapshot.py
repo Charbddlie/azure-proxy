@@ -40,13 +40,14 @@ class RouteView:
     The dashboard does, in both directions, so the join happens once here.
     """
 
-    __slots__ = ("key", "model", "share", "data")
+    __slots__ = ("key", "model", "share", "share_by_face", "data")
 
     def __init__(self, key: str, model: Optional[str], share: Optional[float],
-                 data: dict):
+                 data: dict, share_by_face: Optional[dict] = None):
         self.key = key
         self.model = model
         self.share = share
+        self.share_by_face = share_by_face or {}
         self.data = _rpm_fields(data)
 
     def __getattr__(self, name):
@@ -381,12 +382,12 @@ class Snapshot:
         owner: Dict[str, tuple] = {}
         for model, entries in models.items():
             for entry in entries:
-                owner[entry.get("route")] = (model, entry.get("share"))
+                owner[entry.get("route")] = (model, entry.get("share"), entry.get("share_by_face"))
 
         self._views: Dict[str, RouteView] = {}
         for key, data in table.items():
-            model, share = owner.get(key, (None, None))
-            self._views[key] = RouteView(key, model, share, data)
+            model, share, share_by_face = owner.get(key, (None, None, None))
+            self._views[key] = RouteView(key, model, share, data, share_by_face)
 
         by_source: Dict[str, List[RouteView]] = {}
         for view in self._views.values():

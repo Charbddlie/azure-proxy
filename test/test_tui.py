@@ -280,14 +280,14 @@ class InteractionTests(unittest.TestCase):
                     model_frame = render(dash.render(), width)
                     self.assertEqual(build.call_args.args[6], "model")
                     self.assertTrue(all(group.kind == "model" for group in build.call_args.args[0]))
-                    self.assertIn("route prob.", model_frame)
+                    self.assertIn("chat/resp route prob(%)", model_frame)
                     y, x, _, _ = next(region for region in dash._tab_regions if region[3] == 1)
                     dash.key("\x1b[<0;{};{}M".format(x, y))
                     self.assertEqual(dash.board, 1)
                     source_frame = render(dash.render(), width)
                     self.assertEqual(build.call_args.args[6], "source")
                     self.assertTrue(all(group.kind == "source" for group in build.call_args.args[0]))
-                    self.assertNotIn("route prob.", source_frame)
+                    self.assertNotIn("route prob(%)", source_frame)
 
     def test_tabs_use_rendered_cell_coordinates_even_when_wrapped(self):
         for width in (24, 60, 120, 180):
@@ -832,14 +832,16 @@ class PinnedCardTests(unittest.TestCase):
                     source_text = render(_source_card(source, width, detail, 7, snapshot, True), width)
                     model_text = render(_model_card(model, width, detail, snapshot), width)
                     self.assertIn("7 pinned", source_text.splitlines()[1])
-                    self.assertIn("5 pinned", model_text.splitlines()[1])
                     self.assertIn("7 pinned  RPM:cur/avail", source_text.splitlines()[1])
-                    self.assertIn("5 pinned  RPM:cur/avail", model_text.splitlines()[1])
+                    if width >= 80:
+                        self.assertIn("5 pinned  RPM:cur/avail", model_text.splitlines()[1])
+                    self.assertIn("chat/resp route prob(%)", model_text.splitlines()[1])
                     self.assertRegex(source_text, r"sol-a\s+3\s")
                     self.assertRegex(source_text, r"sol-b\s+3\s")
                     self.assertRegex(source_text, r"gpt-5.6-terra\s+4\s")
-                    self.assertRegex(model_text, r"alpha·sol-a\s+3\s")
-                    self.assertRegex(model_text, r"alpha·sol-b\s+3\s")
+                    model_prefix = "…pha" if width == 46 else "alpha"
+                    self.assertRegex(model_text, model_prefix + r"·sol-a\s+3\s")
+                    self.assertRegex(model_text, model_prefix + r"·sol-b\s+3\s")
                     self.assertRegex(model_text, r"beta\s+2\s")
                     for text in (source_text, model_text):
                         self.assertEqual(text.count("MAX RPM: "), 1)
@@ -848,7 +850,7 @@ class PinnedCardTests(unittest.TestCase):
                         self.assertNotIn("pinned", text.splitlines()[0])
                         self.assertNotIn("pinned", "\n".join(text.splitlines()[2:]))
                         self.assertNotIn("/3", text)
-                        for hidden in ("deployments", "个源", "在用", "chat", "responses", "2026-07-09"):
+                        for hidden in ("deployments", "个源", "在用", "responses", "2026-07-09"):
                             self.assertNotIn(hidden, text)
 
     def test_missing_breakdown_is_unknown_and_complete_zero_is_zero(self):
@@ -890,7 +892,8 @@ class PinnedCardTests(unittest.TestCase):
                 text = render(card, width)
                 self.assertNotIn("降权", text)
                 self.assertNotIn("demoted", text)
-                self.assertIn("pinned", text.splitlines()[1])
+                self.assertTrue("pinned" in text.splitlines()[1]
+                                or "chat/resp route prob(%)" in text.splitlines()[1])
                 self.assertTrue(all(cell_len(line) == width for line in text.splitlines()))
 
     def test_zero_and_missing_pins_use_dots_in_every_row_and_summary(self):
@@ -1061,43 +1064,53 @@ class AvailableRpmTests(unittest.TestCase):
 
 class RouteProbabilityTests(unittest.TestCase):
     def test_probability_colour_is_independent_of_demotion(self):
-        route = RouteView("source/deploy", "model", .46, {})
+        route = RouteView("source/deploy", "model", .46, {}, {"chat": .12, "responses": .35})
         console = Console(file=io.StringIO(), width=64)
         for state in ({}, dict(penalty=.25), dict(parked_for_seconds=30)):
             route.data = state
             table = _route_rows([route], 64, {route.key: "deploy"}, {}, False, show_share=True)
             segments = console.render_lines(table, console.options.update(height=None))[0]
-            probability = next(segment for segment in segments if segment.text == ".46")
+            probability = next(segment for segment in segments if segment.text == "12/35")
             self.assertEqual(probability.style.color, console.get_style(theme.ACCENT).color)
 
     def test_compact_probability_format(self):
-        for value, expected in ((None, "·"), (0, "0"), (1, "1"), (.5, ".5"),
-                                (.25, ".25"), (.46, ".46"), (1 / 3, ".33"),
-                                (2 / 3, ".67"), (.4567, ".46"), (.004, "0")):
+        for value, expected in ((None, "--"), (0, " 0"), (1, "1ꝏ"), (.5, "50"),
+                                (.25, "25"), (.46, "46"), (1 / 3, "33"),
+                                (2 / 3, "67"), (.4567, "46"), (.004, " 0"),
+                                (.09, " 9"), (.994, "99"), (.999, "1ꝏ")):
             with self.subTest(value=value):
                 self.assertEqual(_share_number(value), expected)
+                self.assertEqual(cell_len(_share_number(value)), 2)
+
+    def test_legacy_report_does_not_reuse_merged_probability(self):
+        snapshot = Snapshot({"routes": {
+            "routes": {"alpha/model": {}},
+            "models": {"model": [dict(route="alpha/model", share=1)]}}})
+        text = render(_model_card(snapshot.models[0], 64, False, snapshot), 64)
+        self.assertIn("--/--", text)
+        self.assertNotIn("1ꝏ", text)
 
     def test_model_card_uses_reported_probability_as_first_column(self):
         keys = ("alpha/deploy-a", "beta/deploy-b", "gamma/deploy-c")
         snapshot = Snapshot({"routes": {
             "routes": {key: dict(capacity_rpm=100, current_rpm=rpm)
                        for key, rpm in zip(keys, (7, 23, 1))},
-            "models": {"model": [dict(route=key, share=share)
-                                  for key, share in zip(keys, (.4567, .5433, 0))]}}})
+            "models": {"model": [dict(route=key, share=0, share_by_face=shares)
+                                  for key, shares in zip(keys, (
+                                      dict(chat=.4567, responses=0),
+                                      dict(chat=.5433, responses=0),
+                                      dict(responses=1)))]}}})
         for width in (40, 46, 64, 93):
             for detail in (False, True):
                 with self.subTest(width=width, detail=detail):
                     text = render(_model_card(snapshot.models[0], width, detail, snapshot), width)
-                    if width >= 64:
-                        self.assertTrue(text.splitlines()[1].startswith("│  route prob.  "))
-                        self.assertEqual(text.count("route prob."), 1)
-                    else:
-                        self.assertNotIn("route prob.", text)
-                    if width >= 46:
+                    self.assertTrue(text.splitlines()[1].startswith("│  chat/resp route prob(%)"))
+                    self.assertEqual(text.count("route prob(%)"), 1)
+                    if width >= 93:
                         self.assertIn("· pinned  RPM:cur/avail", text.splitlines()[1])
-                    for probability, endpoint in ((".46", "alpha"), (".54", "beta"), ("0", "gamma")):
+                    for probability, endpoint in (("46/ 0", "alpha"), ("54/ 0", "beta"), ("--/1ꝏ", "gamma")):
                         if width == 40:
-                            endpoint = truncate(endpoint, 4, prefix=True)
+                            endpoint = r"\S+"
                         self.assertRegex(text, r"(?m)^│\s+{}\s+{}\s".format(
                             re.escape(probability), endpoint))
                     self.assertNotIn("0.46", text)
@@ -1105,11 +1118,11 @@ class RouteProbabilityTests(unittest.TestCase):
         source = render(_source_card(snapshot.sources[0], 64, False, None, snapshot, True), 64)
         self.assertRegex(source, r"(?m)^│\s+model\s")
         self.assertNotIn(".46", source)
-        self.assertNotIn("route prob.", source)
+        self.assertNotIn("route prob(%)", source)
 
     def test_probability_column_preserves_row_spacing_and_alignment(self):
         routes = [RouteView(key, "model", share, dict(capacity_rpm=100, current_rpm=23,
-                           other_rpm=47, rpm_by_face=dict(chat=23)))
+                           other_rpm=47, rpm_by_face=dict(chat=23)), {"chat": share, "responses": 1})
                   for key, share in (("a/deploy", .46), ("long-name/deploy", 1), ("模型/deploy", None))]
         for width in (34, 42, 64, 96):
             table = _route_rows(routes, width, {r.key: r.endpoint for r in routes},
@@ -1120,7 +1133,7 @@ class RouteProbabilityTests(unittest.TestCase):
             self.assertTrue(all(not line.strip() for line in lines[1::2]))
             edges = []
             for line, route in zip(lines[::2], Snapshot.sorted_routes(routes)):
-                self.assertTrue(line.lstrip().startswith(_share_number(route.share) + " "))
+                self.assertTrue(line.lstrip().startswith(_share_number(route.share).lstrip() + "/1ꝏ "))
                 pin = re.search(r"\b7\b", line)
                 edges.append(cell_len(line[:pin.end()]))
                 self.assertIn("23/30", line)
@@ -1146,11 +1159,12 @@ class RouteProbabilityTests(unittest.TestCase):
         keys = [endpoint + "/gpt-5.6-sol-deploy-" + suffix for suffix in ("east", "west")]
         snapshot = Snapshot({"routes": {
             "routes": {key: dict(capacity_rpm=100) for key in keys},
-            "models": {"model": [dict(route=key, share=.5) for key in keys]}}})
+            "models": {"model": [dict(route=key, share=.5, share_by_face=dict(chat=.5, responses=.5))
+                                  for key in keys]}}})
         for width in (46, 64, 93):
             text = render(_model_card(snapshot.models[0], width, False, snapshot), width)
             for suffix in ("east", "west"):
-                self.assertRegex(text, r"\.5\s+…\S*{}\s".format(suffix))
+                self.assertRegex(text, r"50/50\s+…\S*{}\s".format(suffix))
             self.assertTrue(all(cell_len(line) == width for line in text.splitlines()))
 
     def test_prefix_ellipsis_preserves_suffix_and_terminal_width(self):

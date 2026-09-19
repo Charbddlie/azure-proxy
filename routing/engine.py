@@ -274,6 +274,22 @@ class Engine:
             if model and str(route) not in self.retired_routes and str(route) not in {str(r) for r in merged.get(model, [])}:
                 merged.setdefault(model, []).append(route)
         report = self.quota.report(merged)
+        # Compute each probability over the candidates for that API only.
+        # Use the published parameters so the report matches serving's inputs.
+        for model, entries in report["models"].items():
+            for entry in entries:
+                entry["share_by_face"] = {}
+            by_route = {entry["route"]: entry for entry in entries}
+            for face, name in (("chat", "routes"), ("responses", "responses_routes")):
+                candidates = tables[name].get(model, [])
+                priority = min((r["selection_priority"] for r in candidates), default=0)
+                total = sum(r["selection_weight"] for r in candidates
+                            if r["selection_priority"] == priority) or 1.0
+                for route in candidates:
+                    key = "{}/{}".format(route["endpoint"], route["deployment"])
+                    by_route[key]["share_by_face"][face] = (
+                        route["selection_weight"] / total
+                        if route["selection_priority"] == priority else 0.0)
         report.update(session_affinity=self.sessions,
                       route_refresh=self.route_refresh,
                       spill_threshold=cfg.spill_threshold, probed_at=cfg.generated_at,

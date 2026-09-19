@@ -96,7 +96,9 @@ def _route_rows(routes: List[RouteView], width: int, labels: dict,
     pin_width = max([2] + [text.cell_len for text in pin_cells.values()])
     ours_width = max([1] + [text.cell_len for text in ours.values()])
     others_width = max([1] + [text.cell_len for text in others.values()])
-    shares = {route.key: Text(_share_number(route.share), style=theme.ACCENT)
+    shares = {route.key: Text("{}/{}".format(
+                  _share_number(route.share_by_face.get("chat")),
+                  _share_number(route.share_by_face.get("responses"))), style=theme.ACCENT)
               for route in routes} if show_share else {}
     share_width = max([1] + [text.cell_len for text in shares.values()]) if show_share else 0
     share_space = share_width + 1 if show_share else 0
@@ -150,10 +152,14 @@ def _card_summary(group, details, pinned, width):
     summary = Text(no_wrap=True, overflow="ellipsis")
     summary.append("{} pinned".format(pinned if pinned else "·"), style=theme.PINNED)
     summary.append("  RPM:cur/avail", style=theme.DIM)
-    probability = Text("route prob.  ", style=theme.ACCENT)
-    if (group.kind == "model" and
-            probability.cell_len + summary.cell_len + 1 + maximum.cell_len <= width):
-        summary = probability + summary
+    probability = Text("chat/resp route prob(%)", style=theme.ACCENT)
+    if group.kind == "model":
+        if probability.cell_len + 1 + maximum.cell_len > width:
+            maximum = maximum[4:]  # Compact "MAX RPM: n" to "RPM: n".
+        if probability.cell_len + summary.cell_len + 3 + maximum.cell_len <= width:
+            summary = probability + Text("  ") + summary
+        else:
+            summary = probability
     if details.plain:
         if summary.plain:
             summary.append(" · ", style=theme.DIM)
@@ -179,9 +185,9 @@ def _usage_number(value):
 
 def _share_number(value):
     if value is None:
-        return "·"
-    number = "{:.2f}".format(value).rstrip("0").rstrip(".")
-    return number[1:] if number.startswith("0.") else number
+        return "--"
+    percent = max(0, min(100, round(value * 100)))
+    return "1ꝏ" if percent == 100 else "{:2d}".format(percent)
 
 
 def _source_card(group: Group, width: int, detail: bool, pinned: Optional[int],
