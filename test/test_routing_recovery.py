@@ -61,7 +61,7 @@ class RetryLoopTests(unittest.TestCase):
         self.assertTrue(is_busy(error))
 
     def test_busy_publications_retry_same_engine_and_log_recovery(self):
-        engine = Mock()
+        engine = Mock(config=SimpleNamespace(route_refresh_enabled=False))
         engine.step.side_effect = [sqlite3.OperationalError("database is locked"),
                                    sqlite3.OperationalError("database is locked"), {}, {}]
         stop = Mock()
@@ -77,7 +77,7 @@ class RetryLoopTests(unittest.TestCase):
         self.assertIn("recovered", logs.output[-1])
 
     def test_busy_startup_retries_and_non_lock_errors_propagate(self):
-        engine = Mock()
+        engine = Mock(config=SimpleNamespace(route_refresh_enabled=False))
         stop = Mock()
         stop.is_set.side_effect = [False, False, True]
         with patch("routing.__main__.Engine", side_effect=[
@@ -87,7 +87,7 @@ class RetryLoopTests(unittest.TestCase):
         self.assertEqual(factory.call_count, 2)
         engine.close.assert_called_once()
 
-        engine = Mock()
+        engine = Mock(config=SimpleNamespace(route_refresh_enabled=False))
         engine.step.side_effect = sqlite3.OperationalError("disk I/O error")
         stop = Mock()
         stop.is_set.return_value = False
@@ -98,7 +98,7 @@ class RetryLoopTests(unittest.TestCase):
         stop.wait.assert_not_called()
 
     def test_shutdown_under_lock_releases_engine(self):
-        engine = Mock()
+        engine = Mock(config=SimpleNamespace(route_refresh_enabled=False))
         engine.step.side_effect = [{}, sqlite3.OperationalError("database is locked")]
         stop = Mock()
         stop.is_set.side_effect = [False, True]

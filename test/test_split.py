@@ -246,11 +246,19 @@ class ProtocolTests(unittest.TestCase):
                 policy["routing"]["balancing"] = {name: value}
                 with patch("builtins.open", mock_open(read_data=json.dumps(policy))):
                     self.assertEqual(Config(load_routes=False).timeout, 30)
-                files = [io.StringIO(json.dumps(doc)) for doc in
-                         (policy, {"endpoints": []}, {"models": {}})]
-                with patch("builtins.open", side_effect=files):
-                    with self.assertRaisesRegex(ValueError, "invalid routing window/threshold"):
-                        Config()
+                sources, models = {"endpoints": []}, {"models": {}}
+                for layout in ("bundle", "legacy"):
+                    with self.subTest(layout=layout):
+                        files = [io.StringIO(json.dumps(policy))]
+                        if layout == "bundle":
+                            files.append(io.StringIO(json.dumps(dict(sources=sources, models=models))))
+                        else:
+                            files.extend([FileNotFoundError("discovery.json"),
+                                          io.StringIO(json.dumps(sources)),
+                                          io.StringIO(json.dumps(models))])
+                        with patch("builtins.open", side_effect=files):
+                            with self.assertRaisesRegex(ValueError, "invalid routing window/threshold"):
+                                Config()
 
 
 class SplitTests(unittest.TestCase):
@@ -515,7 +523,15 @@ class SplitTests(unittest.TestCase):
             for session in ("existing", "offline-new"):
                 self.assertEqual(turn(p, session)[2]["x-azure-proxy-route"], "alpha/" + DEPLOYMENT)
             report = p.get("/routes")[1]
-            self.assertEqual(report["routes"]["alpha/" + DEPLOYMENT]["attempts"], 5)
+            retired = "alpha/" + DEPLOYMENT
+            self.assertNotIn(retired, report["routes"])
+            self.assertEqual([entry["route"] for entry in report["models"][MODEL]],
+                             ["beta/" + DEPLOYMENT])
+            self.assertEqual((a.hits, b.hits), (5, 1))
+            with contextlib.closing(Store(p.home)) as store:
+                checkpoint = store.get("checkpoint")
+            self.assertIn(retired, checkpoint["retired_routes"])
+            self.assertEqual(checkpoint["states"][retired]["attempts"], 5)
             self.assertFalse(report["stats_stale"])
 
     def test_routing_stays_off_the_request_path_when_database_is_locked(self):

@@ -3520,8 +3520,7 @@ def test_expired_token_is_not_served():
 # makes these tests worth having: the mapping being asserted is not a made-up
 # edge case, it is the one endpoint-b actually presents.
 
-sys.path.insert(0, os.path.join(ROOT, "probe"))
-import probe as probe_module  # noqa: E402
+from probe import probe as probe_module  # noqa: E402
 
 
 def arm(name, model, sku="GlobalStandard", capacity=1000, limits=None,

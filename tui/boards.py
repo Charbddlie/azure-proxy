@@ -151,7 +151,7 @@ def _card_summary(group, details, pinned, width):
         r.capacity_rpm is not None for r in group.routes) else None)
     summary = Text(no_wrap=True, overflow="ellipsis")
     summary.append("{} pinned".format(pinned if pinned else "·"), style=theme.PINNED)
-    summary.append("  RPM:cur/avail", style=theme.DIM)
+    summary.append("  RPM:cur/avail", style=theme.OURS)
     probability = Text("chat/resp route prob(%)", style=theme.ACCENT)
     if group.kind == "model":
         if probability.cell_len + 1 + maximum.cell_len > width:

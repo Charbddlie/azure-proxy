@@ -955,6 +955,18 @@ class PinnedCardTests(unittest.TestCase):
                     self.assertTrue(line.endswith("  │"), line)
                     self.assertEqual(cell_len(line), width)
 
+    def test_rpm_legend_matches_usage_number_colour_on_both_boards(self):
+        snapshot = self.snapshot()
+        for width in (80, 93):
+            console = Console(file=io.StringIO(), width=width)
+            for card in (_source_card(snapshot.sources[0], width, False, 7, snapshot, True),
+                         _model_card(snapshot.models[0], width, False, snapshot)):
+                lines = console.render_lines(card, console.options.update(height=None))
+                legend = next(segment for segment in lines[1] if "RPM:cur/avail" in segment.text)
+                usage = next(segment for line in lines[2:] for segment in line if "0/10" in segment.text)
+                self.assertEqual(legend.style.color, usage.style.color)
+                self.assertEqual(legend.style.color, console.get_style(theme.OURS).color)
+
     def test_pinned_rpm_legend_hidden_and_maximum_share_the_row_below_title(self):
         snapshot = self.snapshot()
         source = snapshot.sources[0]
