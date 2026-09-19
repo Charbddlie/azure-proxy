@@ -833,6 +833,8 @@ class PinnedCardTests(unittest.TestCase):
                     model_text = render(_model_card(model, width, detail, snapshot), width)
                     self.assertIn("7 pinned", source_text.splitlines()[1])
                     self.assertIn("5 pinned", model_text.splitlines()[1])
+                    self.assertIn("7 pinned  RPM:cur/avail", source_text.splitlines()[1])
+                    self.assertIn("5 pinned  RPM:cur/avail", model_text.splitlines()[1])
                     self.assertRegex(source_text, r"sol-a\s+3\s")
                     self.assertRegex(source_text, r"sol-b\s+3\s")
                     self.assertRegex(source_text, r"gpt-5.6-terra\s+4\s")
@@ -950,18 +952,20 @@ class PinnedCardTests(unittest.TestCase):
                     self.assertTrue(line.endswith("  │"), line)
                     self.assertEqual(cell_len(line), width)
 
-    def test_pinned_hidden_and_maximum_share_the_row_below_title(self):
+    def test_pinned_rpm_legend_hidden_and_maximum_share_the_row_below_title(self):
         snapshot = self.snapshot()
         source = snapshot.sources[0]
         old = copy.deepcopy(source.routes[0])
         old.model, old.key = "gpt-4", "alpha/old"
         source.routes.append(old)
-        for width in (46, 80, 120):
+        for width in (46, 64, 80, 120):
             card = _source_card(source, width, False, 7, snapshot, False)
             lines = render(card, width).splitlines()
-            for value in ("7 pinned", "隐藏 1 旧", "MAX RPM: 40.0"):
+            for value in ("7 pinned", "RPM:cur/avail", "MAX RPM: 40.0"):
                 self.assertIn(value, lines[1])
                 self.assertNotIn(value, lines[0])
+            if width >= 64:
+                self.assertIn("隐藏 1 旧", lines[1])
             self.assertEqual(card.title_align, "center")
 
     def test_pinned_and_usage_columns_align_in_a_single_row(self):
@@ -984,7 +988,7 @@ class PinnedCardTests(unittest.TestCase):
                 bar = re.search(r"[█▓▒▚▞░·]+", main)
                 self.assertIsNotNone(bar)
                 bar_edges.append((cell_len(main[:bar.start()]), cell_len(main[:bar.end()])))
-                self.assertTrue(main[:bar.start()].endswith("23 "))
+                self.assertTrue(main[:bar.start()].endswith("23/30 "))
                 self.assertTrue(main[bar.end():].startswith(" 47"))
                 self.assertNotIn("ours", main)
                 self.assertNotIn("others", main)
@@ -1006,8 +1010,53 @@ class PinnedCardTests(unittest.TestCase):
                         self.assertNotIn("尚无完成样本", lines[0])
                         self.assertNotIn("ours", lines[0])
                         self.assertNotIn("others", lines[0])
-                        self.assertIn(_usage_number(ours), lines[0])
+                        self.assertIn("{}/{}".format(_usage_number(ours),
+                                                    _usage_number(route.available_rpm)), lines[0])
                         self.assertIn(_usage_number(others), lines[0])
+
+
+class AvailableRpmTests(unittest.TestCase):
+    def test_reported_available_rpm_takes_precedence_including_zero(self):
+        for available in (0, 12.5, 10000):
+            route = RouteView("source/model", "model", None,
+                              dict(current_rpm=23, other_rpm=47, capacity_rpm=100,
+                                   available_rpm=available))
+            self.assertEqual(route.available_rpm, available)
+            table = _route_rows([route], 64, {route.key: "model"}, {}, False)
+            expected = "23/" + _usage_number(available)
+            self.assertIn(expected, render(table, 64))
+            console = Console(file=io.StringIO(), width=64)
+            segments = console.render_lines(table, console.options.update(height=None))[0]
+            usage = next(segment for segment in segments if segment.text.strip() == expected)
+            self.assertEqual(usage.style.color, console.get_style(theme.OURS).color)
+
+    def test_older_snapshots_derive_nonnegative_available_rpm(self):
+        for capacity, current, others, expected in ((100, 23, 47, 30),
+                                                   (100, 100, 0, 0),
+                                                   (100, 120, 7, 0),
+                                                   (100, 12.5, 7.5, 80),
+                                                   (0, 0, 0, 0)):
+            with self.subTest(capacity=capacity, current=current, others=others):
+                route = RouteView("source/model", "model", None,
+                                  dict(capacity_rpm=capacity, current_rpm=current, other_rpm=others))
+                self.assertEqual(route.available_rpm, expected)
+
+    def test_unknown_capacity_and_cold_start_estimates(self):
+        for data, expected, pair in (({}, None, "0/—"),
+                                    (dict(current_rpm=2), None, "2/—"),
+                                    (dict(available_rpm=1), 1, "0/1"),
+                                    (dict(estimated_capacity_rpm=1), 1, "0/1")):
+            with self.subTest(data=data):
+                route = RouteView("source/model", "model", None, data)
+                self.assertEqual(route.available_rpm, expected)
+                table = _route_rows([route], 42, {route.key: "model"}, {}, False)
+                self.assertIn(pair, render(table, 42))
+
+    def test_legacy_qpm_fields_support_available_rpm(self):
+        data = dict(capacity_qpm=100, current_qpm=23, other_qpm=47)
+        self.assertEqual(RouteView("source/model", "model", None, data).available_rpm, 30)
+        data["available_qpm"] = 0
+        self.assertEqual(RouteView("source/model", "model", None, data).available_rpm, 0)
 
 
 class RouteProbabilityTests(unittest.TestCase):
@@ -1039,9 +1088,16 @@ class RouteProbabilityTests(unittest.TestCase):
             for detail in (False, True):
                 with self.subTest(width=width, detail=detail):
                     text = render(_model_card(snapshot.models[0], width, detail, snapshot), width)
-                    self.assertTrue(text.splitlines()[1].startswith("│  route prob.  "))
-                    self.assertEqual(text.count("route prob."), 1)
+                    if width >= 64:
+                        self.assertTrue(text.splitlines()[1].startswith("│  route prob.  "))
+                        self.assertEqual(text.count("route prob."), 1)
+                    else:
+                        self.assertNotIn("route prob.", text)
+                    if width >= 46:
+                        self.assertIn("· pinned  RPM:cur/avail", text.splitlines()[1])
                     for probability, endpoint in ((".46", "alpha"), (".54", "beta"), ("0", "gamma")):
+                        if width == 40:
+                            endpoint = truncate(endpoint, 4, prefix=True)
                         self.assertRegex(text, r"(?m)^│\s+{}\s+{}\s".format(
                             re.escape(probability), endpoint))
                     self.assertNotIn("0.46", text)
@@ -1067,7 +1123,7 @@ class RouteProbabilityTests(unittest.TestCase):
                 self.assertTrue(line.lstrip().startswith(_share_number(route.share) + " "))
                 pin = re.search(r"\b7\b", line)
                 edges.append(cell_len(line[:pin.end()]))
-                self.assertIn("23", line)
+                self.assertIn("23/30", line)
                 self.assertIn("47", line)
                 self.assertLessEqual(cell_len(line), width)
             self.assertEqual(len(set(edges)), 1)

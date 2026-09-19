@@ -93,6 +93,17 @@ class RouteView:
         return self.data.get("other_rpm") or 0.0
 
     @property
+    def available_rpm(self) -> Optional[float]:
+        """Reported headroom, derived from capacity for older snapshots."""
+        value = self.data.get("available_rpm")
+        if value is not None:
+            return value
+        capacity = self.data.get("estimated_capacity_rpm", self.capacity_rpm)
+        if capacity is None:
+            return None
+        return max(0.0, capacity - self.other_rpm - self.current_rpm)
+
+    @property
     def rpm_load(self) -> Optional[float]:
         if not self.capacity_rpm:
             return None

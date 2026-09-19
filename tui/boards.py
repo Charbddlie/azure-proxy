@@ -85,10 +85,12 @@ def _labels(routes: List[RouteView], kind: str) -> dict:
 
 def _route_rows(routes: List[RouteView], width: int, labels: dict,
                 pins: dict, detail: bool, show_share: bool = False):
-    """Names, pins, our usage, bars, outside usage and ceilings share one row."""
+    """Names, pins, current/available RPM, bars, outside usage and ceilings."""
     capacities = {route.key: rpm_capacity(route.capacity_rpm, label=False) for route in routes}
     pin_cells = {key: _pinned_value(value) for key, value in pins.items()}
-    ours = {route.key: Text(_usage_number(route.current_rpm), style=theme.OURS) for route in routes}
+    ours = {route.key: Text("{}/{}".format(_usage_number(route.current_rpm),
+                                         _usage_number(route.available_rpm)),
+                            style=theme.OURS, no_wrap=True) for route in routes}
     others = {route.key: Text(_usage_number(route.other_rpm), style=theme.FOREIGN) for route in routes}
     capacity_width = max([4] + [text.cell_len for text in capacities.values()])
     pin_width = max([2] + [text.cell_len for text in pin_cells.values()])
@@ -142,13 +144,16 @@ def _card_title(group):
     return title
 
 
-def _card_summary(group, details, pinned):
+def _card_summary(group, details, pinned, width):
     maximum = rpm_capacity(group.capacity_rpm if any(
         r.capacity_rpm is not None for r in group.routes) else None)
     summary = Text(no_wrap=True, overflow="ellipsis")
-    if group.kind == "model":
-        summary.append("route prob.  ", style=theme.ACCENT)
     summary.append("{} pinned".format(pinned if pinned else "·"), style=theme.PINNED)
+    summary.append("  RPM:cur/avail", style=theme.DIM)
+    probability = Text("route prob.  ", style=theme.ACCENT)
+    if (group.kind == "model" and
+            probability.cell_len + summary.cell_len + 1 + maximum.cell_len <= width):
+        summary = probability + summary
     if details.plain:
         if summary.plain:
             summary.append(" · ", style=theme.DIM)
@@ -167,6 +172,8 @@ def _row_pins(routes, snapshot, model=None):
 
 
 def _usage_number(value):
+    if value is None:
+        return "—"
     return (si(value) if abs(value) >= 1000 else "{:.1f}".format(value)).replace(".0", "")
 
 
@@ -188,9 +195,10 @@ def _source_card(group: Group, width: int, detail: bool, pinned: Optional[int],
     if hidden:
         subtitle.append("隐藏 {} 旧".format(hidden), style=theme.DIM)
 
-    body = _route_rows(rows_shown, width - 2 - 2 * CARD_SIDE_PADDING, _labels(rows_shown, "source"),
+    content_width = width - 2 - 2 * CARD_SIDE_PADDING
+    body = _route_rows(rows_shown, content_width, _labels(rows_shown, "source"),
                        _row_pins(rows_shown, snapshot), detail)
-    return Panel(RichGroup(_card_summary(group, subtitle, pinned),
+    return Panel(RichGroup(_card_summary(group, subtitle, pinned, content_width),
                            *([Text("")] if rows_shown else []), body),
                  title=title, width=width,
                  border_style=theme.severity(
@@ -202,9 +210,10 @@ def _model_card(group: Group, width: int, detail: bool,
                 snapshot: Snapshot) -> Panel:
     title = _card_title(group)
 
-    body = _route_rows(group.routes, width - 2 - 2 * CARD_SIDE_PADDING, _labels(group.routes, "model"),
+    content_width = width - 2 - 2 * CARD_SIDE_PADDING
+    body = _route_rows(group.routes, content_width, _labels(group.routes, "model"),
                        _row_pins(group.routes, snapshot, group.name), detail, show_share=True)
-    return Panel(RichGroup(_card_summary(group, Text(), snapshot.pinned(group.name)),
+    return Panel(RichGroup(_card_summary(group, Text(), snapshot.pinned(group.name), content_width),
                            *([Text("")] if group.routes else []), body),
                  title=title, width=width,
                  border_style=theme.severity(
