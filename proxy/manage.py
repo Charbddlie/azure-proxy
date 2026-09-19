@@ -12,6 +12,7 @@ import time
 import urllib.request
 
 from .config import Config, ROOT
+from .logfiles import log_path
 
 
 def pidfile(role):
@@ -80,8 +81,8 @@ def refuse_online(role):
 def start(role, timeout):
     refuse_online(role)
     module = "proxy" if role == "serving" else "routing"
-    log_path = os.path.join(ROOT, "proxy.log" if role == "serving" else "routing.log")
-    with open(log_path, "ab", buffering=0) as log:
+    path = log_path(ROOT, role)
+    with open(path, "ab", buffering=0) as log:
         process = subprocess.Popen([sys.executable, "-m", module], stdin=subprocess.DEVNULL,
                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                                    env=dict(os.environ, AZURE_PROXY_MANAGED_LOG="1"),
@@ -90,7 +91,7 @@ def start(role, timeout):
     accepted_revision = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("{} failed to start; see {}".format(role, log_path))
+            raise RuntimeError("{} failed to start; see {}".format(role, path))
         if role == "serving":
             reply = health()
             ready = reply and reply.get("supervisor", {}).get("pid", reply.get("pid")) == process.pid
@@ -111,7 +112,7 @@ def start(role, timeout):
             return
         time.sleep(0.1)
     raise RuntimeError("{} started but readiness/serving acknowledgement timed out; see {}".format(
-        role, log_path))
+        role, path))
 
 
 def stop(role, timeout, force=False):

@@ -15,10 +15,11 @@ import tempfile
 import termios
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from rich.cells import cell_len
 
 from proxy.logfiles import handler, prune_logs
+from proxy import manage
 from tools.scheduled_restart import next_run, restart
 from test_split import fixture
 from run_tests import PYTHON, ROOT, sticky_ask
@@ -102,19 +103,70 @@ class OperationsTests(unittest.TestCase):
 
     def test_log_retention_is_limited_to_rotated_diagnostics(self):
         with tempfile.TemporaryDirectory() as root:
+            directory = os.path.join(root, "runtime", "logs")
+            os.makedirs(os.path.join(directory, "archive"))
             names = ("proxy.log.2026-09-01_01", "routing.log.2026-09-01_01",
                      "affinity.sqlite3", "proxy.log", "other.backup")
             for name in names:
-                with open(os.path.join(root, name), "w") as file:
+                with open(os.path.join(directory, name), "w") as file:
                     file.write("keep or expire")
-                os.utime(os.path.join(root, name), (1000, 1000))
+                os.utime(os.path.join(directory, name), (1000, 1000))
+            archived = os.path.join(directory, "archive", names[0])
+            legacy = os.path.join(root, names[0])
+            for path in (archived, legacy):
+                with open(path, "w") as file:
+                    file.write("keep")
+                os.utime(path, (1000, 1000))
             prune_logs(root, now=100000)
-            self.assertEqual(set(os.listdir(root)), set(names[2:]))
-            output = handler(root, "serving")
-            output.emit(logging.LogRecord("test", logging.INFO, "", 0, "new line", (), None))
-            output.close()
-            with open(os.path.join(root, "proxy.log")) as file:
-                self.assertIn("new line", file.read())
+            self.assertEqual(set(os.listdir(directory)), set(names[2:]) | {"archive"})
+            self.assertTrue(os.path.isfile(archived))
+            self.assertTrue(os.path.isfile(legacy))
+
+    def test_log_retention_before_first_managed_start(self):
+        with tempfile.TemporaryDirectory() as root:
+            prune_logs(root)
+            self.assertEqual(os.listdir(root), [])
+
+    def test_managed_logs_and_rollover_stay_in_runtime(self):
+        for role, name in (("serving", "proxy.log"), ("routing", "routing.log")):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as root:
+                output = handler(root, role)
+                directory = os.path.join(root, "runtime", "logs")
+                path = os.path.join(directory, name)
+                record = logging.LogRecord("test", logging.INFO, "", 0, "new line", (), None)
+                try:
+                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+                    self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
+                    output.emit(record)
+                    output.doRollover()
+                    output.emit(record)
+                finally:
+                    output.close()
+                self.assertEqual(os.listdir(root), ["runtime"])
+                self.assertEqual(len(os.listdir(directory)), 2)
+                for filename in os.listdir(directory):
+                    self.assertTrue(filename.startswith(name))
+                    with open(os.path.join(directory, filename)) as file:
+                        self.assertIn("new line", file.read())
+
+    def test_bootstrap_errors_use_managed_log_directory(self):
+        for role, name in (("serving", "proxy.log"), ("routing", "routing.log")):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as root:
+                with patch.object(manage, "ROOT", root), \
+                        patch.object(manage, "refuse_online"), \
+                        patch.object(manage.subprocess, "Popen") as popen:
+                    # Write before returning an exited process, as an early import error would.
+                    def launch(*args, **kwargs):
+                        kwargs["stdout"].write(b"bootstrap failed\n")
+                        return Mock(poll=lambda: 1)
+                    popen.side_effect = launch
+                    path = os.path.join(root, "runtime", "logs", name)
+                    with self.assertRaisesRegex(RuntimeError, re.escape(path)):
+                        manage.start(role, 1)
+                self.assertEqual(os.listdir(root), ["runtime"])
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+                with open(path) as file:
+                    self.assertEqual(file.read(), "bootstrap failed\n")
 
     def test_real_terminal_repaints_without_input_at_all_widths(self):
         with fixture() as (p, a, b):

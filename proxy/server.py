@@ -250,7 +250,7 @@ class TokenCache:
 
 
 def _setup_logging(level: str):
-    """One logger, on stdout, which start.sh appends to proxy.log.
+    """Worker stdout is collected by the supervisor in runtime/logs/proxy.log.
 
     Bodies are never logged at any level: prompts are user data, and a proxy
     that quietly archives them would be a worse problem than anything it helps

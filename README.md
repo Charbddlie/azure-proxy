@@ -175,8 +175,11 @@ serving 由持有监听 socket 的 supervisor 和 worker 组成；routing 独立
 | `./stop.sh` | 先排空并停止 serving，再停止 routing |
 | `./tui.sh` | 打开看板 |
 
-serving supervisor 使用 `.proxy.pid`，所有 worker 日志汇入 `proxy.log`；routing 使用 `.routing.pid` 和
-`routing.log`。每个角色有独立的单实例锁。重复启动返回错误。
+serving supervisor 使用 `.proxy.pid`，所有 worker 日志汇入 `runtime/logs/proxy.log`；routing 使用 `.routing.pid` 和
+`runtime/logs/routing.log`。启动错误也写入对应日志。日志目录自动创建，每小时轮转，轮转日志保留 24 小时。
+手动归档放在 `runtime/logs/archive/`，由人工管理保留期限；整个 `runtime/` 已被 Git 忽略。
+升级旧日志路径时，需要停止并重新启动 serving supervisor 和 routing；serving 的滚动重启只更新 worker。
+每个角色有独立的单实例锁。重复启动返回错误。
 停止默认等待 30 秒；当请求仍在排空时，命令返回错误并保留进程。
 可以通过 `--timeout 120` 延长等待；`--force` 明确允许超时后强制结束。
 
@@ -297,7 +300,7 @@ serving 保持旧映射并显示告警。内存观测队列上限为 100,000 条
 响应头带 `x-azure-proxy-route`，写明这次实际走的是哪个 endpoint 的哪个部署。
 排查时先看它。
 
-日志在 `proxy.log`：启动摘要（当前 az 账号、token 寿命、每个 endpoint 各个面的状态、
+日志在 `runtime/logs/proxy.log`：启动摘要（当前 az 账号、token 寿命、每个 endpoint 各个面的状态、
 每个面各有几个模型）、请求完成记录（模型、是否流式、走的哪条路由、耗时）、
 每次故障切换、每次 token 刷新。**请求体和响应体在任何级别都不记**——prompt 是用户
 数据，`/events` 守同一条规矩。`settings/policy.yaml` 的 `server.log_level` 调级别，
@@ -787,7 +790,7 @@ endpoint 最先被尝试。探测把这个顺序固化成每条路由的 `priori
 - **超时不触发切换**。推理模型的慢请求和挂死在客户端看起来一样，超时重试会为同一个
   prompt 付两次钱，而且第一个请求可能还在跑。超时返回 504，由调用端决定
 - **4xx 直接透传**。参数原样转发，所以一个关于不支持参数的 400 就是真实且有用的结果
-- **流式请求一旦给调用方发出过字节就不再切换**。中途断流只能让它断，`proxy.log` 里记
+- **流式请求一旦给调用方发出过字节就不再切换**。中途断流只能让它断，`runtime/logs/proxy.log` 里记
   一行说明为什么没重试
 
 ### 200 里面藏着的 429
@@ -1243,7 +1246,7 @@ refresh token 要等一小时后才暴露。
 两个进程各拿一份去刷，早晚互相把对方作废。所以拷完就该把原来那份停掉。
 
 serving 启动时会比较当前账号和 `policy.yaml` 的 `expected_account`。当两者不一致时，
-`proxy.log` 会记录警告和修复提示。routing 的启动和重启使用本地部署信息。
+`runtime/logs/proxy.log` 会记录警告和修复提示。routing 的启动和重启使用本地部署信息。
 
 **关键事实二：`az account get-access-token` 给的是 `az` 自己缓存里的 token，剩余寿命
 不可预测。** 实测拿到过 6 分钟和 9.7 分钟的，也可能拿到接近一小时的——取决于你取的
@@ -1260,7 +1263,7 @@ serving 启动时会比较当前账号和 `policy.yaml` 的 `expected_account`�
 后台有个刷新协程，所以正常情况下**没有请求需要为取 token 付时间**。
 
 刷新失败但手上的 token 还能用时，**继续用**，错误记在 `/healthz` 的 `token.last_error`
-里，`proxy.log` 里记一行（只在状态变化时记，不会每 30 秒刷屏）；只有真的没有可用
+里，`runtime/logs/proxy.log` 里记一行（只在状态变化时记，不会每 30 秒刷屏）；只有真的没有可用
 token 时才返回 503：
 
 ```json
