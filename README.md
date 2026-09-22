@@ -60,7 +60,7 @@ python3 -m venv .venv                          # 1. 环境
 |---|---|
 | Python | ≥ 3.9（3.9 和 3.11 上都跑过全量测试） |
 | 位置 | `./.venv`，`.gitignore` 挡掉 |
-| 依赖 | 见 `requirements.txt`，六个包，全都被代码 import |
+| 依赖 | 见 `requirements.txt`，七个包，全都被代码 import |
 
 还需要**系统装了 Azure CLI**（`az`）。它不是 pip 依赖：`azure-identity` 的
 `AzureCliCredential` 是 shell 出去调 `az account get-access-token`。
@@ -106,7 +106,7 @@ refresh token——这台机器上的那份就同时有两个——整份拷过�
 
 ```
 azure-proxy/              # 自足：代码 + 虚拟环境 + 凭据，整个目录可以直接搬走
-├── start.sh / tui.sh / stop.sh / restart.sh
+├── start.sh / tui.sh / stop.sh / restart-serving.sh / restart-routing.sh
 ├── preflight.sh         # 看板启动检查，供 tui.sh 使用
 ├── az.sh                # 代理专属的 az —— 运维一律走它，别用裸 az
 ├── import-identity.sh   # 从已有登录里挑出一个账号的凭据装进来
@@ -169,11 +169,15 @@ serving 由持有监听 socket 的 supervisor 和 worker 组成；routing 独立
 |---|---|
 | `./start.sh` | 先启动 routing 并生成映射，再启动 serving |
 | `./start.sh serving` / `./start.sh routing` | 启动指定进程 |
-| `./restart.sh` | 默认只重启 routing，等待 serving 接受新映射 |
-| `./restart.sh serving` / `./restart.sh all` | 预热新 worker 后滚动接流；all 先升级 routing |
-| `./stop.sh routing` | 停止 routing，serving 继续使用缓存映射 |
+| `./restart-routing.sh` | 重启 routing，等待 serving 接受新映射 |
+| `./restart-serving.sh` | 预热新 worker 后滚动接流，旧 worker 排空后退出 |
 | `./stop.sh` | 先排空并停止 serving，再停止 routing |
 | `./tui.sh` | 打开看板 |
+
+两个重启脚本均支持 `--timeout 120`。升级全部服务时，先执行
+`./restart-routing.sh`，再执行 `./restart-serving.sh`。
+单独停止某个服务可使用 `./.venv/bin/python -m proxy.manage stop serving`
+或 `./.venv/bin/python -m proxy.manage stop routing`。
 
 serving supervisor 使用 `.proxy.pid`，所有 worker 日志汇入 `runtime/logs/proxy.log`；routing 使用 `.routing.pid` 和
 `runtime/logs/routing.log`。启动错误也写入对应日志。日志目录自动创建，每小时轮转，轮转日志保留 24 小时。
@@ -193,7 +197,7 @@ routing 根据配额计算各接口、各模型的当前目标和备用顺序，
 负责 RPM、容量学习和看板统计。serving 启动时只解析自身所需设置。
 
 - 修改 routing 代码、`routing.balance`、`routing.balancing` 或重新探测部署后，执行
-  `./restart.sh routing`。新映射由后台同步，已有连接继续使用原快照，会话保持原 endpoint。
+  `./restart-routing.sh`。新映射由后台同步，已有连接继续使用原快照，会话保持原 endpoint。
 - 修改 serving 的转发代码、监听地址、认证、请求兼容处理、超时重试或
   `routing.session_affinity` 设置后，需要安排 serving 重启。
 - 当部署从新映射移除时，新会话停止分配到该部署；已有会话保存完整部署信息，并按原 TTL 排空。
@@ -246,10 +250,10 @@ serving 保持旧映射并显示告警。内存观测队列上限为 100,000 条
 ### 首次迁移与滚动重启
 
 首次迁移安排在旧会话结束后。旧版内存绑定无法完整导出，首次切换后仍携带旧状态的
-会话会收到绑定缺失错误。先执行 `./restart.sh routing` 升级权重和遥测协议，再排空
-旧 serving 并 `./start.sh serving`。旧版服务运行时，`restart.sh serving` 会明确提示首次迁移要求。
+会话会收到绑定缺失错误。先执行 `./restart-routing.sh` 升级权重和遥测协议，再排空
+旧 serving 并 `./start.sh serving`。旧版服务运行时，`restart-serving.sh` 会明确提示首次迁移要求。
 
-新版 `restart.sh serving` 先恢复绑定和快照、并行预热各 scope 认证，通过独立就绪通道
+`restart-serving.sh` 先恢复绑定和快照、并行预热各 scope 认证，通过独立就绪通道
 确认后开启新接流并排空旧 worker。旧 SSE 持续到结束。预热失败时保留旧 worker，
 命令返回失败；已有 worker 排空时拒绝第二次切换。修改监听地址或端口需要 stop/start。
 
@@ -331,7 +335,7 @@ serving 状态来自 `/healthz` 是否可达；routing 心跳超过 3 秒为 `no
 
 **看板只读，不管服务的死活。** 它是独立进程，通过代理自己的 HTTP 面
 （`/healthz` `/routes` `/events`）取数，所以随开随关都不碰服务；关掉它所在的终端
-带走的只有看板。执行 `./restart.sh` 时 serving 持续可达；当 routing 重启造成
+带走的只有看板。执行 `./restart-routing.sh` 时 serving 持续可达；当 routing 重启造成
 统计暂时陈旧时，看板显示进程状态与 `stats … stale`，恢复后自动刷新。
 serving 离线时也可启动 `./tui.sh`。观察本机配置的地址时，看板通过只读数据库和
 supervisor 状态文件独立读取 routing 的 PID、心跳和积压；未知值显示 `?`。
@@ -1161,7 +1165,7 @@ routing:
 `active_window_seconds` 控制看板统计的活跃窗口，默认 300 秒，须为正有限数。
 窗口内有请求的绑定会话、以及仍有请求在途的会话计入总数、源和模型统计。
 `ttl_seconds` 独立控制持久化绑定的保留时间。超出活跃窗口后绑定继续保留，
-恢复请求时会重新出现在看板中。修改活跃窗口后执行 `./restart.sh serving` 滚动生效。
+恢复请求时会重新出现在看板中。修改活跃窗口后执行 `./restart-serving.sh` 滚动生效。
 
 `runtime/affinity.sqlite3` 使用 WAL、FULL 同步、短事务和 0600 文件权限。
 唯一 family 键保证并发首请求和多个 worker 只能提交一个绑定；提交成功后才允许派发。

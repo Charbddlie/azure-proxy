@@ -10,7 +10,7 @@
 #
 #   ./start.sh     start it in the background
 #   ./stop.sh      stop it
-#   ./restart.sh   restart routing after editing its policy or re-probing
+#   ./restart-routing.sh   restart routing after editing its policy or re-probing
 #
 # `python -m tui --attach` is the same thing without the checks below, and
 # takes --url for another proxy and --scroll-lines N for wheel sensitivity.

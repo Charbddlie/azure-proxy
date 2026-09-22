@@ -26,6 +26,18 @@ def roll(p):
 
 
 class RollingTests(unittest.TestCase):
+    def test_serving_restart_script_preserves_routing_and_bindings(self):
+        with fixture() as (p, a, b):
+            expected = sticky_ask(p)[2]["x-azure-proxy-route"]
+            before = p.get_raw("/healthz")[1]
+            result = subprocess.run(["./restart-serving.sh", "--timeout", "10"],
+                                    cwd=ROOT, env=p.env, capture_output=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            after = p.get_raw("/healthz")[1]
+            self.assertNotEqual(after["pid"], before["pid"])
+            self.assertEqual(after["routing"]["pid"], before["routing"]["pid"])
+            self.assertEqual(sticky_ask(p)[2]["x-azure-proxy-route"], expected)
+
     def test_long_sse_survives_switch_and_new_requests_have_no_failures(self):
         with fixture([Behaviour(events=sse("alpha", extra=60), event_delay=.07), Behaviour()]) as (p, a, b):
             request = urllib.request.Request(p.url("/v1/responses"), data=json.dumps(CODEX_BODY).encode(),

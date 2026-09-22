@@ -6,7 +6,7 @@
 It starts nothing, stops nothing and writes nothing — every endpoint it touches
 (/healthz, /routes, /events) is a reader, so opening and closing it does not
 touch the service. `./start_tui.sh` is this with a couple of checks in front of
-it; the proxy itself is managed by start.sh / stop.sh / restart.sh.
+it; services are managed by start.sh, stop.sh, and the two restart-*.sh scripts.
 """
 
 import argparse

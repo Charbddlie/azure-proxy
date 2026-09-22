@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
+import anyio
 import httpx
 from azure.identity import AzureCliCredential
 from fastapi import FastAPI, Request
@@ -927,7 +928,11 @@ async def _probe_stream_head(resp: httpx.Response) -> _StreamHead:
         if remaining <= 0:
             break
         task = asyncio.ensure_future(head.aiter.__anext__())
-        done, _ = await asyncio.wait({task}, timeout=remaining)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+        except BaseException:
+            await _close_upstream(resp, task)
+            raise
         if not done:
             head.pending = task
             break
@@ -951,6 +956,34 @@ async def _probe_stream_head(resp: httpx.Response) -> _StreamHead:
         if head.retry_reason or _has_content_event(buffered):
             break
     return head
+
+
+async def _close_upstream(resp, pending=None):
+    """Finish the outstanding read and release its connection under cancellation."""
+    with anyio.CancelScope(shield=True):
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        await resp.aclose()
+
+
+class _UpstreamStreamingResponse(StreamingResponse):
+    """Own upstream cleanup even when ASGI sending fails before iteration starts."""
+
+    def __init__(self, *args, cleanup, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cleanup = cleanup
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    await self._cleanup()
 
 
 def _relay_stream(resp: httpx.Response, route: Target, face: str, started: float,
@@ -979,6 +1012,18 @@ def _relay_stream(resp: httpx.Response, route: Target, face: str, started: float
     """
     if entry:
         entry.streaming = True
+
+    closed = False
+
+    async def cleanup():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        try:
+            await _close_upstream(resp, head.pending)
+        finally:
+            telemetry.finish(entry)
 
     async def body():
         sent = 0
@@ -1026,10 +1071,11 @@ def _relay_stream(resp: httpx.Response, route: Target, face: str, started: float
                 sent += len(chunk)
                 yield chunk
             if head.pending is not None:
-                # The read the probe stopped waiting for. Awaited, never
-                # cancelled, so the connection stays usable.
+                # Cleanup owns cancellation of this detached read. Shield the
+                # await so downstream cancellation cannot interrupt its close
+                # once here and then again when cleanup cancels the task.
                 try:
-                    chunk = await head.pending
+                    chunk = await asyncio.shield(head.pending)
                 except StopAsyncIteration:
                     chunk = b""
                 if chunk:
@@ -1061,8 +1107,7 @@ def _relay_stream(resp: httpx.Response, route: Target, face: str, started: float
                 record_success()
             if not success_recorded:
                 telemetry.settle(route, entry, request_bytes, watch.total_tokens)
-            telemetry.finish(entry)
-            await resp.aclose()
+            await cleanup()
             if keep:
                 _capture_stream(route, resp, bytes(seen))
             _note_upstream_error(watch.upstream_error(), route, face, model,
@@ -1087,9 +1132,10 @@ def _relay_stream(resp: httpx.Response, route: Target, face: str, started: float
                 status=resp.status_code, bytes=sent,
                 seconds=round(time.monotonic() - started, 1))
 
-    return StreamingResponse(body(), status_code=resp.status_code,
-                             headers=_relay_headers(resp, route),
-                             media_type=resp.headers.get("content-type"))
+    return _UpstreamStreamingResponse(body(), cleanup=cleanup,
+                                      status_code=resp.status_code,
+                                      headers=_relay_headers(resp, route),
+                                      media_type=resp.headers.get("content-type"))
 
 
 def _note_upstream_error(failure: Optional[Tuple[str, str]], route: Target,
@@ -1575,7 +1621,11 @@ async def _forward(request: Request, body: dict, routes: List[Target],
                           "upstream_timeout")
         finally:
             if not entry.streaming:
-                telemetry.finish(entry)
+                try:
+                    if resp is not None:
+                        await _close_upstream(resp)
+                finally:
+                    telemetry.finish(entry)
 
     _ev("exhausted", "error",
         "<- 503 %s model=%s: all %d attempt(s) failed; last: %s",

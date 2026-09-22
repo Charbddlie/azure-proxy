@@ -26,6 +26,27 @@ from run_tests import PYTHON, ROOT, sticky_ask
 
 
 class OperationsTests(unittest.TestCase):
+    def test_role_scripts_forward_flags_to_their_fixed_role(self):
+        for script, action, role in (("restart-serving.sh", "restart", "serving"),
+                                     ("restart-routing.sh", "restart", "routing"),
+                                     ("stop.sh", "stop", "all")):
+            with self.subTest(script=script):
+                result = subprocess.run([os.path.join(ROOT, script), "--timeout", "7"],
+                                        cwd="/tmp", capture_output=True, text=True, check=True,
+                                        env=dict(os.environ, AZURE_PROXY_PYTHON="/bin/echo"))
+                self.assertEqual(result.stdout.strip(),
+                                 "-m proxy.manage {} {} --timeout 7".format(action, role))
+
+    def test_stop_script_stops_both_services(self):
+        with fixture() as (p, a, b):
+            result = subprocess.run(["./stop.sh", "--timeout", "10"], cwd=ROOT,
+                                    env=p.env, capture_output=True, timeout=25)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b"stopped serving", result.stdout)
+            self.assertIn(b"stopped routing", result.stdout)
+            p.proc.wait(timeout=5)
+            p.routing_proc.wait(timeout=5)
+
     def test_next_beijing_0100_and_day_boundary(self):
         before = datetime(2026, 9, 7, 16, 59, tzinfo=timezone.utc)
         self.assertEqual(next_run(before).isoformat(), "2026-09-08T01:00:00+08:00")

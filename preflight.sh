@@ -47,7 +47,8 @@ refuse_if_online() {
         echo "already running — $ONLINE_WHY" >&2
         echo >&2
         echo "  ./stop.sh      then start it again" >&2
-        echo "  ./restart.sh   stop and start again in one step" >&2
+        echo "  ./restart-serving.sh   warm up and switch to a new serving worker" >&2
+        echo "  ./restart-routing.sh   reload routing and publish a new mapping" >&2
         exit 1
     fi
     # A pidfile whose process is gone is debris from a crash, not a claim.

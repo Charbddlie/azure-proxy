@@ -414,7 +414,7 @@ class SplitTests(unittest.TestCase):
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 future = pool.submit(request)
                 wait_for(lambda: a.hits == 1)
-                result = subprocess.run(["./stop.sh", "serving", "--timeout", "0.1"],
+                result = subprocess.run([PYTHON, "-m", "proxy.manage", "stop", "serving", "--timeout", "0.1"],
                                         cwd=ROOT, env=p.env, capture_output=True, timeout=5)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(b"still draining", result.stderr)
@@ -570,7 +570,7 @@ class SplitTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_restart_script_defaults_to_routing_and_rejects_duplicate(self):
+    def test_restart_routing_script_and_rejects_duplicate(self):
         with fixture() as (p, a, b):
             duplicate = subprocess.run([PYTHON, "-m", "routing"], cwd=ROOT, env=p.env,
                                        capture_output=True, timeout=5)
@@ -578,7 +578,7 @@ class SplitTests(unittest.TestCase):
             self.assertIn(b"already running", duplicate.stderr)
             old = p.routing_proc.pid
             try:
-                result = subprocess.run(["./restart.sh"], cwd=ROOT, env=p.env,
+                result = subprocess.run(["./restart-routing.sh"], cwd=ROOT, env=p.env,
                                         capture_output=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 health = p.get_raw("/healthz")[1]
@@ -586,7 +586,7 @@ class SplitTests(unittest.TestCase):
                 self.assertNotEqual(health["routing"]["pid"], old)
                 self.assertTrue(health["routing"]["ok"])
             finally:
-                subprocess.run(["./stop.sh", "routing"], cwd=ROOT, env=p.env,
+                subprocess.run([PYTHON, "-m", "proxy.manage", "stop", "routing"], cwd=ROOT, env=p.env,
                                capture_output=True, timeout=15, check=True)
 
     def test_cold_serving_requires_a_snapshot(self):

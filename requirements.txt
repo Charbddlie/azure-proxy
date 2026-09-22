@@ -3,7 +3,7 @@
 #   python3 -m venv .venv
 #   .venv/bin/pip install -r requirements.txt
 #
-# Six packages, and every one of them is imported by the code — `openai` used to
+# Seven packages, and every one of them is imported by the code — `openai` used to
 # be on this list and was never imported by anything; it is gone.
 #
 # Floors rather than pins. This is a service you deploy and keep running, not a
@@ -25,6 +25,9 @@ uvicorn>=0.30
 
 # Upstream HTTP, including the streaming path. Async client throughout.
 httpx>=0.27
+
+# Cancellation-safe upstream response cleanup.
+anyio>=4.0
 
 # settings/*.yaml
 PyYAML>=6.0
